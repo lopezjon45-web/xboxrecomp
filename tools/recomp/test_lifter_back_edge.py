@@ -80,4 +80,6 @@ def test_a_switch_arm_going_backward_is_a_back_edge():
     assert "uint32_t _jt" in code, code
     assert "if (_jt == 0x00010000u) { RECOMP_BACK_EDGE(0x00010001u); goto loc_00010000; }" in code, code
     assert "if (_jt == 0x00010008u) goto loc_00010008;" in code, code
-    assert code.count("RECOMP_BACK_EDGE") == 1
+    # Every jump back to the arm yields, and only those: the Def Jam fork's
+    # proven-slot fallback is a second way to the same arm.
+    assert code.count("RECOMP_BACK_EDGE") == code.count("goto loc_00010000;"), code
