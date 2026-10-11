@@ -261,14 +261,20 @@ int d3d8_Nv2aProgramDraw(uint32_t hash, const char *hlsl, uint32_t used,
         upload(s_cb_consts, consts, 192 * 16);
         s_consts_version = consts_version;
     }
-    frame[0] = 2.0f / (float)d3d8_GetBackbufferWidth();
+    {
+        /* A widescreen placement for this draw: clip x becomes x * kx + bx
+         * (the program's epilogue computes x * Screen.x - TexScale.w). */
+        float kx, bx;
+        d3d8_GetDrawPlacement(&kx, &bx);
+        frame[0] = 2.0f * kx / (float)d3d8_GetBackbufferWidth();
+        frame[7] = kx - bx;
+    }
     frame[1] = 2.0f / (float)d3d8_GetBackbufferHeight();
     frame[2] = zscale;
     frame[3] = s_points ? s_point_size : 0.0f;
     frame[4] = texscale[0];
     frame[5] = texscale[1];
     frame[6] = d3d8_GetCanvasScaleY() / d3d8_GetCanvasScaleX();   /* point sprites: 1 unless widened */
-    frame[7] = 1.0f;
     upload(s_cb_frame, frame, sizeof frame);
 
     if (s_points) {

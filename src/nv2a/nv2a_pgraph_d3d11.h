@@ -107,6 +107,13 @@ void pgraph_d3d11_bind_stage(int stage);
 void pgraph_d3d11_unbind_stage(int stage);
 void pgraph_d3d11_set_surface_clip(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
 void pgraph_d3d11_set_point_mode(int on, float size);
+/* Widescreen: clip-space x of the next draws becomes x * kx + bx (1, 0 = unchanged). */
+void pgraph_d3d11_set_placement(float kx, float bx);
+/* Widescreen 2D placement policy (nv2a_pb_exec.c): k = title aspect / canvas aspect
+ * (1 = off); hud_reach = how far towards the screen edge anchored HUD pieces go
+ * (1 = the edge). The heartbeat, once per game tick, says a fight HUD is up. */
+void nv2a_ws_configure(float k, float hud_reach);
+void nv2a_ws_hud_heartbeat(void);
 
 /* The title's register combiners for the next draws (see the .c). */
 void pgraph_d3d11_set_combiners(const uint32_t *a, const uint32_t *b, const uint32_t *c,

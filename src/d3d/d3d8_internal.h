@@ -40,6 +40,10 @@ UINT                 d3d8_GetRenderScale(void);
  * the target is widened to a canvas (d3d8_present_set_canvas_aspect). */
 float                d3d8_GetCanvasScaleX(void);
 float                d3d8_GetCanvasScaleY(void);
+/* Widescreen 2D placement for the next draws: clip-space x becomes x * kx + bx
+ * (1, 0 = unchanged). Set per draw by the push-buffer executor. */
+void                 d3d8_SetDrawPlacement(float kx, float bx);
+void                 d3d8_GetDrawPlacement(float *kx, float *bx);
 void                d3d8_SetScissorRect(UINT x, UINT y, UINT w, UINT h);
 void                 d3d8_SetBlendColor(DWORD argb);
 

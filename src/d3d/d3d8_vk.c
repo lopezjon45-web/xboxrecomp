@@ -1493,6 +1493,12 @@ void d3d8_SetBlendColor(DWORD argb)
     color_to_float(argb, vk.blend_color);
 }
 
+/* Widescreen 2D placement: kept for the API; the Vulkan canvas is not built yet
+ * (docs/widescreen WS-1b), so the host never asks for one here. */
+static float s_place_kx = 1.0f, s_place_bx = 0.0f;
+void d3d8_SetDrawPlacement(float kx, float bx) { s_place_kx = kx; s_place_bx = bx; }
+void d3d8_GetDrawPlacement(float *kx, float *bx) { *kx = s_place_kx; *bx = s_place_bx; }
+
 void d3d8_Nv2aPointMode(int on, float fixed_size)
 {
     vk.points = on;

@@ -193,6 +193,9 @@ HWND                 d3d8_GetHWND(void) { return g_device_state.hwnd; }
 UINT                 d3d8_GetBackbufferWidth(void) { return g_device_state.logical_width; }
 UINT                 d3d8_GetBackbufferHeight(void) { return g_device_state.logical_height; }
 UINT                 d3d8_GetRenderScale(void) { return g_device_state.render_scale ? g_device_state.render_scale : 1; }
+static float g_place_kx = 1.0f, g_place_bx = 0.0f;
+void d3d8_SetDrawPlacement(float kx, float bx) { g_place_kx = kx; g_place_bx = bx; }
+void d3d8_GetDrawPlacement(float *kx, float *bx) { *kx = g_place_kx; *bx = g_place_bx; }
 float d3d8_GetCanvasScaleX(void)
 {
     return g_device_state.logical_width ? (float)g_device_state.width / (float)g_device_state.logical_width

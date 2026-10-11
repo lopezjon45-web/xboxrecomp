@@ -1585,6 +1585,13 @@ static int s_bad_prog_n;
 /* The next draw_program batches are point lists (NV2A primitive 1), drawn as
  * point sprites; `size` is SET_POINT_SIZE in pixels, used when the vertex
  * program writes no size of its own. */
+/* Widescreen 2D placement for the next draws (nv2a_pb_exec.c, ws_place_batch). */
+void pgraph_d3d11_set_placement(float kx, float bx)
+{
+    extern void d3d8_SetDrawPlacement(float kx, float bx);
+    d3d8_SetDrawPlacement(kx, bx);
+}
+
 void pgraph_d3d11_set_point_mode(int on, float size)
 {
     extern void d3d8_Nv2aPointMode(int on, float fixed_size);

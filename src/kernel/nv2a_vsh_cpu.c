@@ -390,7 +390,7 @@ int nv2a_vsh_emit_hlsl(char *out, int size, uint32_t *inputs_used)
 
     hb(&b, "    VS_OUT o;\n"
            "    float w = R[12].w;\n"
-           "    float2 ndc = float2(R[12].x * Screen.x - 1.0, 1.0 - R[12].y * Screen.y);\n"
+           "    float2 ndc = float2(R[12].x * Screen.x - TexScale.w, 1.0 - R[12].y * Screen.y);\n"
            "    o.pos = float4(ndc * w, R[12].z * Screen.z * w, w);\n"
            "    o.diffuse = saturate(O[3]);\n"
            "    o.specular = saturate(O[4]);\n"

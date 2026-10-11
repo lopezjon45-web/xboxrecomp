@@ -714,6 +714,124 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
     }
 }
 
+/* Widescreen 2D placement (docs/widescreen in the Def Jam port).
+ *
+ * With a widescreen canvas the title's 640-wide coordinates are spread over a
+ * wider target and the title widens its own 3D view. Its 2D -- menus, HUD,
+ * movies -- would come out stretched, so each 2D batch is placed here instead:
+ * squeezed by k = (title aspect) / (canvas aspect) and centred; during a fight
+ * (the host's heartbeat) HUD pieces wholly left or right of the middle are
+ * anchored to that side; full-screen fills (fades, tints, vignettes) stretch.
+ * A batch is 2D when its first vertices come out with w = 1 and one depth
+ * (an orthographic view); 3D batches are left alone. k = 1 turns it all off. */
+static volatile float s_ws_k = 1.0f, s_ws_reach = 1.0f;
+static volatile uint32_t s_ws_hud_flip = 0xFFFFFFF0u;
+static uint32_t s_ws_counts[6];
+
+void nv2a_ws_configure(float k, float hud_reach)
+{
+    s_ws_k = (k > 0.0f && k <= 1.0f) ? k : 1.0f;
+    s_ws_reach = (hud_reach > 0.0f && hud_reach <= 1.0f) ? hud_reach : 1.0f;
+}
+
+/* Call once per game tick while a fight's HUD is up. */
+void nv2a_ws_hud_heartbeat(void) { s_ws_hud_flip = s_gpu.flips; }
+
+static int ws_vertex(int vsh, uint32_t used, uint32_t vi, float out[4])
+{
+    if (vsh) {
+        float in[16][4];
+        NvVshOutput o;
+        uint32_t a;
+        for (a = 0; a < 16; a++) {
+            if (!((used >> a) & 1)) {
+                in[a][0] = in[a][1] = in[a][2] = 0.0f;
+                in[a][3] = 1.0f;
+            } else if (!fetch_attr(&s_gpu.attr[a], vi, in[a])) {
+                nv2a_vsh_current((int)a, in[a]);
+            }
+        }
+        if (!nv2a_vsh_run_ready((const float (*)[4])in, &o))
+            return 0;
+        out[0] = o.pos[0]; out[1] = o.pos[1]; out[2] = o.pos[2]; out[3] = o.pos[3];
+        return 1;
+    }
+    if (!fetch_attr(&s_gpu.attr[0], vi, out))
+        return 0;
+    out[3] = 1.0f;
+    return 1;
+}
+
+/* Decide this batch's placement and hand it to the renderer. `ready` holds its
+ * vertices when the CPU path transformed them (n of them), else NULL. */
+static void ws_place_batch(int vsh, uint32_t used, const PgraphReadyVertex *ready, uint32_t n)
+{
+    extern void pgraph_d3d11_set_placement(float kx, float bx);
+    float k = s_ws_k, x0 = 1e30f, x1 = -1e30f, y0 = 1e30f, y1 = -1e30f, z = 0.0f, p[4];
+    uint32_t i, cnt = ready ? n : s_gpu.idx_count;
+    int cls;                               /* 0 3D, 1 centre, 2 left, 3 right, 4 stretch */
+
+    if (k >= 1.0f)
+        return;
+    if (cnt > 512)
+        cnt = 512;                         /* plenty to tell a 2D batch's extent */
+    cls = 1;
+    for (i = 0; i < cnt; i++) {
+        if (ready) {
+            p[0] = ready[i].x; p[1] = ready[i].y; p[2] = ready[i].z; p[3] = ready[i].w;
+        } else if (!ws_vertex(vsh, used, s_gpu.idx[i], p)) {
+            break;
+        }
+        if (i == 0)
+            z = p[2];
+        if (i < 3 && (fabsf(p[3] - 1.0f) > 1e-4f || fabsf(p[2] - z) > 1e-3f * (fabsf(z) + 1.0f))) {
+            cls = 0;                       /* perspective or varying depth: 3D */
+            break;
+        }
+        if (p[0] < x0) x0 = p[0];
+        if (p[0] > x1) x1 = p[0];
+        if (p[1] < y0) y0 = p[1];
+        if (p[1] > y1) y1 = p[1];
+    }
+    if (cls && x0 <= 2.0f && x1 >= 638.0f && y0 <= 2.0f && y1 >= 478.0f) {
+        /* Full screen: a fill stretches, a picture (movie, poster) is centred. */
+        int tex = s_gpu.texs[0].valid && s_gpu.texs[0].width && s_gpu.texs[0].height;
+        uint32_t big = tex ? (s_gpu.texs[0].width > s_gpu.texs[0].height ? s_gpu.texs[0].width
+                                                                          : s_gpu.texs[0].height) : 0;
+        cls = (!tex || big <= 128) ? 4 : 1;
+    } else if (cls && (uint32_t)(s_gpu.flips - s_ws_hud_flip) <= 30u) {
+        if (x1 <= 300.0f)
+            cls = 2;
+        else if (x0 >= 340.0f)
+            cls = 3;
+    }
+    s_ws_counts[cls]++;
+    {
+        float bx = cls == 2 ? k - s_ws_reach : cls == 3 ? s_ws_reach - k : 0.0f;
+        if (cls == 1 || cls == 2 || cls == 3) {
+            /* Clip the placed batch to where its own clip rectangle lands, so
+             * what the title keeps off screen (slide-ins start far outside
+             * 0..640) does not show in the new side areas: pixel x becomes
+             * x * k + 320 * (1 - k + bx). */
+            float off = 320.0f * (1.0f - k + bx);
+            uint32_t cx = (uint32_t)(s_gpu.clip_x * k + off + 0.5f);
+            uint32_t cw = (uint32_t)(s_gpu.clip_w * k + 0.5f);
+            pgraph_d3d11_set_placement(k, bx);
+            pgraph_d3d11_set_surface_clip(cx, s_gpu.clip_y, cw ? cw : 1, s_gpu.clip_h);
+        } else {
+            pgraph_d3d11_set_placement(1.0f, 0.0f);
+        }
+    }
+    {
+        static uint32_t last_flip;
+        if (s_gpu.flips - last_flip >= 600u) {
+            last_flip = s_gpu.flips;
+            fprintf(stderr, "[WS] 2D placement: 3D %u, centred %u, left %u, right %u, stretched %u\n",
+                    s_ws_counts[0], s_ws_counts[1], s_ws_counts[2], s_ws_counts[3], s_ws_counts[4]);
+        }
+    }
+}
+
 static uint32_t surface_bpp(void);
 
 static void note_drawn(void)
@@ -3456,6 +3574,8 @@ static void draw_primitive(void)
                         for (k = 0; k < n; k++)
                             ready[k].color |= 0x00FFFFFFu;
                 }
+                if (n >= 3)
+                    ws_place_batch(vsh, used, gpu ? NULL : ready, n);
                 if (n >= 3 && gpu) {
                     pgraph_d3d11_set_point_mode(s_gpu.prim == 1, s_point_size);
                     (void)pgraph_d3d11_draw_program(gv, gnv, used, gtri, gnt, gsu, gsv);
