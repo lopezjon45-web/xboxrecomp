@@ -114,6 +114,7 @@ void pgraph_d3d11_set_placement(float kx, float bx);
  * (1 = the edge). The heartbeat, once per game tick, says a fight HUD is up. */
 void nv2a_ws_configure(float k, float hud_reach);
 void nv2a_ws_hud_heartbeat(void);
+void nv2a_ws_set_side_fill(int on);
 
 /* The title's register combiners for the next draws (see the .c). */
 void pgraph_d3d11_set_combiners(const uint32_t *a, const uint32_t *b, const uint32_t *c,

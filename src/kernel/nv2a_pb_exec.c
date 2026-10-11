@@ -725,6 +725,7 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
  * A batch is 2D when its first vertices come out with w = 1 and one depth
  * (an orthographic view); 3D batches are left alone. k = 1 turns it all off. */
 static volatile float s_ws_k = 1.0f, s_ws_reach = 1.0f;
+static volatile int s_ws_side_fill = 1;
 static volatile uint32_t s_ws_hud_flip = 0xFFFFFFF0u;
 static uint32_t s_ws_counts[6];
 
@@ -733,6 +734,10 @@ void nv2a_ws_configure(float k, float hud_reach)
     s_ws_k = (k > 0.0f && k <= 1.0f) ? k : 1.0f;
     s_ws_reach = (hud_reach > 0.0f && hud_reach <= 1.0f) ? hud_reach : 1.0f;
 }
+
+/* 1: a full-screen picture that is centred (movie, poster) gets a blurred
+ * extension beside it at present; 0: black. */
+void nv2a_ws_set_side_fill(int on) { s_ws_side_fill = on ? 1 : 0; }
 
 /* Call once per game tick while a fight's HUD is up. */
 void nv2a_ws_hud_heartbeat(void) { s_ws_hud_flip = s_gpu.flips; }
@@ -799,6 +804,10 @@ static void ws_place_batch(int vsh, uint32_t used, const PgraphReadyVertex *read
         uint32_t big = tex ? (s_gpu.texs[0].width > s_gpu.texs[0].height ? s_gpu.texs[0].width
                                                                           : s_gpu.texs[0].height) : 0;
         cls = (!tex || big <= 128) ? 4 : 1;
+        if (cls == 1 && s_ws_side_fill) {
+            extern void d3d8_RequestSideFill(void);
+            d3d8_RequestSideFill();
+        }
     } else if (cls && (uint32_t)(s_gpu.flips - s_ws_hud_flip) <= 30u) {
         if (x1 <= 300.0f)
             cls = 2;

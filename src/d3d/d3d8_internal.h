@@ -44,6 +44,8 @@ float                d3d8_GetCanvasScaleY(void);
  * (1, 0 = unchanged). Set per draw by the push-buffer executor. */
 void                 d3d8_SetDrawPlacement(float kx, float bx);
 void                 d3d8_GetDrawPlacement(float *kx, float *bx);
+/* Widescreen: fill the areas beside the 4:3 box at the next present (d3d8_present.c). */
+void                 d3d8_RequestSideFill(void);
 void                d3d8_SetScissorRect(UINT x, UINT y, UINT w, UINT h);
 void                 d3d8_SetBlendColor(DWORD argb);
 

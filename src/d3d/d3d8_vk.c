@@ -1498,6 +1498,7 @@ void d3d8_SetBlendColor(DWORD argb)
 static float s_place_kx = 1.0f, s_place_bx = 0.0f;
 void d3d8_SetDrawPlacement(float kx, float bx) { s_place_kx = kx; s_place_bx = bx; }
 void d3d8_GetDrawPlacement(float *kx, float *bx) { *kx = s_place_kx; *bx = s_place_bx; }
+void d3d8_RequestSideFill(void) { }
 
 void d3d8_Nv2aPointMode(int on, float fixed_size)
 {
