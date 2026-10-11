@@ -124,9 +124,38 @@ static void check_sha256(void)
     } else printf("texture-pack fixture: this CPU has no SHA extensions; C rounds only\n");
 #endif
 }
+/* The cheap re-check between identity hashes sees what the identity sees, and nothing else. */
+static void check_quick(void)
+{
+    static uint8_t rows[8*32],palette[64];
+    RecompTextureSource s={1,11,16,8,16,rows,sizeof rows,32,16,8,palette,16};
+    uint64_t a,b,again; unsigned i;
+    for(i=0;i<sizeof rows;i++) rows[i]=(uint8_t)(i*7);
+    for(i=0;i<sizeof palette;i++) palette[i]=(uint8_t)i;
+    assert(texture_pack_quick(&s,&a) && texture_pack_quick(&s,&again) && a==again);
+    rows[3*32+20]^=1;                       /* row padding: outside the identity too */
+    assert(texture_pack_quick(&s,&b) && b==a);
+    rows[3*32+5]^=1;                        /* a texel */
+    assert(texture_pack_quick(&s,&b) && b!=a);
+    rows[3*32+5]^=1; assert(texture_pack_quick(&s,&b) && b==a);
+    palette[63]^=0x80;                      /* the palette */
+    assert(texture_pack_quick(&s,&b) && b!=a);
+    palette[63]^=0x80;
+    rows[7*32+15]^=0x40;                    /* the last texel byte of the last row */  
+    assert(texture_pack_quick(&s,&b) && b!=a);
+    assert(same_layout(&s,&s));
+    { RecompTextureSource moved=s; moved.data=rows+32; assert(!same_layout(&s,&moved)); }
+    {
+        void *blocked=no_access_page();
+        RecompTextureSource hidden={1,6,2,2,2,blocked,16,0,0,0,NULL,0};
+        assert(blocked && !texture_pack_quick(&hidden,&b));
+        free_page(blocked);
+    }
+}
 int main(void)
 {
     check_sha256();
+    check_quick();
     uint8_t raw[128],palette[16],changed[128],pixel[16]={0,0,255,255, 255,0,0,0, 255,0,0,0, 255,0,0,0};
     char id[65],other[65],root[1024],path[1024],manifest[1024];
     RecompTextureSource source={1,11,16,8,16,raw,128,0,0,0,palette,4};

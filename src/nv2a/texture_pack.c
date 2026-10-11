@@ -48,7 +48,8 @@ static struct SourceState {
     RecompTextureSource shape;
     char id[65];
     ULONGLONG checked;
-    int used, dumped;
+    uint64_t quick;          /* texture_pack_quick() of the bytes that gave id */
+    int used, dumped, has_quick;
 } g_sources[SOURCE_SLOTS];
 static unsigned g_source_next;
 #if defined(_WIN32)
@@ -240,6 +241,48 @@ int texture_pack_hash(const RecompTextureSource *s,char out[65])
     return 1;
 }
 
+/* A cheap check between identity hashes: four lanes of the xxHash64 round over the bytes
+ * the identity covers. A bound texture is re-identified every 8 ms; while this value is
+ * unchanged its SHA-256 is too (barring a 64-bit collision on a changed texture), so the
+ * full hash runs only for new or rewritten textures. That hashing was the steady cost of
+ * the packs on the GPU thread (a four-fighter match on a Steam Deck held 53 fps, not 60). */
+static uint64_t quick_round(uint64_t acc,uint64_t word)
+{
+    acc+=word*0xC2B2AE3D27D4EB4Full;
+    acc=(acc<<31)|(acc>>33);
+    return acc*0x9E3779B185EBCA87ull;
+}
+static void quick_add(uint64_t lane[4],const uint8_t *p,size_t bytes)
+{
+    uint64_t word[4];
+    for(;bytes>=32;bytes-=32,p+=32) {
+        memcpy(word,p,32);
+        lane[0]=quick_round(lane[0],word[0]); lane[1]=quick_round(lane[1],word[1]);
+        lane[2]=quick_round(lane[2],word[2]); lane[3]=quick_round(lane[3],word[3]);
+    }
+    for(;bytes>=8;bytes-=8,p+=8) { memcpy(word,p,8); lane[0]=quick_round(lane[0],word[0]); }
+    for(;bytes;bytes--,p++) lane[1]=quick_round(lane[1],*p);
+}
+static int texture_pack_quick(const RecompTextureSource *s,uint64_t *out)
+{
+    uint64_t lane[4]={0x60ea27eeadc0b5d6ull,0xc2b2ae3d27d4eb4full,0,0x61c8864e7a143579ull},h;
+    unsigned i;
+    if(!source_readable(s)) return 0;
+    if(s->stride) for(i=0;i<s->rows;i++) quick_add(lane,(const uint8_t *)s->data+(size_t)i*s->stride,s->row_bytes);
+    else quick_add(lane,s->data,s->bytes);
+    if(s->palette_entries) quick_add(lane,s->palette,s->palette_entries*4u);
+    h=((lane[0]<<1)|(lane[0]>>63))+((lane[1]<<7)|(lane[1]>>57))+((lane[2]<<12)|(lane[2]>>52))+((lane[3]<<18)|(lane[3]>>46));
+    h^=h>>33; h*=0xC2B2AE3D27D4EB4Full; h^=h>>29; h*=0x165667B19E3779F9ull; h^=h>>32;
+    *out=h;
+    return 1;
+}
+static int same_layout(const RecompTextureSource *a,const RecompTextureSource *b)
+{
+    return a->data==b->data && a->bytes==b->bytes && a->stride==b->stride && a->row_bytes==b->row_bytes &&
+           a->rows==b->rows && a->palette==b->palette && a->palette_entries==b->palette_entries &&
+           a->format==b->format && a->width==b->width && a->height==b->height && a->row_texels==b->row_texels;
+}
+
 static void release_entry(IDirect3DDevice8 *dev,PackEntry *e)
 {
     unsigned stage;
@@ -393,6 +436,7 @@ static unsigned source_slot(const RecompTextureSource *s)
 int texture_pack_bind(IDirect3DDevice8 *dev,unsigned stage,const RecompTextureSource *s,RecompTextureSample sample,void *user)
 {
     struct SourceState *state=NULL; char id[65]; PackEntry *entry;
+    uint64_t quick=0; int have_quick=0;
     unsigned i, slot=source_slot(s);
     ULONGLONG now=now_ms();
     if(!texture_pack_active() || !dev || stage>3) return 0;
@@ -402,7 +446,10 @@ int texture_pack_bind(IDirect3DDevice8 *dev,unsigned stage,const RecompTextureSo
            c->shape.height==s->height && c->shape.row_texels==s->row_texels && c->shape.palette==s->palette && c->shape.palette_entries==s->palette_entries) { state=c; break; }
     }
     if(state && now-state->checked<8) memcpy(id,state->id,65);
-    else {
+    else if(state && state->has_quick && same_layout(&state->shape,s) &&
+            (have_quick=texture_pack_quick(s,&quick)) && quick==state->quick) {
+        memcpy(id,state->id,65); state->checked=now;
+    } else {
         if(!texture_pack_hash(s,id)) return 0;
         if(!state) {
             state=&g_sources[slot];
@@ -415,6 +462,8 @@ int texture_pack_bind(IDirect3DDevice8 *dev,unsigned stage,const RecompTextureSo
         }
         if(state->used && strcmp(state->id,id)) state->dumped=0;
         state->shape=*s; state->checked=now; memcpy(state->id,id,65); state->used=1;
+        state->has_quick=have_quick || texture_pack_quick(s,&quick);
+        state->quick=quick;
     }
     if(!state->dumped && g_dump[0] && g_dumps<(uint64_t)g_dump_limit && sample && source_readable(s)) {
         state->dumped=1;
