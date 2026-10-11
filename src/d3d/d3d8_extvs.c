@@ -53,7 +53,9 @@ static const char s_point_gs_src[] =
     "void main(point VS_OUT i[1], inout TriangleStream<VS_OUT> s) {\n"
     "    float sz = i[0].psize > 0.0 ? i[0].psize : Screen.w;\n"
     "    if (sz <= 0.0 || i[0].pos.w <= 0.0) return;\n"
-    "    float2 h = 0.5 * sz * Screen.xy * i[0].pos.w;\n"
+    /* TexScale.z: 1, or how much narrower a title pixel is across than down
+     * on a widescreen canvas, so the square stays square. */
+    "    float2 h = 0.5 * sz * Screen.xy * i[0].pos.w * float2(TexScale.z, 1.0);\n"
     "    static const float2 c[4] = { float2(0, 0), float2(1, 0), float2(0, 1), float2(1, 1) };\n"
     "    for (int k = 0; k < 4; k++) {\n"
     "        VS_OUT o = i[0];\n"
@@ -265,7 +267,7 @@ int d3d8_Nv2aProgramDraw(uint32_t hash, const char *hlsl, uint32_t used,
     frame[3] = s_points ? s_point_size : 0.0f;
     frame[4] = texscale[0];
     frame[5] = texscale[1];
-    frame[6] = 1.0f;
+    frame[6] = d3d8_GetCanvasScaleY() / d3d8_GetCanvasScaleX();   /* point sprites: 1 unless widened */
     frame[7] = 1.0f;
     upload(s_cb_frame, frame, sizeof frame);
 

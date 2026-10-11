@@ -9,6 +9,7 @@
 
 static BOOL g_scaling;
 static UINT g_scale_override;
+static UINT g_canvas_num, g_canvas_den;
 
 /* Written from any thread, read by the presenting thread. */
 static volatile LONG g_keep_aspect = 1;
@@ -27,6 +28,7 @@ static ID3D11SamplerState *g_sampler_linear, *g_sampler_nearest;
 
 void d3d8_present_enable_scaling(int enable) { g_scaling = enable ? TRUE : FALSE; }
 void d3d8_present_set_render_scale(unsigned scale) { g_scale_override = scale > 4 ? 4 : scale; }
+void d3d8_present_set_canvas_aspect(unsigned num, unsigned den) { g_canvas_num = num; g_canvas_den = den; }
 
 void d3d8_present_set_aspect(int keep, unsigned num, unsigned den)
 {
@@ -49,6 +51,11 @@ void d3d8_present_set_linear_filter(int linear)
 
 BOOL d3d8_present_scaling(void) { return g_scaling; }
 UINT d3d8_present_render_scale(void) { return g_scale_override; }
+void d3d8_present_canvas_aspect(UINT *num, UINT *den)
+{
+    *num = g_scaling ? g_canvas_num : 0;
+    *den = g_scaling ? g_canvas_den : 0;
+}
 
 /* The display the window is on, re-read about once a second: the window can
  * be dragged to another monitor and the mode can change. */

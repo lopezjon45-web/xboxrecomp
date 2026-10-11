@@ -36,7 +36,11 @@ HWND                 d3d8_GetHWND(void);
 UINT                 d3d8_GetBackbufferWidth(void);
 UINT                 d3d8_GetBackbufferHeight(void);
 UINT                 d3d8_GetRenderScale(void);
-void                 d3d8_SetScissorRect(UINT x, UINT y, UINT w, UINT h);
+/* Host pixels per title pixel. Equal to the render scale, except across when
+ * the target is widened to a canvas (d3d8_present_set_canvas_aspect). */
+float                d3d8_GetCanvasScaleX(void);
+float                d3d8_GetCanvasScaleY(void);
+void                d3d8_SetScissorRect(UINT x, UINT y, UINT w, UINT h);
 void                 d3d8_SetBlendColor(DWORD argb);
 
 /* Presentation-only gamma. End restores the saved backbuffer even if Present fails. */
@@ -50,6 +54,7 @@ void d3d8_gamma_shutdown(void);
  * each present draws it into a swap chain that follows the window. */
 BOOL d3d8_present_scaling(void);
 UINT d3d8_present_render_scale(void);     /* 0 = no host override */
+void d3d8_present_canvas_aspect(UINT *num, UINT *den); /* 0, 0 = the title's own shape */
 int  d3d8_present_sync_interval(void);    /* -1 = no host choice; else Present's interval */
 void d3d8_present_trace_pacing(void);     /* RECOMP_PRESENT_PACING=1 */
 HRESULT d3d8_present_create_game_target(UINT width, UINT height, ID3D11RenderTargetView **rtv);

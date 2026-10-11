@@ -53,8 +53,31 @@ static inline D3D8PresentRect d3d8_present_fit(unsigned num, unsigned den,
     return r;
 }
 
+/* Width in pixels of the title's render target when it is widened to a canvas
+ * of aspect num:den. The title keeps its own logical size lw x lh; the target
+ * is lh * scale high and as wide as the canvas aspect asks, rounded to an even
+ * number, so the title's x coordinates are spread over a wider picture (the
+ * title widens its own projection to match). A canvas no wider than the
+ * title's own aspect, or a degenerate ratio, gives the usual lw * scale. */
+static inline unsigned d3d8_canvas_width(unsigned lw, unsigned lh, unsigned scale,
+                                         unsigned num, unsigned den)
+{
+    unsigned long long w;
+    unsigned base = lw * scale;
+    if (!num || !den || !lw || !lh || (unsigned long long)num * lh <= (unsigned long long)den * lw)
+        return base;
+    w = ((unsigned long long)lh * scale * num + den / 2) / den;
+    w = (w + 1) & ~1ull;
+    return w > base && w <= 16384 ? (unsigned)w : base;
+}
+
 /* Call before the device is created. */
 void d3d8_present_enable_scaling(int enable);
+
+/* Widen the title's render target to a canvas of aspect num:den (see
+ * d3d8_canvas_width); 0, 0 keeps the title's own shape. Only with scaling
+ * enabled. Call before the device is created. */
+void d3d8_present_set_canvas_aspect(unsigned num, unsigned den);
 
 /* The render scale to create the device with (1-4). 0 leaves the choice to
  * RECOMP_RENDER_SCALE and its default. Call before the device is created. */

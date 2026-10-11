@@ -16,6 +16,7 @@
  */
 
 #include "d3d8_internal.h"
+#include "d3d8_present.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -192,6 +193,16 @@ HWND                 d3d8_GetHWND(void) { return g_device_state.hwnd; }
 UINT                 d3d8_GetBackbufferWidth(void) { return g_device_state.logical_width; }
 UINT                 d3d8_GetBackbufferHeight(void) { return g_device_state.logical_height; }
 UINT                 d3d8_GetRenderScale(void) { return g_device_state.render_scale ? g_device_state.render_scale : 1; }
+float d3d8_GetCanvasScaleX(void)
+{
+    return g_device_state.logical_width ? (float)g_device_state.width / (float)g_device_state.logical_width
+                                        : (float)d3d8_GetRenderScale();
+}
+float d3d8_GetCanvasScaleY(void)
+{
+    return g_device_state.logical_height ? (float)g_device_state.height / (float)g_device_state.logical_height
+                                         : (float)d3d8_GetRenderScale();
+}
 const DWORD         *d3d8_GetRenderStates(void) { return g_device_state.render_states; }
 const DWORD         *d3d8_GetTSS(DWORD stage) { return (stage < MAX_TEXTURE_STAGES) ? g_device_state.tss[stage] : NULL; }
 IDirect3DBaseTexture8 *d3d8_GetStageTexture(DWORD stage) { return (stage < 4) ? g_cur_textures[stage] : NULL; }
@@ -351,7 +362,18 @@ static HRESULT d3d11_create_device_and_swap_chain(
 #endif
 
     state->hwnd = pp->hDeviceWindow;
-    state->width = state->logical_width * state->render_scale;
+    {
+        /* A widescreen canvas widens only the title's own target (scaling mode);
+         * the title's coordinates keep their range and spread over it. */
+        UINT num, den;
+        d3d8_present_canvas_aspect(&num, &den);
+        state->width = d3d8_canvas_width(state->logical_width, state->logical_height,
+                                         state->render_scale, num, den);
+        if (state->width != state->logical_width * state->render_scale)
+            fprintf(stderr, "D3D8: widescreen canvas %u:%u, target %ux%u for a %ux%u title\n",
+                    num, den, state->width, state->logical_height * state->render_scale,
+                    state->logical_width, state->logical_height);
+    }
     state->height = state->logical_height * state->render_scale;
 
     return S_OK;
@@ -1488,7 +1510,7 @@ static HRESULT __stdcall dev_SetViewport(IDirect3DDevice8 *self, const D3DVIEWPO
 void d3d8_SetScissorRect(UINT x, UINT y, UINT w, UINT h)
 {
     static UINT last[4] = { ~0u, ~0u, ~0u, ~0u };
-    UINT s = d3d8_GetRenderScale();
+    float sx = d3d8_GetCanvasScaleX(), sy = d3d8_GetCanvasScaleY();
     D3D11_RECT r;
     if (!g_device_state.d3d11_context)
         return;
@@ -1496,8 +1518,8 @@ void d3d8_SetScissorRect(UINT x, UINT y, UINT w, UINT h)
         return;
     last[0] = x; last[1] = y; last[2] = w; last[3] = h;
     if (w && h) {
-        r.left = (LONG)(x * s);       r.top = (LONG)(y * s);
-        r.right = (LONG)((x + w) * s); r.bottom = (LONG)((y + h) * s);
+        r.left = (LONG)(x * sx + 0.5f);       r.top = (LONG)(y * sy + 0.5f);
+        r.right = (LONG)((x + w) * sx + 0.5f); r.bottom = (LONG)((y + h) * sy + 0.5f);
     } else {
         r.left = 0; r.top = 0; r.right = 16384; r.bottom = 16384;
     }

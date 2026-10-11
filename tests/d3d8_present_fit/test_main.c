@@ -37,6 +37,32 @@ int main(void)
     expect("sliver", d3d8_present_fit(4, 3, 1000, 1, 1), 499, 0, 1, 1);
     expect("column", d3d8_present_fit(4, 3, 1, 1000, 1), 0, 499, 1, 1);
 
+    /* The widened render target: height times the canvas aspect, even, never narrower than the title. */
+    {
+        static const unsigned cases[][6] = {
+            /* lw, lh, scale, num, den, want */
+            { 640, 480, 2, 0, 0, 1280 },        /* no canvas */
+            { 640, 480, 2, 4, 3, 1280 },        /* the title's own shape */
+            { 640, 480, 1, 16, 9, 854 },        /* 853.3 -> 854 */
+            { 640, 480, 2, 16, 9, 1708 },       /* 1706.7 -> 1708 (rounded to even) */
+            { 640, 480, 2, 16, 10, 1536 },
+            { 640, 480, 4, 21, 9, 4480 },
+            { 640, 480, 4, 32, 9, 6828 },
+            { 640, 480, 2, 5, 4, 1280 },        /* narrower than 4:3: unchanged */
+            { 640, 480, 2, 1, 0, 1280 },        /* degenerate */
+            { 640, 480, 4, 1000, 1, 2560 },     /* beyond the texture limit: unchanged */
+        };
+        unsigned i;
+        for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            unsigned got = d3d8_canvas_width(cases[i][0], cases[i][1], cases[i][2], cases[i][3], cases[i][4]);
+            if (got != cases[i][5]) {
+                printf("FAIL canvas %u:%u at scale %u: got %u, want %u\n", cases[i][3], cases[i][4],
+                       cases[i][2], got, cases[i][5]);
+                g_failed++;
+            }
+        }
+    }
+
     /* Which displays can show 60 frames a second evenly. */
     {
         static const unsigned cases[][2] = {
