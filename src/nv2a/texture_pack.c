@@ -687,7 +687,7 @@ static const uint32_t k_sha256[64]={
     0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
     0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2};
 #define ROR(x,n) (((x)>>(n))|((x)<<(32-(n))))
-static void sha_block(Sha *sha,const uint8_t *p)
+static void sha_block_c(uint32_t state[8],const uint8_t *p)
 {
     uint32_t w[64],a,b,c,d,e,f,g,h,t1,t2,i;
     for(i=0;i<16;i++) w[i]=(uint32_t)p[i*4]<<24|(uint32_t)p[i*4+1]<<16|(uint32_t)p[i*4+2]<<8|p[i*4+3];
@@ -695,15 +695,73 @@ static void sha_block(Sha *sha,const uint8_t *p)
         uint32_t s0=ROR(w[i-15],7)^ROR(w[i-15],18)^(w[i-15]>>3),s1=ROR(w[i-2],17)^ROR(w[i-2],19)^(w[i-2]>>10);
         w[i]=w[i-16]+s0+w[i-7]+s1;
     }
-    a=sha->state[0]; b=sha->state[1]; c=sha->state[2]; d=sha->state[3];
-    e=sha->state[4]; f=sha->state[5]; g=sha->state[6]; h=sha->state[7];
+    a=state[0]; b=state[1]; c=state[2]; d=state[3];
+    e=state[4]; f=state[5]; g=state[6]; h=state[7];
     for(i=0;i<64;i++) {
         t1=h+(ROR(e,6)^ROR(e,11)^ROR(e,25))+((e&f)^(~e&g))+k_sha256[i]+w[i];
         t2=(ROR(a,2)^ROR(a,13)^ROR(a,22))+((a&b)^(a&c)^(b&c));
         h=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
     }
-    sha->state[0]+=a; sha->state[1]+=b; sha->state[2]+=c; sha->state[3]+=d;
-    sha->state[4]+=e; sha->state[5]+=f; sha->state[6]+=g; sha->state[7]+=h;
+    state[0]+=a; state[1]+=b; state[2]+=c; state[3]+=d;
+    state[4]+=e; state[5]+=f; state[6]+=g; state[7]+=h;
+}
+#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__)) && \
+    !defined(TEXTURE_PACK_NO_SHA_NI)
+/* x86 SHA extensions (Intel since Goldmont/Ice Lake, AMD since Zen; the Steam Deck has them).
+ * The texture hash runs on every bind refresh, and the C rounds above made it the largest
+ * cost on the GPU thread on Linux, where no system SHA-256 is used. Same digest, checked
+ * against the C rounds by the fixture. */
+#include <cpuid.h>
+#include <immintrin.h>
+#define TEXTURE_PACK_SHA_NI 1
+__attribute__((target("sha,sse4.1,ssse3")))
+static void sha_blocks_ni(uint32_t state[8],const uint8_t *p,size_t blocks)
+{
+    const __m128i swap=_mm_set_epi64x(0x0c0d0e0f08090a0bULL,0x0405060700010203ULL);
+    __m128i abef,cdgh,tmp,saved_abef,saved_cdgh,msg,w[4];
+    unsigned g;
+    tmp=_mm_shuffle_epi32(_mm_loadu_si128((const __m128i *)&state[0]),0xB1);   /* CDAB */
+    cdgh=_mm_shuffle_epi32(_mm_loadu_si128((const __m128i *)&state[4]),0x1B);  /* EFGH */
+    abef=_mm_alignr_epi8(tmp,cdgh,8);
+    cdgh=_mm_blend_epi16(cdgh,tmp,0xF0);
+    while(blocks--) {
+        saved_abef=abef; saved_cdgh=cdgh;
+        for(g=0;g<4;g++) w[g]=_mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(p+16*g)),swap);
+        for(g=0;g<16;g++) {
+            /* Four rounds on W[4g..4g+3], then the schedule's W[4g+16..4g+19] into the same slot. */
+            msg=_mm_add_epi32(w[g&3],_mm_loadu_si128((const __m128i *)&k_sha256[4*g]));
+            cdgh=_mm_sha256rnds2_epu32(cdgh,abef,msg);
+            abef=_mm_sha256rnds2_epu32(abef,cdgh,_mm_shuffle_epi32(msg,0x0E));
+            if(g<12)
+                w[g&3]=_mm_sha256msg2_epu32(_mm_add_epi32(_mm_sha256msg1_epu32(w[g&3],w[(g+1)&3]),
+                                                          _mm_alignr_epi8(w[(g+3)&3],w[(g+2)&3],4)),w[(g+3)&3]);
+        }
+        abef=_mm_add_epi32(abef,saved_abef); cdgh=_mm_add_epi32(cdgh,saved_cdgh);
+        p+=64;
+    }
+    tmp=_mm_shuffle_epi32(abef,0x1B);    /* FEBA */
+    cdgh=_mm_shuffle_epi32(cdgh,0xB1);   /* DCHG */
+    _mm_storeu_si128((__m128i *)&state[0],_mm_blend_epi16(tmp,cdgh,0xF0));   /* DCBA */
+    _mm_storeu_si128((__m128i *)&state[4],_mm_alignr_epi8(cdgh,tmp,8));      /* HGFE */
+}
+static int sha_ni_available(void)
+{
+    static int known=-1;
+    unsigned a,b,c,d;
+    if(known<0) {
+        known=__get_cpuid(1,&a,&b,&c,&d) && (c&bit_SSE4_1) && (c&bit_SSSE3) &&
+              __get_cpuid_count(7,0,&a,&b,&c,&d) && (b&(1u<<29));
+        if(getenv("RECOMP_TEXTURE_SHA_C")) known=0;   /* diagnostics: force the C rounds */
+    }
+    return known;
+}
+#endif
+static void sha_blocks(uint32_t state[8],const uint8_t *p,size_t blocks)
+{
+#if defined(TEXTURE_PACK_SHA_NI)
+    if(sha_ni_available()) { sha_blocks_ni(state,p,blocks); return; }
+#endif
+    for(;blocks;blocks--,p+=64) sha_block_c(state,p);
 }
 static int sha_start(Sha *sha)
 {
@@ -715,11 +773,14 @@ static int sha_add(Sha *sha,const void *data,size_t bytes)
 {
     const uint8_t *p=data;
     sha->bytes+=bytes;
-    while(bytes) {
+    if(sha->used) {
         size_t take=64-sha->used; if(take>bytes) take=bytes;
         memcpy(sha->block+sha->used,p,take); sha->used+=take; p+=take; bytes-=take;
-        if(sha->used==64) { sha_block(sha,sha->block); sha->used=0; }
+        if(sha->used<64) return 1;
+        sha_blocks(sha->state,sha->block,1); sha->used=0;
     }
+    if(bytes>=64) { sha_blocks(sha->state,p,bytes/64); p+=bytes&~(size_t)63; bytes&=63; }
+    memcpy(sha->block,p,bytes); sha->used=bytes;
     return 1;
 }
 static int sha_finish(Sha *sha,uint8_t out[32])

@@ -86,8 +86,47 @@ static HRESULT __stdcall create_texture(IDirect3DDevice8 *dev,UINT w,UINT h,UINT
     creates++; *out=&t->iface; return S_OK;
 }
 static void put32(uint8_t *p,uint32_t n) { unsigned i; for(i=0;i<4;i++) p[i]=(uint8_t)(n>>(8*i)); }
+static void sha_hex(const void *data,size_t bytes,size_t piece,char out[65])
+{
+    Sha sha; uint8_t digest[32]; size_t at; unsigned i;
+    assert(sha_start(&sha));
+    for(at=0;at<bytes;at+=piece) assert(sha_add(&sha,(const uint8_t *)data+at,bytes-at<piece ? bytes-at : piece));
+    assert(sha_finish(&sha,digest));
+    for(i=0;i<32;i++) sprintf(out+i*2,"%02x",digest[i]);
+}
+/* The host SHA-256 against FIPS 180-2 vectors, fed whole and in odd pieces (block buffering),
+ * and, where the x86 SHA extensions are compiled in, their block function against the C one. */
+static void check_sha256(void)
+{
+    static uint8_t million[1000000];
+    char out[65];
+    size_t pieces[]={1000000,1,63,64,65,4096+7};
+    unsigned i;
+    sha_hex("abc",3,3,out);
+    assert(!strcmp(out,"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+    sha_hex("",0,1,out);
+    assert(!strcmp(out,"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"));
+    sha_hex("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",56,56,out);
+    assert(!strcmp(out,"248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"));
+    memset(million,'a',sizeof million);
+    for(i=0;i<sizeof pieces/sizeof pieces[0];i++) {
+        sha_hex(million,sizeof million,pieces[i],out);
+        assert(!strcmp(out,"cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"));
+    }
+#if defined(TEXTURE_PACK_SHA_NI)
+    if(sha_ni_available()) {
+        uint32_t ni[8]={1,2,3,4,5,6,7,8},c[8]={1,2,3,4,5,6,7,8};
+        for(i=0;i<sizeof million;i++) million[i]=(uint8_t)(i*2654435761u>>13);
+        sha_blocks_ni(ni,million,sizeof million/64);
+        for(i=0;i<sizeof million/64;i++) sha_block_c(c,million+i*64);
+        assert(!memcmp(ni,c,sizeof ni));
+        printf("texture-pack fixture: SHA-256 with the x86 SHA extensions\n");
+    } else printf("texture-pack fixture: this CPU has no SHA extensions; C rounds only\n");
+#endif
+}
 int main(void)
 {
+    check_sha256();
     uint8_t raw[128],palette[16],changed[128],pixel[16]={0,0,255,255, 255,0,0,0, 255,0,0,0, 255,0,0,0};
     char id[65],other[65],root[1024],path[1024],manifest[1024];
     RecompTextureSource source={1,11,16,8,16,raw,128,0,0,0,palette,4};
