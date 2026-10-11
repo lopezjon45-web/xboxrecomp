@@ -188,15 +188,17 @@ int main(void)
     }
 #if !defined(_WIN32)
     {
-        /* Ranges across pages: readable, readable then protected, protected in the middle. */
-        uint8_t *pages=mmap(NULL,4*4096,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);
+        /* Ranges across pages: readable, readable then protected, protected in the middle.
+         * Pages are the host's (16 KiB on Apple Silicon). */
+        size_t pg=(size_t)sysconf(_SC_PAGESIZE);
+        uint8_t *pages=mmap(NULL,4*pg,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);
         assert(pages!=MAP_FAILED);
-        memset(pages,7,4*4096);
-        assert(mprotect(pages+2*4096,4096,PROT_NONE)==0);
-        assert(readable(pages+100,2*4096-100) && readable(pages+4095,2));
-        assert(!readable(pages+4096,4096+1) && !readable(pages+100,4*4096-100) && !readable(pages+2*4096,1));
-        assert(readable(pages+3*4096,4096) && !readable(pages+4096,3*4096));
-        assert(munmap(pages,4*4096)==0);
+        memset(pages,7,4*pg);
+        assert(mprotect(pages+2*pg,pg,PROT_NONE)==0);
+        assert(readable(pages+100,2*pg-100) && readable(pages+pg-1,2));
+        assert(!readable(pages+pg,pg+1) && !readable(pages+100,4*pg-100) && !readable(pages+2*pg,1));
+        assert(readable(pages+3*pg,pg) && !readable(pages+pg,3*pg));
+        assert(munmap(pages,4*pg)==0);
     }
 #endif
     assert(!valid_name("../escape.png",1) && !valid_name("C:/escape.png",1) && !valid_name("a\\b.png",1));
