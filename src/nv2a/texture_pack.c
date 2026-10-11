@@ -22,6 +22,10 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#include <sys/uio.h>
+#endif
 #define _stricmp strcasecmp
 #endif
 
@@ -620,6 +624,35 @@ static int memory_readable(const void *data,uint64_t bytes)
     FILE *maps;
     char line[512];
     if(end<begin) return 0;
+#if defined(__linux__) && defined(SYS_process_vm_readv)
+    {
+        /* One byte of every page, read through the kernel: an inaccessible page makes the
+         * read stop short instead of raising the trap. Parsing /proc/self/maps for every
+         * hash refresh took a quarter of the GPU thread on a Steam Deck with the HD packs;
+         * it stays as the fallback where the call is refused (seccomp, old kernels). */
+        static int refused;
+        static uintptr_t page;
+        if(!refused) {
+            char sink[64];
+            struct iovec local, remote[64];
+            if(!page) { long size=sysconf(_SC_PAGESIZE); page=size>0 ? (uintptr_t)size : 4096u; }
+            at=begin&~(page-1);
+            while(at<end) {
+                long got; unsigned n=0;
+                for(;n<64 && at<end;n++,at+=page) {
+                    remote[n].iov_base=(void *)(at<begin ? begin : at); remote[n].iov_len=1;
+                }
+                local.iov_base=sink; local.iov_len=n;
+                got=syscall(SYS_process_vm_readv,(long)getpid(),&local,1ul,remote,(unsigned long)n,0ul);
+                if(got==(long)n) continue;
+                if(got<0 && (errno==ENOSYS || errno==EPERM)) { refused=1; break; }
+                return 0;
+            }
+            if(!refused) return 1;
+            at=begin;
+        }
+    }
+#endif
     maps=fopen("/proc/self/maps","r");
     if(!maps) return 1;
     while(at<end && fgets(line,sizeof line,maps)) {
