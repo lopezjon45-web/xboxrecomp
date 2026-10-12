@@ -309,12 +309,76 @@ static void plan_slots(int pads)
 }
 
 #ifdef XBOXRECOMP_HAVE_SDL3
+/* Steam Input (the Steam Deck's game mode, and any pad Steam owns) shows SDL two
+ * pads for one controller: the physical device and the "Steam Virtual Gamepad"
+ * Steam builds from it. Both report every press, so each would be a player and
+ * the title would see each press twice. The virtual pad is the one Steam wants
+ * games to read, so a physical Valve pad is ignored while one exists. */
+#define VALVE_VENDOR 0x28de
+
+static int is_steam_virtual(SDL_JoystickID id)
+{
+    const char *n = SDL_GetGamepadNameForID(id);
+    return n && strncmp(n, "Steam Virtual Gamepad", 21) == 0;
+}
+
+static int steam_virtual_present(void)
+{
+    int count = 0, i, found = 0;
+    SDL_JoystickID *ids = SDL_GetGamepads(&count);
+    for (i = 0; ids && i < count && !found; i++) found = is_steam_virtual(ids[i]);
+    SDL_free(ids);
+    return found;
+}
+
+static int is_steam_duplicate(SDL_JoystickID id)
+{
+    return SDL_GetGamepadVendorForID(id) == VALVE_VENDOR && !is_steam_virtual(id) &&
+           steam_virtual_present();
+}
+
+static void open_sdl_gamepad(SDL_JoystickID id);
+
+/* After pads come or go: close a physical pad Steam duplicates, open one a
+ * departed virtual pad was hiding, and close the gap a dropped pad leaves so the
+ * remaining pad is player 1. */
+static void steam_reconcile(void)
+{
+    int d, s, count = 0, i;
+    SDL_JoystickID *ids;
+    EnterCriticalSection(&H.cs);
+    for (d = 0; d < MAX_DEVICES; d++)
+        if (H.dev[d].used && H.dev[d].backend == 1 && !H.dev[d].is_virtual && is_steam_duplicate(H.dev[d].id)) {
+            log_line("[INPUT] %s ignored: Steam's virtual gamepad stands for it\n", H.dev[d].name, 0);
+            free_device(d);
+        }
+    LeaveCriticalSection(&H.cs);
+    ids = SDL_GetGamepads(&count);
+    for (i = 0; ids && i < count; i++)
+        if (!(H.cfg.no_pads && !is_virtual_id(ids[i]))) open_sdl_gamepad(ids[i]);
+    SDL_free(ids);
+    EnterCriticalSection(&H.cs);
+    for (d = 0; d < MAX_DEVICES; d++) {
+        if (!H.dev[d].used || H.dev[d].slot < 0) continue;
+        for (s = 0; s < H.dev[d].slot; s++) {
+            if (s == H.kb_slot || H.slot[s].device >= 0) continue;
+            H.slot[H.dev[d].slot].device = -1;
+            H.slot[s].device = d;
+            H.dev[d].slot = s;
+            log_line("[INPUT] %s is player %d\n", H.dev[d].name, s + 1);
+            break;
+        }
+    }
+    LeaveCriticalSection(&H.cs);
+}
+
 static void open_sdl_gamepad(SDL_JoystickID id)
 {
     SDL_Gamepad *gp;
     int d, i;
     for (i = 0; i < MAX_DEVICES; i++)
         if (H.dev[i].used && H.dev[i].backend == 1 && H.dev[i].id == id) return;
+    if (is_steam_duplicate(id)) return;
     gp = SDL_OpenGamepad(id);
     if (!gp) {
         log_line("[INPUT] could not open pad: %s\n", SDL_GetError(), 0);
@@ -501,10 +565,12 @@ static void hotplug_once(void)
     int d;
 #ifdef XBOXRECOMP_HAVE_SDL3
     if (H.sdl) {
+        int changed = 0;
 #if defined(_WIN32)
         SDL_Event e;
         SDL_UpdateGamepads();
         while (SDL_PollEvent(&e)) {
+            if (e.type == SDL_EVENT_GAMEPAD_ADDED || e.type == SDL_EVENT_GAMEPAD_REMOVED) changed = 1;
             if (e.type == SDL_EVENT_GAMEPAD_ADDED) {
                 if (!(H.cfg.no_pads && !is_virtual_id(e.gdevice.which)))
                     open_sdl_gamepad(e.gdevice.which);
@@ -536,6 +602,7 @@ static void hotplug_once(void)
             }
             SDL_UnlockSpinlock(&g_pad_event_lock);
             if (!n) break;
+            changed = 1;
             if (added) {
                 if (!(H.cfg.no_pads && !is_virtual_id(id)))
                     open_sdl_gamepad(id);
@@ -548,6 +615,7 @@ static void hotplug_once(void)
             }
         }
 #endif
+        if (changed) steam_reconcile();
         return;
     }
 #endif
@@ -623,6 +691,11 @@ static DWORD WINAPI reader_thread(LPVOID unused)
         for (i = 0; ids && i < count && i < MAX_DEVICES; i++) {
             SDL_Gamepad *gp;
             if (H.cfg.no_pads && !is_virtual_id(ids[i])) continue;
+            if (is_steam_duplicate(ids[i])) {
+                fprintf(stderr, "[INPUT] %s ignored: Steam's virtual gamepad stands for it\n",
+                        SDL_GetGamepadNameForID(ids[i]));
+                continue;
+            }
             gp = SDL_OpenGamepad(ids[i]);
             if (!gp) continue;
             d = new_device(1, SDL_GetGamepadName(gp));
