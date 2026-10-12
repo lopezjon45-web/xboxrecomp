@@ -51,8 +51,17 @@ static struct SourceState {
     char id[65];
     ULONGLONG checked;
     uint64_t quick;          /* texture_pack_quick() of the bytes that gave id */
-    int used, dumped, has_quick;
+    ULONGLONG interval;      /* ms between checks: REVALIDATE_MIN_MS while the bytes move, up to REVALIDATE_STABLE_MS */
+    unsigned changes;        /* consecutive checks that found new bytes */
+    int used, dumped, has_quick, unstable;
 } g_sources[SOURCE_SLOTS];
+/* Identity checks back off per source. A stable texture is re-read at most every 64 ms; one whose
+ * bytes change on three checks in a row is treated as dynamic and drawn with its original
+ * texture for up to 500 ms between checks, since a frame-specific texture would not match a pack anyway. */
+#define REVALIDATE_MIN_MS 8
+#define REVALIDATE_STABLE_MS 64
+#define REVALIDATE_UNSTABLE_CHANGES 3
+#define REVALIDATE_UNSTABLE_MS 500
 static unsigned g_source_next;
 #if defined(_WIN32)
 static IWICImagingFactory *g_wic;
@@ -65,7 +74,7 @@ static uint64_t g_budget, g_resident, g_clock, g_hits, g_misses, g_hashed, g_dum
 static unsigned g_errors,g_loads;
 static int g_trace, g_sync_load;
 /* Counted over two seconds and logged with the frame rate, so a play log shows what the packs cost. */
-static struct { ULONGLONG start; unsigned loads, evictions, rejected, max_ms; uint64_t ms, bytes; } g_win;
+static struct { ULONGLONG start; unsigned loads, evictions, rejected, max_ms, revalidated, full_hashes; uint64_t ms, bytes, revalidated_bytes; } g_win;
 
 /* ---- Host services. Everything below this block is the same code on every host. ---- */
 static ULONGLONG now_ms(void);
@@ -244,6 +253,7 @@ int texture_pack_hash(const RecompTextureSource *s,char out[65])
     } else { if(ok) ok=sha_add(&sha,s->data,s->bytes); g_hashed+=s->bytes; }
     if(ok && s->palette_entries) ok=sha_add(&sha,s->palette,s->palette_entries*4);
     if(!sha_finish(&sha,result) || !ok) return 0;
+    g_win.full_hashes++;
     for(i=0;i<32;i++) sprintf(out+i*2,"%02x",result[i]);
     return 1;
 }
@@ -275,6 +285,7 @@ static int texture_pack_quick(const RecompTextureSource *s,uint64_t *out)
     uint64_t lane[4]={0x60ea27eeadc0b5d6ull,0xc2b2ae3d27d4eb4full,0,0x61c8864e7a143579ull},h;
     unsigned i;
     if(!source_readable(s)) return 0;
+    g_win.revalidated++; g_win.revalidated_bytes+=s->bytes;
     if(s->stride) for(i=0;i<s->rows;i++) quick_add(lane,(const uint8_t *)s->data+(size_t)i*s->stride,s->row_bytes);
     else quick_add(lane,s->data,s->bytes);
     if(s->palette_entries) quick_add(lane,s->palette,s->palette_entries*4u);
@@ -702,6 +713,9 @@ int texture_pack_bind(IDirect3DDevice8 *dev,unsigned stage,const RecompTextureSo
             fprintf(stderr,"  [TEXPACK] %.1fs: %u replacements uploaded (%llu MiB, %llu ms on the render thread, slowest %u ms), %u evicted, %llu of %llu MiB resident\n",
                     (double)(now-g_win.start)/1000.0,g_win.loads,(unsigned long long)(g_win.bytes>>20),(unsigned long long)g_win.ms,g_win.max_ms,
                     g_win.evictions,(unsigned long long)(g_resident>>20),(unsigned long long)(g_budget>>20));
+        if(g_trace)
+            fprintf(stderr,"  [TEXPACK] %.1fs: %u source revalidations (%llu MiB read), %u full hashes\n",
+                    (double)(now-g_win.start)/1000.0,g_win.revalidated,(unsigned long long)(g_win.revalidated_bytes>>20),g_win.full_hashes);
         memset(&g_win,0,sizeof g_win); g_win.start=now;
     }
     for(i=0;i<4;i++) {
@@ -709,13 +723,16 @@ int texture_pack_bind(IDirect3DDevice8 *dev,unsigned stage,const RecompTextureSo
         if(c->used && c->shape.address==s->address && c->shape.format==s->format && c->shape.width==s->width &&
            c->shape.height==s->height && c->shape.row_texels==s->row_texels && c->shape.palette==s->palette && c->shape.palette_entries==s->palette_entries) { state=c; break; }
     }
-    if(state && now-state->checked<8) memcpy(id,state->id,65);
-    else if(state && state->has_quick && same_layout(&state->shape,s) &&
-            (have_quick=texture_pack_quick(s,&quick)) && quick==state->quick) {
-        memcpy(id,state->id,65); state->checked=now;
+    if(state && now-state->checked<state->interval) {
+        if(state->unstable) return 0;          /* dynamic texture: serve the original until its bytes settle */
+        memcpy(id,state->id,65);
+    } else if(state && state->has_quick && same_layout(&state->shape,s) &&
+              (have_quick=texture_pack_quick(s,&quick)) && quick==state->quick) {
+        memcpy(id,state->id,65); state->checked=now; state->changes=0; state->unstable=0;
+        state->interval = state->interval<REVALIDATE_STABLE_MS ? state->interval*2 : REVALIDATE_STABLE_MS;
     } else {
         { ULONGLONG h0=now_ms(); int ok=texture_pack_hash(s,id), ms=(int)(now_ms()-h0);
-          if(ms>=2 && g_trace) fprintf(stderr,"[TEXPACK] hash %ux%u fmt %x: %d ms\n",s->width,s->height,s->format,ms);
+          if(ms>=1 && g_trace) fprintf(stderr,"[TEXPACK] hash %ux%u fmt %x: %d ms\n",s->width,s->height,s->format,ms);
           if(!ok) return 0; }
         if(!state) {
             state=&g_sources[slot];
@@ -724,12 +741,14 @@ int texture_pack_bind(IDirect3DDevice8 *dev,unsigned stage,const RecompTextureSo
                 if(!candidate->used) { state=candidate; break; }
                 if(candidate->checked<state->checked) state=candidate;
             }
-            state->dumped=0;
-        }
+            state->dumped=0; state->changes=0; state->unstable=0;
+        } else state->changes++;
         if(state->used && strcmp(state->id,id)) state->dumped=0;
         state->shape=*s; state->checked=now; memcpy(state->id,id,65); state->used=1;
         state->has_quick=have_quick || texture_pack_quick(s,&quick);
         state->quick=quick;
+        if(state->changes>=REVALIDATE_UNSTABLE_CHANGES) { state->unstable=1; state->interval=REVALIDATE_UNSTABLE_MS; }
+        else state->interval=REVALIDATE_MIN_MS;
     }
     if(!state->dumped && g_dump[0] && g_dumps<(uint64_t)g_dump_limit && sample && source_readable(s)) {
         state->dumped=1;
@@ -791,7 +810,18 @@ void texture_pack_shutdown(IDirect3DDevice8 *dev)
 
 /* ---- Host services: Windows (WIC, BCrypt, VirtualQuery) ---- */
 #if defined(_WIN32)
-static ULONGLONG now_ms(void) { return GetTickCount64(); }
+/* Monotonic and sub-millisecond. GetTickCount64 advances in 15.6 ms steps, which made the
+ * 8 ms re-identify window in texture_pack_bind expire on almost every bind and hid the true
+ * cost of each hash in the trace (every timing read 15 or 16 ms). The POSIX clock has no such step. */
+static ULONGLONG now_ms(void)
+{
+    LARGE_INTEGER frequency, ticks;
+    ULONGLONG count, hz;
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&ticks);
+    count=(ULONGLONG)ticks.QuadPart; hz=(ULONGLONG)frequency.QuadPart;
+    return (count/hz)*1000u + (count%hz)*1000u/hz;
+}
 static int file_exists(const char *path) { return GetFileAttributesA(path)!=INVALID_FILE_ATTRIBUTES; }
 static void make_directories(const char *path) { SHCreateDirectoryExA(NULL,path,NULL); }
 static int memory_readable(const void *data,uint64_t bytes)
