@@ -491,13 +491,23 @@ static unsigned source_slot(const RecompTextureSource *s)
     key^=key>>15; key*=0x846ca68bu; key^=key>>16;
     return key & (SOURCE_SLOTS-1);
 }
-#if !defined(_WIN32)
-/* ---- Background decoding (POSIX). ----------------------------------------------------
+/* ---- Background decoding. ------------------------------------------------------------
  * Reading a replacement is a PNG decode and a mip chain: 100 to 350 ms for the big menu art,
  * and done on the render thread at the first bind it stalled every screen change. Workers do
  * that part; the render thread only creates the texture and copies the chain in. Until a
  * replacement is ready the original texture is drawn. */
+#if defined(_WIN32)
+typedef CRITICAL_SECTION PoolLock;
+typedef CONDITION_VARIABLE PoolCond;
+typedef HANDLE PoolThread;
+#define POOL_THREAD_RESULT DWORD WINAPI
+#else
 #include <pthread.h>
+typedef pthread_mutex_t PoolLock;
+typedef pthread_cond_t PoolCond;
+typedef pthread_t PoolThread;
+#define POOL_THREAD_RESULT void *
+#endif
 #define LOAD_JOBS 16
 #define LOAD_WORKERS 3
 #define LOAD_STALE_MS 4000
@@ -512,53 +522,123 @@ typedef struct LoadJob {
     ULONGLONG done_at;
 } LoadJob;
 static LoadJob g_jobs[LOAD_JOBS];
-static pthread_mutex_t g_job_lock=PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t g_job_wake=PTHREAD_COND_INITIALIZER;
-static pthread_t g_workers[LOAD_WORKERS];
+#if defined(_WIN32)
+static PoolLock g_job_lock;
+static PoolCond g_job_wake;
+#else
+static PoolLock g_job_lock=PTHREAD_MUTEX_INITIALIZER;
+static PoolCond g_job_wake=PTHREAD_COND_INITIALIZER;
+#endif
+static PoolThread g_workers[LOAD_WORKERS];
 static int g_worker_count, g_workers_stop;
 
-static void *load_worker(void *unused)
+static void pool_lock(void)
+{
+#if defined(_WIN32)
+    EnterCriticalSection(&g_job_lock);
+#else
+    pthread_mutex_lock(&g_job_lock);
+#endif
+}
+static void pool_unlock(void)
+{
+#if defined(_WIN32)
+    LeaveCriticalSection(&g_job_lock);
+#else
+    pthread_mutex_unlock(&g_job_lock);
+#endif
+}
+static void pool_wait(void)             /* with the lock held; returns with it held */
+{
+#if defined(_WIN32)
+    SleepConditionVariableCS(&g_job_wake,&g_job_lock,INFINITE);
+#else
+    pthread_cond_wait(&g_job_wake,&g_job_lock);
+#endif
+}
+static void pool_wake(int all)
+{
+#if defined(_WIN32)
+    if(all) WakeAllConditionVariable(&g_job_wake); else WakeConditionVariable(&g_job_wake);
+#else
+    if(all) pthread_cond_broadcast(&g_job_wake); else pthread_cond_signal(&g_job_wake);
+#endif
+}
+
+static POOL_THREAD_RESULT load_worker(
+#if defined(_WIN32)
+    LPVOID unused
+#else
+    void *unused
+#endif
+    )
 {
     (void)unused;
-#if defined(__linux__) && defined(SYS_gettid)
-    setpriority(PRIO_PROCESS,(id_t)syscall(SYS_gettid),10); /* the render and audio threads come first */
+#if defined(_WIN32)
+    /* WIC wants COM on every thread that calls it; the factory itself is free-threaded. */
+    HRESULT com=CoInitializeEx(NULL,COINIT_MULTITHREADED);
+    SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_BELOW_NORMAL);   /* the render and audio threads come first */
+#elif defined(__linux__) && defined(SYS_gettid)
+    setpriority(PRIO_PROCESS,(id_t)syscall(SYS_gettid),10);
 #endif
-    pthread_mutex_lock(&g_job_lock);
+    pool_lock();
     for(;;) {
         LoadJob *job=NULL; int i; Prepared *image; int retry=0;
         for(i=0;i<LOAD_JOBS;i++) if(g_jobs[i].state==JOB_QUEUED) { job=&g_jobs[i]; break; }
         if(!job) {
             if(g_workers_stop) break;
-            pthread_cond_wait(&g_job_wake,&g_job_lock);
+            pool_wait();
             continue;
         }
         job->state=JOB_RUNNING;
-        pthread_mutex_unlock(&g_job_lock);
+        pool_unlock();
         image=prepare_png(job->path,job->w,job->h,job->row_texels,job->channel_mips,&retry);
-        pthread_mutex_lock(&g_job_lock);
+        pool_lock();
         job->image=image; job->retry=retry; job->done_at=now_ms(); job->state=JOB_DONE;
     }
-    pthread_mutex_unlock(&g_job_lock);
+    pool_unlock();
+#if defined(_WIN32)
+    if(SUCCEEDED(com)) CoUninitialize();
+    return 0;
+#else
     return NULL;
+#endif
 }
 static int workers_start(void)
 {
+    int want;
+#if defined(_WIN32)
+    SYSTEM_INFO info; GetSystemInfo(&info);
+    want=info.dwNumberOfProcessors>=6 ? LOAD_WORKERS : info.dwNumberOfProcessors>=3 ? 2 : 1;
+#else
     long cpus=sysconf(_SC_NPROCESSORS_ONLN);
-    int want=cpus>=6 ? LOAD_WORKERS : cpus>=3 ? 2 : 1;
+    want=cpus>=6 ? LOAD_WORKERS : cpus>=3 ? 2 : 1;
+#endif
     if(g_worker_count) return 1;
     g_workers_stop=0;
+#if defined(_WIN32)
+    { static int ready; if(!ready) { InitializeCriticalSection(&g_job_lock); InitializeConditionVariable(&g_job_wake); ready=1; } }
+    while(g_worker_count<want && (g_workers[g_worker_count]=CreateThread(NULL,0,load_worker,NULL,0,NULL))) g_worker_count++;
+#else
     while(g_worker_count<want && !pthread_create(&g_workers[g_worker_count],NULL,load_worker,NULL)) g_worker_count++;
+#endif
     return g_worker_count>0;
 }
 static void workers_stop(void)
 {
     int i;
     if(!g_worker_count) return;
-    pthread_mutex_lock(&g_job_lock);
+    pool_lock();
     g_workers_stop=1;
-    pthread_cond_broadcast(&g_job_wake);
-    pthread_mutex_unlock(&g_job_lock);
-    for(i=0;i<g_worker_count;i++) pthread_join(g_workers[i],NULL);
+    pool_wake(1);
+    pool_unlock();
+    for(i=0;i<g_worker_count;i++) {
+#if defined(_WIN32)
+        WaitForSingleObject(g_workers[i],INFINITE); CloseHandle(g_workers[i]);
+#else
+        pthread_join(g_workers[i],NULL);
+#endif
+    }
     g_worker_count=0;
     for(i=0;i<LOAD_JOBS;i++) { prepared_free(g_jobs[i].image); memset(&g_jobs[i],0,sizeof g_jobs[i]); }
     for(i=0;(size_t)i<g_count;i++) g_entries[i].job=NULL;
@@ -567,14 +647,15 @@ static void workers_stop(void)
 static void jobs_reap(ULONGLONG now)
 {
     int i;
-    pthread_mutex_lock(&g_job_lock);
+    if(!g_worker_count) return;
+    pool_lock();
     for(i=0;i<LOAD_JOBS;i++) {
         LoadJob *job=&g_jobs[i];
         if(job->state==JOB_DONE && now-job->done_at>LOAD_STALE_MS) {
             job->entry->job=NULL; prepared_free(job->image); memset(job,0,sizeof *job);
         }
     }
-    pthread_mutex_unlock(&g_job_lock);
+    pool_unlock();
 }
 /* 1 uploaded, 0 rejected for good, -1 try again later, -2 still being decoded. */
 static int upload_png_async(IDirect3DDevice8 *dev,PackEntry *e,const RecompTextureSource *source,ULONGLONG now)
@@ -582,32 +663,32 @@ static int upload_png_async(IDirect3DDevice8 *dev,PackEntry *e,const RecompTextu
     LoadJob *job=e->job; int i, result;
     if(!job) {
         if(!workers_start()) return upload_png(dev,e,source);
-        pthread_mutex_lock(&g_job_lock);
+        pool_lock();
         for(i=0;i<LOAD_JOBS && g_jobs[i].state!=JOB_FREE;i++) ;
-        if(i==LOAD_JOBS) { pthread_mutex_unlock(&g_job_lock); return -2; }
+        if(i==LOAD_JOBS) { pool_unlock(); return -2; }
         job=&g_jobs[i]; memset(job,0,sizeof *job);
         job->entry=e; snprintf(job->path,sizeof job->path,"%s",e->path);
         job->w=source->width; job->h=source->height; job->row_texels=source->row_texels;
         job->channel_mips=e->channel_mips; job->state=JOB_QUEUED;
         e->job=job;
-        pthread_cond_signal(&g_job_wake);
-        pthread_mutex_unlock(&g_job_lock);
+        pool_wake(0);
+        pool_unlock();
         return -2;
     }
-    pthread_mutex_lock(&g_job_lock);
-    if(job->state!=JOB_DONE) { pthread_mutex_unlock(&g_job_lock); return -2; }
-    pthread_mutex_unlock(&g_job_lock);
+    pool_lock();
+    if(job->state!=JOB_DONE) { pool_unlock(); return -2; }
+    pool_unlock();
     /* A worker never touches a finished job again, so it is ours until we free it. */
     e->job=NULL;
     if(!job->image) result=job->retry ? -1 : 0;
     else { result=commit_prepared(dev,e,job->image); prepared_free(job->image); }
-    pthread_mutex_lock(&g_job_lock);
+    pool_lock();
     memset(job,0,sizeof *job);
-    pthread_mutex_unlock(&g_job_lock);
+    pool_unlock();
     (void)now;
     return result;
 }
-#endif
+
 int texture_pack_bind(IDirect3DDevice8 *dev,unsigned stage,const RecompTextureSource *s,RecompTextureSample sample,void *user)
 {
     struct SourceState *state=NULL; char id[65]; PackEntry *entry;
@@ -679,13 +760,9 @@ int texture_pack_bind(IDirect3DDevice8 *dev,unsigned stage,const RecompTextureSo
         int is_dds=extension && !_stricmp(extension,".dds");
         ULONGLONG t0=now_ms();
         int loaded;
-#if !defined(_WIN32)
         jobs_reap(now);
         loaded=is_dds ? upload_dds(dev,entry,s) : g_sync_load ? upload_png(dev,entry,s) : upload_png_async(dev,entry,s,now);
         if(loaded==-2) return 0;
-#else
-        loaded=is_dds ? upload_dds(dev,entry,s) : upload_png(dev,entry,s);
-#endif
         { unsigned took=(unsigned)(now_ms()-t0);
           if(loaded>0) { g_win.loads++; g_win.ms+=took; g_win.bytes+=entry->bytes; if(took>g_win.max_ms) g_win.max_ms=took; }
           if(g_trace) fprintf(stderr,"[TEXPACK] upload %s %ux%u: %u ms (%d)\n",entry->id,s->width,s->height,took,loaded); }
@@ -703,9 +780,7 @@ void texture_pack_shutdown(IDirect3DDevice8 *dev)
     size_t i;
     if(g_active) fprintf(stderr,"[TEXPACK] hits=%llu misses=%llu dumps=%llu hashed=%llu resident=%llu\n",
         (unsigned long long)g_hits,(unsigned long long)g_misses,(unsigned long long)g_dumps,(unsigned long long)g_hashed,(unsigned long long)g_resident);
-#if !defined(_WIN32)
     workers_stop();
-#endif
     if(dev) for(i=0;i<g_count;i++) release_entry(dev,&g_entries[i]);
     free(g_entries); g_entries=NULL; g_count=g_capacity=0;
     memset(g_sources,0,sizeof g_sources);

@@ -30,6 +30,11 @@ static void temp_root(char *root,size_t size)
 }
 #define _putenv_s(name,value) setenv(name,value,1)
 #endif
+#if defined(_WIN32)
+static void nap_ms(unsigned ms) { Sleep(ms); }
+#else
+static void nap_ms(unsigned ms) { usleep(ms*1000u); }
+#endif
 typedef struct MockTexture {
     IDirect3DTexture8 iface;
     unsigned refs, levels, uploads;
@@ -310,7 +315,6 @@ int main(void)
     assert(make_room(&device,64));
     for(i=0;i<4;i++) assert(!bound[i]);
     assert(!g_entries[0].texture && g_resident==0);
-#if !defined(_WIN32)
     /* The background decoder: pending first, then the same texture the synchronous path builds;
      * a missing file is rejected for good; a decode nobody collects is dropped. */
     {
@@ -323,7 +327,7 @@ int main(void)
         for(spins=0;spins<2000;spins++) {
             result=upload_png_async(&device,&g_entries[0],&source,0);
             if(result!=-2) break;
-            usleep(1000);
+            nap_ms(1);
         }
         assert(spins<2000 && result==1 && !g_entries[0].job);
         async_texture=(MockTexture *)g_entries[0].texture;
@@ -335,19 +339,18 @@ int main(void)
         for(spins=0;spins<2000;spins++) {
             result=upload_png_async(&device,&g_entries[0],&source,0);
             if(result!=-2) break;
-            usleep(1000);
+            nap_ms(1);
         }
         assert(spins<2000 && result==0 && !g_entries[0].texture && !g_entries[0].job);
         snprintf(g_entries[0].path,PATH_CAP,"%s",path);
         assert(upload_png_async(&device,&g_entries[0],&source,0)==-2);
-        usleep(200000);                                  /* decoded, never collected */
+        nap_ms(200);                                  /* decoded, never collected */
         jobs_reap(now_ms()+LOAD_STALE_MS+1);
         assert(!g_entries[0].job);
         assert(upload_png_async(&device,&g_entries[0],&source,0)==-2);   /* asked for again */
-        for(spins=0;spins<2000 && upload_png_async(&device,&g_entries[0],&source,0)==-2;spins++) usleep(1000);
+        for(spins=0;spins<2000 && upload_png_async(&device,&g_entries[0],&source,0)==-2;spins++) nap_ms(1);
         release_entry(&device,&g_entries[0]);
     }
-#endif
     texture_pack_shutdown(&device);
 #if defined(_WIN32)
     CoUninitialize();
