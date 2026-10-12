@@ -113,7 +113,7 @@ void pgraph_d3d11_set_placement(float kx, float bx);
  * (1 = off); hud_reach = how far towards the screen edge anchored HUD pieces go
  * (1 = the edge). The heartbeat, once per game tick, says a fight HUD is up. */
 void nv2a_ws_configure(float k, float hud_reach);
-void nv2a_ws_hud_heartbeat(void);
+void nv2a_ws_hud_heartbeat(int bottom_rows);
 void nv2a_ws_set_side_fill(int on);
 
 /* The title's register combiners for the next draws (see the .c). */

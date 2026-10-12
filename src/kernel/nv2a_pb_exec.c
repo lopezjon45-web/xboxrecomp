@@ -727,6 +727,8 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
 static volatile float s_ws_k = 1.0f, s_ws_reach = 1.0f;
 static volatile int s_ws_side_fill = 1;
 static volatile uint32_t s_ws_hud_flip = 0xFFFFFFF0u;
+static volatile int s_ws_hud_bottom;     /* 3-4 fighters: HUD blocks in the bottom corners too */
+static int s_ws_frame_3d, s_ws_frame_pic;  /* this frame drew 3D / centred a full-screen picture */
 static uint32_t s_ws_counts[6];
 
 void nv2a_ws_configure(float k, float hud_reach)
@@ -739,8 +741,26 @@ void nv2a_ws_configure(float k, float hud_reach)
  * extension beside it at present; 0: black. */
 void nv2a_ws_set_side_fill(int on) { s_ws_side_fill = on ? 1 : 0; }
 
-/* Call once per game tick while a fight's HUD is up. */
-void nv2a_ws_hud_heartbeat(void) { s_ws_hud_flip = s_gpu.flips; }
+/* Call once per game tick while a fight's HUD is up; bottom_rows when 3 or 4
+ * fighters are in the match (their HUD blocks sit in the bottom corners). */
+void nv2a_ws_hud_heartbeat(int bottom_rows)
+{
+    s_ws_hud_bottom = bottom_rows;
+    s_ws_hud_flip = s_gpu.flips;
+}
+
+/* End of a frame: the side fill goes beside a centred full-screen picture only
+ * on a frame with no 3D at all (a movie, a loading poster, a 2D menu). Fights,
+ * cutscenes and menus over a 3D scene keep their real sides. Lands at the next
+ * present, a frame later at most. */
+static void ws_end_frame(void)
+{
+    if (s_ws_k < 1.0f && s_ws_side_fill && s_ws_frame_pic && !s_ws_frame_3d) {
+        extern void d3d8_RequestSideFill(void);
+        d3d8_RequestSideFill();
+    }
+    s_ws_frame_3d = s_ws_frame_pic = 0;
+}
 
 static int ws_vertex(int vsh, uint32_t used, uint32_t vi, float out[4])
 {
@@ -804,17 +824,20 @@ static void ws_place_batch(int vsh, uint32_t used, const PgraphReadyVertex *read
         uint32_t big = tex ? (s_gpu.texs[0].width > s_gpu.texs[0].height ? s_gpu.texs[0].width
                                                                           : s_gpu.texs[0].height) : 0;
         cls = (!tex || big <= 128) ? 4 : 1;
-        if (cls == 1 && s_ws_side_fill) {
-            extern void d3d8_RequestSideFill(void);
-            d3d8_RequestSideFill();
-        }
-    } else if (cls && (uint32_t)(s_gpu.flips - s_ws_hud_flip) <= 30u) {
+        if (cls == 1)
+            s_ws_frame_pic = 1;
+    } else if (cls && (uint32_t)(s_gpu.flips - s_ws_hud_flip) <= 30u
+               && (y1 <= 130.0f || (s_ws_hud_bottom && y0 >= 350.0f))) {
+        /* Only the HUD's own strips: the top one, and the bottom one with 3-4
+         * fighters. Tutorial prompts and other centred text stay whole. */
         if (x1 <= 300.0f)
             cls = 2;
         else if (x0 >= 340.0f)
             cls = 3;
     }
     s_ws_counts[cls]++;
+    if (cls == 0)
+        s_ws_frame_3d = 1;
     {
         float bx = cls == 2 ? k - s_ws_reach : cls == 3 ? s_ws_reach - k : 0.0f;
         if (cls == 1 || cls == 2 || cls == 3) {
@@ -4292,6 +4315,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                          ? (s_gpu.flip_write + 1) % s_gpu.flip_modulo
                          : s_gpu.flip_write + 1;
         s_gpu.flips++;
+        ws_end_frame();
         frame_trace_flip();
         return;
 
