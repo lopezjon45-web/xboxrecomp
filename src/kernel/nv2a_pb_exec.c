@@ -573,8 +573,21 @@ static void flip_pace(void)
     QueryPerformanceCounter(&now);
     if (next.QuadPart && now.QuadPart < next.QuadPart) {
         LONGLONG left_ms = (next.QuadPart - now.QuadPart) * 1000 / freq.QuadPart;
+#if defined(_WIN32)
         if (left_ms > 2)
             Sleep((DWORD)(left_ms - 1));
+#else
+        /* Sleep to within 0.3 ms of the deadline and spin only for that: the old 1 to 2 ms of
+         * spinning was a core at full tilt for a tenth of every frame, on a chip whose
+         * power the GPU shares. */
+        if (left_ms >= 1) {
+            LONGLONG left_ns = (next.QuadPart - now.QuadPart) * 1000000000LL / freq.QuadPart - 300000;
+            if (left_ns > 0) {
+                struct timespec ts = { (time_t)(left_ns / 1000000000LL), (long)(left_ns % 1000000000LL) };
+                nanosleep(&ts, NULL);
+            }
+        }
+#endif
         do {
             QueryPerformanceCounter(&now);
         } while (now.QuadPart < next.QuadPart);
@@ -4072,7 +4085,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             fprintf(stderr, "  [BATCH] f%u clear 0x%X on surface 0x%08X to 0x%08X%c", s_gpu.flips,
                     param, dma_resolve(s_gpu.color_offset), s_gpu.clear_color, 10);
         clear_surface(param);
-        if (param & 0x01)                         /* Z */
+        /* The software rasteriser's depth buffer: 4 MB cleared at every depth clear, about
+         * 2 ms a frame on a Steam Deck, for a rasteriser that is off whenever the translator draws. */
+        if ((param & 0x01) && soft_raster_on())   /* Z */
             zbuf_clear();
         break;
 
