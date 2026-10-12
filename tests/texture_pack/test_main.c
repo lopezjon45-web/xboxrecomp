@@ -30,6 +30,11 @@ static void temp_root(char *root,size_t size)
 }
 #define _putenv_s(name,value) setenv(name,value,1)
 #endif
+#if defined(_WIN32)
+static void nap_ms(unsigned ms) { Sleep(ms); }
+#else
+static void nap_ms(unsigned ms) { usleep(ms*1000u); }
+#endif
 typedef struct MockTexture {
     IDirect3DTexture8 iface;
     unsigned refs, levels, uploads;
@@ -310,6 +315,42 @@ int main(void)
     assert(make_room(&device,64));
     for(i=0;i<4;i++) assert(!bound[i]);
     assert(!g_entries[0].texture && g_resident==0);
+    /* The background decoder: pending first, then the same texture the synchronous path builds;
+     * a missing file is rejected for good; a decode nobody collects is dropped. */
+    {
+        int result, spins; MockTexture *async_texture;
+        g_budget=1u<<20;
+        snprintf(path,sizeof path,"%s/alpha.png",root); assert(write_png(path,pixel,2,2));
+        snprintf(g_entries[0].path,PATH_CAP,"%s",path);
+        source=(RecompTextureSource){1,6,2,2,2,pixel,16,0,0,0,NULL,0};
+        assert(upload_png_async(&device,&g_entries[0],&source,0)==-2 && g_entries[0].job);
+        for(spins=0;spins<2000;spins++) {
+            result=upload_png_async(&device,&g_entries[0],&source,0);
+            if(result!=-2) break;
+            nap_ms(1);
+        }
+        assert(spins<2000 && result==1 && !g_entries[0].job);
+        async_texture=(MockTexture *)g_entries[0].texture;
+        assert(async_texture->levels==2 && !memcmp(async_texture->mips[0],pixel,16));
+        assert(async_texture->mips[1][0]==0 && async_texture->mips[1][2]==255 && async_texture->mips[1][3]==64);
+        release_entry(&device,&g_entries[0]);
+        snprintf(g_entries[0].path,PATH_CAP,"%s/missing.png",root);
+        assert(upload_png_async(&device,&g_entries[0],&source,0)==-2);
+        for(spins=0;spins<2000;spins++) {
+            result=upload_png_async(&device,&g_entries[0],&source,0);
+            if(result!=-2) break;
+            nap_ms(1);
+        }
+        assert(spins<2000 && result==0 && !g_entries[0].texture && !g_entries[0].job);
+        snprintf(g_entries[0].path,PATH_CAP,"%s",path);
+        assert(upload_png_async(&device,&g_entries[0],&source,0)==-2);
+        nap_ms(200);                                  /* decoded, never collected */
+        jobs_reap(now_ms()+LOAD_STALE_MS+1);
+        assert(!g_entries[0].job);
+        assert(upload_png_async(&device,&g_entries[0],&source,0)==-2);   /* asked for again */
+        for(spins=0;spins<2000 && upload_png_async(&device,&g_entries[0],&source,0)==-2;spins++) nap_ms(1);
+        release_entry(&device,&g_entries[0]);
+    }
     texture_pack_shutdown(&device);
 #if defined(_WIN32)
     CoUninitialize();
@@ -321,6 +362,6 @@ int main(void)
         snprintf(path,sizeof path,"%s/%s",root,i?"two":"one"); remove_dir(path);
     }
     remove_dir(root);
-    printf("texture-pack fixture passed: hash, palette, stride, PNG alpha/mips, DDS bounds, precedence, eviction (%u resources)\n",creates);
+    printf("texture-pack fixture passed: hash, palette, stride, PNG alpha/mips, background decoding, DDS bounds, precedence, eviction (%u resources)\n",creates);
     return 0;
 }

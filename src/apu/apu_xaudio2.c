@@ -351,6 +351,18 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
 
     if (!g_xa2_initialized || !g_sdl_dev)
         return 0;
+    /* A gap in the sound goes in the log, from here rather than from the device's own
+     * thread: when it happened and how many so far, so a stutter can be lined up with
+     * what the game was doing. */
+    {
+        static int told, seen;
+        if (g_xa2_starved != seen && told < 60) {
+            fprintf(stderr, "[XA2] the device ran dry (gap %d, %d frames written, %d submissions refused)\n",
+                    g_xa2_starved, g_xa2_frames_written, g_xa2_dropped);
+            told++;
+        }
+        seen = g_xa2_starved;
+    }
 #ifdef XBOXRECOMP_HAVE_SDL3
     SDL_LockAudioStream(g_sdl_stream);
 #else
