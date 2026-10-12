@@ -340,8 +340,9 @@ static int is_steam_duplicate(SDL_JoystickID id)
 static void open_sdl_gamepad(SDL_JoystickID id);
 
 /* After pads come or go: close a physical pad Steam duplicates, open one a
- * departed virtual pad was hiding, and close the gap a dropped pad leaves so the
- * remaining pad is player 1. */
+ * departed virtual pad was hiding, and move a Steam pad up to the lowest free
+ * player. Other pads are not renumbered: a player's pad does not change under
+ * them when someone else's is unplugged. */
 static void steam_reconcile(void)
 {
     int d, s, count = 0, i;
@@ -360,6 +361,8 @@ static void steam_reconcile(void)
     EnterCriticalSection(&H.cs);
     for (d = 0; d < MAX_DEVICES; d++) {
         if (!H.dev[d].used || H.dev[d].slot < 0) continue;
+        /* Only a Steam pad moves up. Any other pad keeps the player it was given. */
+        if (H.dev[d].backend != 1 || SDL_GetGamepadVendorForID(H.dev[d].id) != VALVE_VENDOR) continue;
         for (s = 0; s < H.dev[d].slot; s++) {
             if (s == H.kb_slot || H.slot[s].device >= 0) continue;
             H.slot[H.dev[d].slot].device = -1;
