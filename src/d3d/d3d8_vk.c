@@ -449,6 +449,7 @@ static void pass_end(void)
 
 /* Hand the frame's commands to the GPU and wait for them. Uploads first:
  * they were recorded apart so they need not interrupt the render pass. */
+static uint64_t g_fence_wait_ticks, g_acquire_ticks, g_present_ticks;   /* time spent waiting for the GPU, for the 2 s line */
 static void frame_submit_wait(VkSemaphore wait)
 {
     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
@@ -472,7 +473,13 @@ static void frame_submit_wait(VkSemaphore wait)
     }
     VKC(vkResetFences(vk.dev, 1, &vk.fence));
     VKC(vkQueueSubmit(vk.queue, 1, &si, vk.fence));
-    VKC(vkWaitForFences(vk.dev, 1, &vk.fence, VK_TRUE, UINT64_MAX));
+    {
+        LARGE_INTEGER a, b;
+        QueryPerformanceCounter(&a);
+        VKC(vkWaitForFences(vk.dev, 1, &vk.fence, VK_TRUE, UINT64_MAX));
+        QueryPerformanceCounter(&b);
+        g_fence_wait_ticks += (uint64_t)(b.QuadPart - a.QuadPart);
+    }
     vk.frame_open = 0;
     for (i = 0; i < vk.retired_n; i++) {
         vkDestroyImageView(vk.dev, vk.retired[i].view, NULL);
@@ -993,8 +1000,27 @@ static int tex_to_rgba_in(const VkTex *t, uint8_t *dst);
 static int tex_to_rgba(const VkTex *t, uint8_t *dst)
 {
     size_t bytes = (size_t)t->width * t->height * 4;
-    uint8_t *work = malloc(bytes ? bytes : 1);
+    uint8_t *work;
     int ok;
+
+    /* Linear A8R8G8B8 (the texture packs' format, and movie frames): swap red and blue
+     * straight into the destination. The general path below builds the image in a side
+     * buffer, reorders it byte by byte and copies it again, which took 15 to 25 ms for a
+     * 2048 x 2048 replacement on a Steam Deck. */
+    if ((uint32_t)t->format == 0x12 && t->sys && t->width && t->pitch >= t->width * 4) {
+        uint32_t x, y;
+        for (y = 0; y < t->height; y++) {
+            const uint8_t *s = t->sys + (size_t)y * t->pitch;
+            uint32_t *d = (uint32_t *)(dst + (size_t)y * t->width * 4);
+            for (x = 0; x < t->width; x++) {
+                uint32_t c;
+                memcpy(&c, s + (size_t)x * 4, 4);
+                d[x] = (c & 0xFF00FF00u) | ((c >> 16) & 0xFFu) | ((c & 0xFFu) << 16);
+            }
+        }
+        return 1;
+    }
+    work = malloc(bytes ? bytes : 1);
 
     if (!work)
         return tex_to_rgba_in(t, dst);
@@ -2185,8 +2211,16 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *s, const RECT *src, const
         if (!last)
             last = now;
         if (now - last >= 2000) {
+            LARGE_INTEGER qf;
+            QueryPerformanceFrequency(&qf);
             fprintf(stderr, "  [D3D] %.1fs: %u present (%.1f fps)\n", (double)(now - last) / 1000.0,
                     frames, (double)frames * 1000.0 / (double)(now - last));
+            fprintf(stderr, "  [VKPERF] a frame is %.2f ms: GPU fence %.2f, acquire %.2f, present %.2f\n",
+                        (double)(now - last) / frames,
+                        (double)g_fence_wait_ticks * 1000.0 / (double)qf.QuadPart / frames,
+                        (double)g_acquire_ticks * 1000.0 / (double)qf.QuadPart / frames,
+                        (double)g_present_ticks * 1000.0 / (double)qf.QuadPart / frames);
+            g_fence_wait_ticks = g_acquire_ticks = g_present_ticks = 0;
             fflush(stderr);
             frames = 0;
             last = now;
@@ -2200,8 +2234,12 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *s, const RECT *src, const
     if (vk.swap) {
         /* A short wait: a covered or minimised window may have no image to
          * give, and the title must keep running at its own pace regardless. */
+        LARGE_INTEGER qa, qb;
+        QueryPerformanceCounter(&qa);
         r = vkAcquireNextImageKHR(vk.dev, vk.swap, 20 * 1000 * 1000ull, vk.acquired,
                                   VK_NULL_HANDLE, &image);
+        QueryPerformanceCounter(&qb);
+        g_acquire_ticks += (uint64_t)(qb.QuadPart - qa.QuadPart);
         if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) {
             have = 1;
         } else if (r == VK_ERROR_OUT_OF_DATE_KHR) {
@@ -2255,7 +2293,11 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *s, const RECT *src, const
         pi.swapchainCount = 1;
         pi.pSwapchains = &vk.swap;
         pi.pImageIndices = &image;
+        LARGE_INTEGER qa, qb;
+        QueryPerformanceCounter(&qa);
         r = vkQueuePresentKHR(vk.queue, &pi);
+        QueryPerformanceCounter(&qb);
+        g_present_ticks += (uint64_t)(qb.QuadPart - qa.QuadPart);
         if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR)
             swapchain_make();
         trace_pacing();
