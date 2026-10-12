@@ -33,6 +33,7 @@
 #include "d3d8_swizzle.h"
 #include "d3d8_combiners.h"
 #include "d3d8_vk.h"
+#include "d3d8_present.h"  /* d3d8_canvas_width */
 #include "win32_compat.h"   /* GetTickCount64 */
 
 #include <vulkan/vulkan.h>
@@ -80,9 +81,16 @@ void d3d8_vk_set_overlay(const D3D8VkOverlay *overlay)
 static unsigned s_render_scale = 1;
 static int      s_scaling, s_keep_aspect = 1, s_linear = 1, s_vsync;
 static unsigned s_aspect_num = 4, s_aspect_den = 3;
+/* Widescreen canvas (d3d8_present.h): the title's target widened to num:den. */
+static unsigned s_canvas_num, s_canvas_den;
+/* Widescreen 2D placement for the next draws (nv2a_pb_exec.c, ws_place_batch). */
+static float s_place_kx = 1.0f, s_place_bx = 0.0f;
+float d3d8_GetCanvasScaleX(void);
+float d3d8_GetCanvasScaleY(void);
 
 void d3d8_present_enable_scaling(int enable)       { s_scaling = enable; }
 void d3d8_present_set_render_scale(unsigned scale) { s_render_scale = scale < 1 ? 1 : scale > 4 ? 4 : scale; }
+void d3d8_present_set_canvas_aspect(unsigned num, unsigned den) { s_canvas_num = num; s_canvas_den = den; }
 void d3d8_present_set_aspect(int keep, unsigned num, unsigned den)
 {
     s_keep_aspect = keep;
@@ -526,7 +534,7 @@ static const char s_vs_fixed[] =
     VS_OUT_DECL
     "VS_OUT main(VS_IN i) {\n"
     "    VS_OUT o;\n"
-    "    o.pos = float4(i.pos.x * Screen.x - 1.0, 1.0 - i.pos.y * Screen.y, i.pos.z, 1.0);\n"
+    "    o.pos = float4(i.pos.x * Screen.x - TexScale.w, 1.0 - i.pos.y * Screen.y, i.pos.z, 1.0);\n"
     "    if (i.pos.w != 0.0) o.pos /= i.pos.w;\n"
     "    o.diffuse = i.color;\n"
     "    o.specular = float4(0, 0, 0, 0);\n"
@@ -1330,14 +1338,17 @@ static uint32_t frame_constants(float zscale, const float texscale[2])
     float f[8];
     VkDeviceSize at;
 
-    f[0] = 2.0f / (float)vk.lw;
+    /* Widescreen placement (d3d8_SetDrawPlacement): clip x becomes x * kx + bx, as the
+     * epilogue computes x * Screen.x - TexScale.w; TexScale.z keeps point sprites square
+     * on a widened target. All 1 (and bx 0) otherwise. */
+    f[0] = 2.0f * s_place_kx / (float)vk.lw;
     f[1] = 2.0f / (float)vk.lh;
     f[2] = zscale;
     f[3] = vk.points ? vk.point_size : 0.0f;
     f[4] = texscale ? texscale[0] : 1.0f;
     f[5] = texscale ? texscale[1] : 1.0f;
-    f[6] = 1.0f;
-    f[7] = 1.0f;
+    f[6] = d3d8_GetCanvasScaleY() / d3d8_GetCanvasScaleX();
+    f[7] = s_place_kx - s_place_bx;
     at = ring_take(&vk.ubo, sizeof f, vk.ubo_align);
     memcpy(vk.ubo.map + at, f, sizeof f);
     return (uint32_t)at;
@@ -1455,9 +1466,10 @@ static int bind_draw(uint32_t vs, uint8_t layout, uint8_t instanced, VkPrimitive
     if (vk.scissor_dirty) {
         VkRect2D sc;
         if (vk.scissor[2] && vk.scissor[3]) {
-            uint32_t x0 = vk.scissor[0] * vk.scale, y0 = vk.scissor[1] * vk.scale;
-            uint32_t x1 = (vk.scissor[0] + vk.scissor[2]) * vk.scale;
-            uint32_t y1 = (vk.scissor[1] + vk.scissor[3]) * vk.scale;
+            float sx = d3d8_GetCanvasScaleX(), sy = d3d8_GetCanvasScaleY();
+            uint32_t x0 = (uint32_t)(vk.scissor[0] * sx + 0.5f), y0 = (uint32_t)(vk.scissor[1] * sy + 0.5f);
+            uint32_t x1 = (uint32_t)((vk.scissor[0] + vk.scissor[2]) * sx + 0.5f);
+            uint32_t y1 = (uint32_t)((vk.scissor[1] + vk.scissor[3]) * sy + 0.5f);
             if (x1 > vk.tw) x1 = vk.tw;
             if (y1 > vk.th) y1 = vk.th;
             if (x0 > x1) x0 = x1;
@@ -1493,11 +1505,10 @@ void d3d8_SetBlendColor(DWORD argb)
     color_to_float(argb, vk.blend_color);
 }
 
-/* Widescreen 2D placement: kept for the API; the Vulkan canvas is not built yet
- * (docs/widescreen WS-1b), so the host never asks for one here. */
-static float s_place_kx = 1.0f, s_place_bx = 0.0f;
 void d3d8_SetDrawPlacement(float kx, float bx) { s_place_kx = kx; s_place_bx = bx; }
 void d3d8_GetDrawPlacement(float *kx, float *bx) { *kx = s_place_kx; *bx = s_place_bx; }
+/* The blurred side fill is Direct3D 11 only so far: Vulkan presents with a blit.
+ * Beside a centred picture the canvas stays black here. */
 void d3d8_RequestSideFill(void) { }
 
 void d3d8_Nv2aPointMode(int on, float fixed_size)
@@ -1522,7 +1533,7 @@ static char *points_variant(const char *hlsl)
         "        if (sz <= 0.0 || o.pos.w <= 0.0) {\n"
         "            o.pos = float4(0.0, 0.0, -1.0, 1.0);\n"
         "        } else {\n"
-        "            float2 h = 0.5 * sz * Screen.xy * o.pos.w;\n"
+        "            float2 h = 0.5 * sz * Screen.xy * o.pos.w * float2(TexScale.z, 1.0);\n"
         "            o.pos.x += (c.x * 2.0 - 1.0) * h.x;\n"
         "            o.pos.y -= (c.y * 2.0 - 1.0) * h.y;\n"
         "            o.tex3 = float3(c, 0);\n"
@@ -2992,7 +3003,8 @@ static HRESULT __stdcall d3d_CreateDevice(IDirect3D8 *s, UINT adapter, DWORD dev
     vk.lw = pp->BackBufferWidth ? pp->BackBufferWidth : 640;
     vk.lh = pp->BackBufferHeight ? pp->BackBufferHeight : 480;
     vk.scale = s_scaling ? s_render_scale : 1;
-    vk.tw = vk.lw * vk.scale;
+    vk.tw = s_scaling ? d3d8_canvas_width(vk.lw, vk.lh, vk.scale, s_canvas_num, s_canvas_den)
+                      : vk.lw * vk.scale;
     vk.th = vk.lh * vk.scale;
     if (!device_make() || !resources_make()) {
         LOG("the device could not be created");
@@ -3029,5 +3041,8 @@ IDirect3DDevice8 *xbox_GetD3DDevice(void) { return g_device_made ? &g_device : N
 IDirect3DDevice8 *d3d8_GetDevice(void) { return xbox_GetD3DDevice(); }
 void d3d8_PresentFrame(void) { if (g_device_made) dev_Present(&g_device, NULL, NULL, NULL, NULL); }
 unsigned d3d8_GetRenderScale(void) { return vk.scale ? vk.scale : 1; }
+/* Host pixels per title pixel, across and down (a widescreen canvas is wider). */
+float d3d8_GetCanvasScaleX(void) { return vk.lw ? (float)vk.tw / (float)vk.lw : (float)d3d8_GetRenderScale(); }
+float d3d8_GetCanvasScaleY(void) { return vk.lh ? (float)vk.th / (float)vk.lh : (float)d3d8_GetRenderScale(); }
 UINT d3d8_GetBackbufferWidth(void) { return vk.lw; }
 UINT d3d8_GetBackbufferHeight(void) { return vk.lh; }
