@@ -22,6 +22,10 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#include <sys/uio.h>
+#endif
 #define _stricmp strcasecmp
 #endif
 
@@ -44,7 +48,8 @@ static struct SourceState {
     RecompTextureSource shape;
     char id[65];
     ULONGLONG checked;
-    int used, dumped;
+    uint64_t quick;          /* texture_pack_quick() of the bytes that gave id */
+    int used, dumped, has_quick;
 } g_sources[SOURCE_SLOTS];
 static unsigned g_source_next;
 #if defined(_WIN32)
@@ -236,6 +241,48 @@ int texture_pack_hash(const RecompTextureSource *s,char out[65])
     return 1;
 }
 
+/* A cheap check between identity hashes: four lanes of the xxHash64 round over the bytes
+ * the identity covers. A bound texture is re-identified every 8 ms; while this value is
+ * unchanged its SHA-256 is too (barring a 64-bit collision on a changed texture), so the
+ * full hash runs only for new or rewritten textures. That hashing was the steady cost of
+ * the packs on the GPU thread (a four-fighter match on a Steam Deck held 53 fps, not 60). */
+static uint64_t quick_round(uint64_t acc,uint64_t word)
+{
+    acc+=word*0xC2B2AE3D27D4EB4Full;
+    acc=(acc<<31)|(acc>>33);
+    return acc*0x9E3779B185EBCA87ull;
+}
+static void quick_add(uint64_t lane[4],const uint8_t *p,size_t bytes)
+{
+    uint64_t word[4];
+    for(;bytes>=32;bytes-=32,p+=32) {
+        memcpy(word,p,32);
+        lane[0]=quick_round(lane[0],word[0]); lane[1]=quick_round(lane[1],word[1]);
+        lane[2]=quick_round(lane[2],word[2]); lane[3]=quick_round(lane[3],word[3]);
+    }
+    for(;bytes>=8;bytes-=8,p+=8) { memcpy(word,p,8); lane[0]=quick_round(lane[0],word[0]); }
+    for(;bytes;bytes--,p++) lane[1]=quick_round(lane[1],*p);
+}
+static int texture_pack_quick(const RecompTextureSource *s,uint64_t *out)
+{
+    uint64_t lane[4]={0x60ea27eeadc0b5d6ull,0xc2b2ae3d27d4eb4full,0,0x61c8864e7a143579ull},h;
+    unsigned i;
+    if(!source_readable(s)) return 0;
+    if(s->stride) for(i=0;i<s->rows;i++) quick_add(lane,(const uint8_t *)s->data+(size_t)i*s->stride,s->row_bytes);
+    else quick_add(lane,s->data,s->bytes);
+    if(s->palette_entries) quick_add(lane,s->palette,s->palette_entries*4u);
+    h=((lane[0]<<1)|(lane[0]>>63))+((lane[1]<<7)|(lane[1]>>57))+((lane[2]<<12)|(lane[2]>>52))+((lane[3]<<18)|(lane[3]>>46));
+    h^=h>>33; h*=0xC2B2AE3D27D4EB4Full; h^=h>>29; h*=0x165667B19E3779F9ull; h^=h>>32;
+    *out=h;
+    return 1;
+}
+static int same_layout(const RecompTextureSource *a,const RecompTextureSource *b)
+{
+    return a->data==b->data && a->bytes==b->bytes && a->stride==b->stride && a->row_bytes==b->row_bytes &&
+           a->rows==b->rows && a->palette==b->palette && a->palette_entries==b->palette_entries &&
+           a->format==b->format && a->width==b->width && a->height==b->height && a->row_texels==b->row_texels;
+}
+
 static void release_entry(IDirect3DDevice8 *dev,PackEntry *e)
 {
     unsigned stage;
@@ -389,6 +436,7 @@ static unsigned source_slot(const RecompTextureSource *s)
 int texture_pack_bind(IDirect3DDevice8 *dev,unsigned stage,const RecompTextureSource *s,RecompTextureSample sample,void *user)
 {
     struct SourceState *state=NULL; char id[65]; PackEntry *entry;
+    uint64_t quick=0; int have_quick=0;
     unsigned i, slot=source_slot(s);
     ULONGLONG now=now_ms();
     if(!texture_pack_active() || !dev || stage>3) return 0;
@@ -398,7 +446,10 @@ int texture_pack_bind(IDirect3DDevice8 *dev,unsigned stage,const RecompTextureSo
            c->shape.height==s->height && c->shape.row_texels==s->row_texels && c->shape.palette==s->palette && c->shape.palette_entries==s->palette_entries) { state=c; break; }
     }
     if(state && now-state->checked<8) memcpy(id,state->id,65);
-    else {
+    else if(state && state->has_quick && same_layout(&state->shape,s) &&
+            (have_quick=texture_pack_quick(s,&quick)) && quick==state->quick) {
+        memcpy(id,state->id,65); state->checked=now;
+    } else {
         if(!texture_pack_hash(s,id)) return 0;
         if(!state) {
             state=&g_sources[slot];
@@ -411,6 +462,8 @@ int texture_pack_bind(IDirect3DDevice8 *dev,unsigned stage,const RecompTextureSo
         }
         if(state->used && strcmp(state->id,id)) state->dumped=0;
         state->shape=*s; state->checked=now; memcpy(state->id,id,65); state->used=1;
+        state->has_quick=have_quick || texture_pack_quick(s,&quick);
+        state->quick=quick;
     }
     if(!state->dumped && g_dump[0] && g_dumps<(uint64_t)g_dump_limit && sample && source_readable(s)) {
         state->dumped=1;
@@ -620,6 +673,35 @@ static int memory_readable(const void *data,uint64_t bytes)
     FILE *maps;
     char line[512];
     if(end<begin) return 0;
+#if defined(__linux__) && defined(SYS_process_vm_readv)
+    {
+        /* One byte of every page, read through the kernel: an inaccessible page makes the
+         * read stop short instead of raising the trap. Parsing /proc/self/maps for every
+         * hash refresh took a quarter of the GPU thread on a Steam Deck with the HD packs;
+         * it stays as the fallback where the call is refused (seccomp, old kernels). */
+        static int refused;
+        static uintptr_t page;
+        if(!refused) {
+            char sink[64];
+            struct iovec local, remote[64];
+            if(!page) { long size=sysconf(_SC_PAGESIZE); page=size>0 ? (uintptr_t)size : 4096u; }
+            at=begin&~(page-1);
+            while(at<end) {
+                long got; unsigned n=0;
+                for(;n<64 && at<end;n++,at+=page) {
+                    remote[n].iov_base=(void *)(at<begin ? begin : at); remote[n].iov_len=1;
+                }
+                local.iov_base=sink; local.iov_len=n;
+                got=syscall(SYS_process_vm_readv,(long)getpid(),&local,1ul,remote,(unsigned long)n,0ul);
+                if(got==(long)n) continue;
+                if(got<0 && (errno==ENOSYS || errno==EPERM)) { refused=1; break; }
+                return 0;
+            }
+            if(!refused) return 1;
+            at=begin;
+        }
+    }
+#endif
     maps=fopen("/proc/self/maps","r");
     if(!maps) return 1;
     while(at<end && fgets(line,sizeof line,maps)) {
@@ -687,7 +769,7 @@ static const uint32_t k_sha256[64]={
     0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
     0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2};
 #define ROR(x,n) (((x)>>(n))|((x)<<(32-(n))))
-static void sha_block(Sha *sha,const uint8_t *p)
+static void sha_block_c(uint32_t state[8],const uint8_t *p)
 {
     uint32_t w[64],a,b,c,d,e,f,g,h,t1,t2,i;
     for(i=0;i<16;i++) w[i]=(uint32_t)p[i*4]<<24|(uint32_t)p[i*4+1]<<16|(uint32_t)p[i*4+2]<<8|p[i*4+3];
@@ -695,15 +777,73 @@ static void sha_block(Sha *sha,const uint8_t *p)
         uint32_t s0=ROR(w[i-15],7)^ROR(w[i-15],18)^(w[i-15]>>3),s1=ROR(w[i-2],17)^ROR(w[i-2],19)^(w[i-2]>>10);
         w[i]=w[i-16]+s0+w[i-7]+s1;
     }
-    a=sha->state[0]; b=sha->state[1]; c=sha->state[2]; d=sha->state[3];
-    e=sha->state[4]; f=sha->state[5]; g=sha->state[6]; h=sha->state[7];
+    a=state[0]; b=state[1]; c=state[2]; d=state[3];
+    e=state[4]; f=state[5]; g=state[6]; h=state[7];
     for(i=0;i<64;i++) {
         t1=h+(ROR(e,6)^ROR(e,11)^ROR(e,25))+((e&f)^(~e&g))+k_sha256[i]+w[i];
         t2=(ROR(a,2)^ROR(a,13)^ROR(a,22))+((a&b)^(a&c)^(b&c));
         h=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
     }
-    sha->state[0]+=a; sha->state[1]+=b; sha->state[2]+=c; sha->state[3]+=d;
-    sha->state[4]+=e; sha->state[5]+=f; sha->state[6]+=g; sha->state[7]+=h;
+    state[0]+=a; state[1]+=b; state[2]+=c; state[3]+=d;
+    state[4]+=e; state[5]+=f; state[6]+=g; state[7]+=h;
+}
+#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__)) && \
+    !defined(TEXTURE_PACK_NO_SHA_NI)
+/* x86 SHA extensions (Intel since Goldmont/Ice Lake, AMD since Zen; the Steam Deck has them).
+ * The texture hash runs on every bind refresh, and the C rounds above made it the largest
+ * cost on the GPU thread on Linux, where no system SHA-256 is used. Same digest, checked
+ * against the C rounds by the fixture. */
+#include <cpuid.h>
+#include <immintrin.h>
+#define TEXTURE_PACK_SHA_NI 1
+__attribute__((target("sha,sse4.1,ssse3")))
+static void sha_blocks_ni(uint32_t state[8],const uint8_t *p,size_t blocks)
+{
+    const __m128i swap=_mm_set_epi64x(0x0c0d0e0f08090a0bULL,0x0405060700010203ULL);
+    __m128i abef,cdgh,tmp,saved_abef,saved_cdgh,msg,w[4];
+    unsigned g;
+    tmp=_mm_shuffle_epi32(_mm_loadu_si128((const __m128i *)&state[0]),0xB1);   /* CDAB */
+    cdgh=_mm_shuffle_epi32(_mm_loadu_si128((const __m128i *)&state[4]),0x1B);  /* EFGH */
+    abef=_mm_alignr_epi8(tmp,cdgh,8);
+    cdgh=_mm_blend_epi16(cdgh,tmp,0xF0);
+    while(blocks--) {
+        saved_abef=abef; saved_cdgh=cdgh;
+        for(g=0;g<4;g++) w[g]=_mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(p+16*g)),swap);
+        for(g=0;g<16;g++) {
+            /* Four rounds on W[4g..4g+3], then the schedule's W[4g+16..4g+19] into the same slot. */
+            msg=_mm_add_epi32(w[g&3],_mm_loadu_si128((const __m128i *)&k_sha256[4*g]));
+            cdgh=_mm_sha256rnds2_epu32(cdgh,abef,msg);
+            abef=_mm_sha256rnds2_epu32(abef,cdgh,_mm_shuffle_epi32(msg,0x0E));
+            if(g<12)
+                w[g&3]=_mm_sha256msg2_epu32(_mm_add_epi32(_mm_sha256msg1_epu32(w[g&3],w[(g+1)&3]),
+                                                          _mm_alignr_epi8(w[(g+3)&3],w[(g+2)&3],4)),w[(g+3)&3]);
+        }
+        abef=_mm_add_epi32(abef,saved_abef); cdgh=_mm_add_epi32(cdgh,saved_cdgh);
+        p+=64;
+    }
+    tmp=_mm_shuffle_epi32(abef,0x1B);    /* FEBA */
+    cdgh=_mm_shuffle_epi32(cdgh,0xB1);   /* DCHG */
+    _mm_storeu_si128((__m128i *)&state[0],_mm_blend_epi16(tmp,cdgh,0xF0));   /* DCBA */
+    _mm_storeu_si128((__m128i *)&state[4],_mm_alignr_epi8(cdgh,tmp,8));      /* HGFE */
+}
+static int sha_ni_available(void)
+{
+    static int known=-1;
+    unsigned a,b,c,d;
+    if(known<0) {
+        known=__get_cpuid(1,&a,&b,&c,&d) && (c&bit_SSE4_1) && (c&bit_SSSE3) &&
+              __get_cpuid_count(7,0,&a,&b,&c,&d) && (b&(1u<<29));
+        if(getenv("RECOMP_TEXTURE_SHA_C")) known=0;   /* diagnostics: force the C rounds */
+    }
+    return known;
+}
+#endif
+static void sha_blocks(uint32_t state[8],const uint8_t *p,size_t blocks)
+{
+#if defined(TEXTURE_PACK_SHA_NI)
+    if(sha_ni_available()) { sha_blocks_ni(state,p,blocks); return; }
+#endif
+    for(;blocks;blocks--,p+=64) sha_block_c(state,p);
 }
 static int sha_start(Sha *sha)
 {
@@ -715,11 +855,14 @@ static int sha_add(Sha *sha,const void *data,size_t bytes)
 {
     const uint8_t *p=data;
     sha->bytes+=bytes;
-    while(bytes) {
+    if(sha->used) {
         size_t take=64-sha->used; if(take>bytes) take=bytes;
         memcpy(sha->block+sha->used,p,take); sha->used+=take; p+=take; bytes-=take;
-        if(sha->used==64) { sha_block(sha,sha->block); sha->used=0; }
+        if(sha->used<64) return 1;
+        sha_blocks(sha->state,sha->block,1); sha->used=0;
     }
+    if(bytes>=64) { sha_blocks(sha->state,p,bytes/64); p+=bytes&~(size_t)63; bytes&=63; }
+    memcpy(sha->block,p,bytes); sha->used=bytes;
     return 1;
 }
 static int sha_finish(Sha *sha,uint8_t out[32])
