@@ -21,6 +21,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #if defined(__linux__)
 #include <sys/syscall.h>
@@ -41,6 +42,7 @@ typedef struct PackEntry {
     int channel_mips;
     int failed;
     ULONGLONG retry;
+    struct LoadJob *job;     /* a background decode in flight or finished, not yet uploaded */
 } PackEntry;
 static PackEntry *g_entries;
 static size_t g_count, g_capacity;
@@ -61,6 +63,9 @@ static int g_initialized, g_active, g_dump_limit=2000;
 static char g_dump[PATH_CAP];
 static uint64_t g_budget, g_resident, g_clock, g_hits, g_misses, g_hashed, g_dumps;
 static unsigned g_errors,g_loads;
+static int g_trace, g_sync_load;
+/* Counted over two seconds and logged with the frame rate, so a play log shows what the packs cost. */
+static struct { ULONGLONG start; unsigned loads, evictions, rejected, max_ms; uint64_t ms, bytes; } g_win;
 
 /* ---- Host services. Everything below this block is the same code on every host. ---- */
 static ULONGLONG now_ms(void);
@@ -180,6 +185,8 @@ static void initialize(void)
     mb=(e=getenv("RECOMP_TEXTURE_CACHE_MB")) ? strtol(e,NULL,10) : 512;
     if(mb<32) mb=32; if(mb>4096) mb=4096;
     g_budget=(uint64_t)mb*1024*1024;
+    g_sync_load=(e=getenv("RECOMP_TEXTURE_SYNC")) && *e && *e!='0';
+    g_trace=(e=getenv("RECOMP_TEXTURE_TRACE")) && *e && *e!='0';
     e=getenv("RECOMP_TEXTURE_DUMP_DIR"); if(e && *e) snprintf(g_dump,sizeof g_dump,"%s",e);
     if((e=getenv("RECOMP_TEXTURE_DUMP_LIMIT"))) {
         g_dump_limit=atoi(e); if(g_dump_limit<0) g_dump_limit=0; if(g_dump_limit>65536) g_dump_limit=65536;
@@ -314,7 +321,7 @@ static int make_room(IDirect3DDevice8 *dev,uint64_t need)
             if(g_entries[i].texture && !in_use && (!old || g_entries[i].used<old->used)) old=&g_entries[i];
         }
         if(!old) return 0;
-        release_entry(dev,old);
+        release_entry(dev,old); g_win.evictions++;
     }
     return 1;
 }
@@ -323,19 +330,39 @@ static int valid_scale(uint32_t w,uint32_t h,const RecompTextureSource *s)
     uint32_t scale=w/s->width;
     return scale>=1 && scale<=8 && w==s->width*scale && h==s->height*scale;
 }
-static int upload_png(IDirect3DDevice8 *dev,PackEntry *e,const RecompTextureSource *source)
+/* A decoded replacement with its whole mip chain, ready to copy into a texture. It
+ * touches no D3D object, so a worker thread can build it. */
+typedef struct Prepared {
+    uint32_t w,h,levels;
+    uint64_t memory;
+    uint8_t *level[16];
+    uint32_t lw[16],lh[16];
+} Prepared;
+static void prepared_free(Prepared *p)
+{
+    unsigned i;
+    if(!p) return;
+    for(i=0;i<16;i++) free(p->level[i]);
+    free(p);
+}
+/* Decode, pad to the guest's row length and build the mips. Returns NULL for a replacement that
+ * is rejected (*retry 0) or that failed for a reason that can clear (*retry 1). */
+static Prepared *prepare_png(const char *path,uint32_t src_w,uint32_t src_h,uint32_t row_texels,int channel_mips,int *retry)
 {
     uint32_t w=0,h=0,physical_w,levels=1,dim,y,x,level;
-    int retry=0;
-    uint8_t *data=read_png(e->path,&w,&h,&retry),*padded=NULL;
-    IDirect3DTexture8 *texture=NULL; uint64_t memory=0;
-    if(!data) return retry ? -1 : 0;
-    if(!valid_scale(w,h,source)) { free(data); return 0; }
-    physical_w=source->row_texels*(w/source->width);
-    if(physical_w<w || physical_w>16384 || (uint64_t)physical_w*h*4>g_budget/4) { free(data); return 0; }
+    uint8_t *data,*padded=NULL;
+    Prepared *out;
+    RecompTextureSource shape={0};
+    shape.width=src_w; shape.height=src_h;
+    *retry=0;
+    data=read_png(path,&w,&h,retry);
+    if(!data) return NULL;
+    if(!valid_scale(w,h,&shape)) { free(data); return NULL; }
+    physical_w=row_texels*(w/src_w);
+    if(physical_w<w || physical_w>16384 || (uint64_t)physical_w*h*4>g_budget/4) { free(data); return NULL; }
     if(physical_w!=w) {
         padded=malloc((size_t)physical_w*h*4);
-        if(!padded) { free(data); return -1; }
+        if(!padded) { free(data); *retry=1; return NULL; }
         for(y=0;y<h;y++) {
             memcpy(padded+(size_t)y*physical_w*4,data+(size_t)y*w*4,w*4);
             for(x=w;x<physical_w;x++) memcpy(padded+((size_t)y*physical_w+x)*4,data+((size_t)y*w+w-1)*4,4);
@@ -343,36 +370,67 @@ static int upload_png(IDirect3DDevice8 *dev,PackEntry *e,const RecompTextureSour
         free(data); data=padded; w=physical_w;
     }
     for(dim=w>h?w:h;dim>1;dim>>=1) levels++;
-    for(level=0;level<levels;level++) memory+=(uint64_t)(w>>level?w>>level:1)*(h>>level?h>>level:1)*8;
-    if(memory>g_budget) { free(data); return 0; }
-    if(!make_room(dev,memory) || FAILED(dev->lpVtbl->CreateTexture(dev,w,h,levels,0,D3DFMT_LIN_A8R8G8B8,0,&texture))) { free(data); return -1; }
+    out=calloc(1,sizeof *out);
+    if(!out) { free(data); *retry=1; return NULL; }
+    out->w=w; out->h=h; out->levels=levels;
+    for(level=0;level<levels;level++) out->memory+=(uint64_t)(w>>level?w>>level:1)*(h>>level?h>>level:1)*8;
+    if(out->memory>g_budget) { free(data); free(out); return NULL; }
     for(level=0;level<levels;level++) {
-        D3DLOCKED_RECT lock={0}; uint32_t nw=w>1?w/2:1,nh=h>1?h/2:1;
-        uint8_t *next=NULL;
-        if(FAILED(texture->lpVtbl->LockRect(texture,level,&lock,NULL,0)) || !lock.pBits || lock.Pitch<(INT)(w*4)) goto fail;
-        for(y=0;y<h;y++) memcpy((uint8_t *)lock.pBits+(size_t)y*lock.Pitch,data+(size_t)y*w*4,w*4);
-        if(FAILED(texture->lpVtbl->UnlockRect(texture,level))) goto fail;
+        uint32_t nw=w>1?w/2:1,nh=h>1?h/2:1;
+        out->level[level]=data; out->lw[level]=w; out->lh[level]=h;
         if(level+1<levels) {
-            next=malloc((size_t)nw*nh*4); if(!next) goto fail;
-            for(y=0;y<nh;y++) for(x=0;x<nw;x++) {
-                unsigned c,alpha=0,colour[3]={0},samples=0;
-                uint32_t sx,sy,x0=x*w/nw,x1=(x+1)*w/nw,y0=y*h/nh,y1=(y+1)*h/nh;
-                /* Include odd final rows/columns instead of discarding their
-                 * artwork. Power-of-two textures retain the original 2x2 box. */
-                for(sy=y0;sy<y1;sy++) for(sx=x0;sx<x1;sx++) {
-                    const uint8_t *p=data+((size_t)sy*w+sx)*4;
-                    samples++;
-                    alpha+=p[3]; for(c=0;c<3;c++) colour[c]+=p[c]*(e->channel_mips ? 1 : p[3]);
+            uint8_t *next=malloc((size_t)nw*nh*4);
+            if(!next) { prepared_free(out); *retry=1; return NULL; }
+            for(y=0;y<nh;y++) {
+                uint32_t y0=y*h/nh,y1=(y+1)*h/nh;
+                for(x=0;x<nw;x++) {
+                    unsigned c,alpha=0,colour[3]={0},samples=0;
+                    uint32_t sx,sy,x0=x*w/nw,x1=(x+1)*w/nw;
+                    /* Include odd final rows/columns instead of discarding their
+                     * artwork. Power-of-two textures retain the original 2x2 box. */
+                    for(sy=y0;sy<y1;sy++) for(sx=x0;sx<x1;sx++) {
+                        const uint8_t *q=data+((size_t)sy*w+sx)*4;
+                        samples++;
+                        alpha+=q[3]; for(c=0;c<3;c++) colour[c]+=q[c]*(channel_mips ? 1 : q[3]);
+                    }
+                    for(c=0;c<3;c++) next[((size_t)y*nw+x)*4+c]=(uint8_t)(channel_mips ? (colour[c]+samples/2)/samples : alpha ? (colour[c]+alpha/2)/alpha : 0);
+                    next[((size_t)y*nw+x)*4+3]=(uint8_t)((alpha+samples/2)/samples);
                 }
-                for(c=0;c<3;c++) next[((size_t)y*nw+x)*4+c]=(uint8_t)(e->channel_mips ? (colour[c]+samples/2)/samples : alpha ? (colour[c]+alpha/2)/alpha : 0);
-                next[((size_t)y*nw+x)*4+3]=(uint8_t)((alpha+samples/2)/samples);
             }
-            free(data); data=next; w=nw; h=nh;
+            data=next; w=nw; h=nh;
         }
     }
-    free(data); e->texture=texture; e->bytes=memory; e->levels=levels; g_resident+=memory; return 1;
+    return out;
+}
+/* Create the texture and copy the chain in. D3D calls: the render thread only. 1 done, -1 retry later. */
+static int commit_prepared(IDirect3DDevice8 *dev,PackEntry *e,const Prepared *p)
+{
+    IDirect3DTexture8 *texture=NULL; uint32_t level,y;
+    ULONGLONG t0=now_ms(),t1,t2,t3;
+    if(!make_room(dev,p->memory) || FAILED(dev->lpVtbl->CreateTexture(dev,p->w,p->h,p->levels,0,D3DFMT_LIN_A8R8G8B8,0,&texture))) return -1;
+    t1=now_ms(); t2=t3=0;
+    for(level=0;level<p->levels;level++) {
+        D3DLOCKED_RECT lock={0}; uint32_t w=p->lw[level],h=p->lh[level];
+        ULONGLONG a=now_ms(),b;
+        if(FAILED(texture->lpVtbl->LockRect(texture,level,&lock,NULL,0)) || !lock.pBits || lock.Pitch<(INT)(w*4)) goto fail;
+        for(y=0;y<h;y++) memcpy((uint8_t *)lock.pBits+(size_t)y*lock.Pitch,p->level[level]+(size_t)y*w*4,w*4);
+        b=now_ms(); t2+=b-a;
+        if(FAILED(texture->lpVtbl->UnlockRect(texture,level))) goto fail;
+        t3+=now_ms()-b;
+    }
+    if(g_trace && now_ms()-t0>=8) fprintf(stderr,"[TEXPACK] commit %ux%u: room+create %llu, copy %llu, unlock %llu ms\n",p->w,p->h,(unsigned long long)(t1-t0),(unsigned long long)t2,(unsigned long long)t3);
+    e->texture=texture; e->bytes=p->memory; e->levels=p->levels; g_resident+=p->memory; return 1;
 fail:
-    free(data); if(texture) texture->lpVtbl->Release(texture); return -1;
+    texture->lpVtbl->Release(texture); return -1;
+}
+static int upload_png(IDirect3DDevice8 *dev,PackEntry *e,const RecompTextureSource *source)
+{
+    int retry=0,result;
+    Prepared *p=prepare_png(e->path,source->width,source->height,source->row_texels,e->channel_mips,&retry);
+    if(!p) return retry ? -1 : 0;
+    result=commit_prepared(dev,e,p);
+    prepared_free(p);
+    return result;
 }
 static uint32_t le32(const uint8_t *p) { return (uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24); }
 static int upload_dds(IDirect3DDevice8 *dev,PackEntry *e,const RecompTextureSource *source)
@@ -433,6 +491,123 @@ static unsigned source_slot(const RecompTextureSource *s)
     key^=key>>15; key*=0x846ca68bu; key^=key>>16;
     return key & (SOURCE_SLOTS-1);
 }
+#if !defined(_WIN32)
+/* ---- Background decoding (POSIX). ----------------------------------------------------
+ * Reading a replacement is a PNG decode and a mip chain: 100 to 350 ms for the big menu art,
+ * and done on the render thread at the first bind it stalled every screen change. Workers do
+ * that part; the render thread only creates the texture and copies the chain in. Until a
+ * replacement is ready the original texture is drawn. */
+#include <pthread.h>
+#define LOAD_JOBS 16
+#define LOAD_WORKERS 3
+#define LOAD_STALE_MS 4000
+enum { JOB_FREE, JOB_QUEUED, JOB_RUNNING, JOB_DONE };
+typedef struct LoadJob {
+    int state;
+    PackEntry *entry;
+    char path[PATH_CAP];
+    uint32_t w,h,row_texels;
+    int channel_mips,retry;
+    Prepared *image;
+    ULONGLONG done_at;
+} LoadJob;
+static LoadJob g_jobs[LOAD_JOBS];
+static pthread_mutex_t g_job_lock=PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_job_wake=PTHREAD_COND_INITIALIZER;
+static pthread_t g_workers[LOAD_WORKERS];
+static int g_worker_count, g_workers_stop;
+
+static void *load_worker(void *unused)
+{
+    (void)unused;
+#if defined(__linux__) && defined(SYS_gettid)
+    setpriority(PRIO_PROCESS,(id_t)syscall(SYS_gettid),10); /* the render and audio threads come first */
+#endif
+    pthread_mutex_lock(&g_job_lock);
+    for(;;) {
+        LoadJob *job=NULL; int i; Prepared *image; int retry=0;
+        for(i=0;i<LOAD_JOBS;i++) if(g_jobs[i].state==JOB_QUEUED) { job=&g_jobs[i]; break; }
+        if(!job) {
+            if(g_workers_stop) break;
+            pthread_cond_wait(&g_job_wake,&g_job_lock);
+            continue;
+        }
+        job->state=JOB_RUNNING;
+        pthread_mutex_unlock(&g_job_lock);
+        image=prepare_png(job->path,job->w,job->h,job->row_texels,job->channel_mips,&retry);
+        pthread_mutex_lock(&g_job_lock);
+        job->image=image; job->retry=retry; job->done_at=now_ms(); job->state=JOB_DONE;
+    }
+    pthread_mutex_unlock(&g_job_lock);
+    return NULL;
+}
+static int workers_start(void)
+{
+    long cpus=sysconf(_SC_NPROCESSORS_ONLN);
+    int want=cpus>=6 ? LOAD_WORKERS : cpus>=3 ? 2 : 1;
+    if(g_worker_count) return 1;
+    g_workers_stop=0;
+    while(g_worker_count<want && !pthread_create(&g_workers[g_worker_count],NULL,load_worker,NULL)) g_worker_count++;
+    return g_worker_count>0;
+}
+static void workers_stop(void)
+{
+    int i;
+    if(!g_worker_count) return;
+    pthread_mutex_lock(&g_job_lock);
+    g_workers_stop=1;
+    pthread_cond_broadcast(&g_job_wake);
+    pthread_mutex_unlock(&g_job_lock);
+    for(i=0;i<g_worker_count;i++) pthread_join(g_workers[i],NULL);
+    g_worker_count=0;
+    for(i=0;i<LOAD_JOBS;i++) { prepared_free(g_jobs[i].image); memset(&g_jobs[i],0,sizeof g_jobs[i]); }
+    for(i=0;(size_t)i<g_count;i++) g_entries[i].job=NULL;
+}
+/* Called with the clock at each bind: drop finished decodes nobody came back for. */
+static void jobs_reap(ULONGLONG now)
+{
+    int i;
+    pthread_mutex_lock(&g_job_lock);
+    for(i=0;i<LOAD_JOBS;i++) {
+        LoadJob *job=&g_jobs[i];
+        if(job->state==JOB_DONE && now-job->done_at>LOAD_STALE_MS) {
+            job->entry->job=NULL; prepared_free(job->image); memset(job,0,sizeof *job);
+        }
+    }
+    pthread_mutex_unlock(&g_job_lock);
+}
+/* 1 uploaded, 0 rejected for good, -1 try again later, -2 still being decoded. */
+static int upload_png_async(IDirect3DDevice8 *dev,PackEntry *e,const RecompTextureSource *source,ULONGLONG now)
+{
+    LoadJob *job=e->job; int i, result;
+    if(!job) {
+        if(!workers_start()) return upload_png(dev,e,source);
+        pthread_mutex_lock(&g_job_lock);
+        for(i=0;i<LOAD_JOBS && g_jobs[i].state!=JOB_FREE;i++) ;
+        if(i==LOAD_JOBS) { pthread_mutex_unlock(&g_job_lock); return -2; }
+        job=&g_jobs[i]; memset(job,0,sizeof *job);
+        job->entry=e; snprintf(job->path,sizeof job->path,"%s",e->path);
+        job->w=source->width; job->h=source->height; job->row_texels=source->row_texels;
+        job->channel_mips=e->channel_mips; job->state=JOB_QUEUED;
+        e->job=job;
+        pthread_cond_signal(&g_job_wake);
+        pthread_mutex_unlock(&g_job_lock);
+        return -2;
+    }
+    pthread_mutex_lock(&g_job_lock);
+    if(job->state!=JOB_DONE) { pthread_mutex_unlock(&g_job_lock); return -2; }
+    pthread_mutex_unlock(&g_job_lock);
+    /* A worker never touches a finished job again, so it is ours until we free it. */
+    e->job=NULL;
+    if(!job->image) result=job->retry ? -1 : 0;
+    else { result=commit_prepared(dev,e,job->image); prepared_free(job->image); }
+    pthread_mutex_lock(&g_job_lock);
+    memset(job,0,sizeof *job);
+    pthread_mutex_unlock(&g_job_lock);
+    (void)now;
+    return result;
+}
+#endif
 int texture_pack_bind(IDirect3DDevice8 *dev,unsigned stage,const RecompTextureSource *s,RecompTextureSample sample,void *user)
 {
     struct SourceState *state=NULL; char id[65]; PackEntry *entry;
@@ -440,6 +615,14 @@ int texture_pack_bind(IDirect3DDevice8 *dev,unsigned stage,const RecompTextureSo
     unsigned i, slot=source_slot(s);
     ULONGLONG now=now_ms();
     if(!texture_pack_active() || !dev || stage>3) return 0;
+    if(!g_win.start) g_win.start=now;
+    if(now-g_win.start>=2000) {
+        if(g_win.loads || g_win.evictions)
+            fprintf(stderr,"  [TEXPACK] %.1fs: %u replacements uploaded (%llu MiB, %llu ms on the render thread, slowest %u ms), %u evicted, %llu of %llu MiB resident\n",
+                    (double)(now-g_win.start)/1000.0,g_win.loads,(unsigned long long)(g_win.bytes>>20),(unsigned long long)g_win.ms,g_win.max_ms,
+                    g_win.evictions,(unsigned long long)(g_resident>>20),(unsigned long long)(g_budget>>20));
+        memset(&g_win,0,sizeof g_win); g_win.start=now;
+    }
     for(i=0;i<4;i++) {
         struct SourceState *c=&g_sources[(slot+i)&(SOURCE_SLOTS-1)];
         if(c->used && c->shape.address==s->address && c->shape.format==s->format && c->shape.width==s->width &&
@@ -450,7 +633,9 @@ int texture_pack_bind(IDirect3DDevice8 *dev,unsigned stage,const RecompTextureSo
             (have_quick=texture_pack_quick(s,&quick)) && quick==state->quick) {
         memcpy(id,state->id,65); state->checked=now;
     } else {
-        if(!texture_pack_hash(s,id)) return 0;
+        { ULONGLONG h0=now_ms(); int ok=texture_pack_hash(s,id), ms=(int)(now_ms()-h0);
+          if(ms>=2 && g_trace) fprintf(stderr,"[TEXPACK] hash %ux%u fmt %x: %d ms\n",s->width,s->height,s->format,ms);
+          if(!ok) return 0; }
         if(!state) {
             state=&g_sources[slot];
             for(i=0;i<4;i++) {
@@ -491,7 +676,19 @@ int texture_pack_bind(IDirect3DDevice8 *dev,unsigned stage,const RecompTextureSo
     if(entry->failed || now<entry->retry) return 0;
     if(!entry->texture) {
         const char *extension=strrchr(entry->path,'.');
-        int loaded=extension && !_stricmp(extension,".dds") ? upload_dds(dev,entry,s) : upload_png(dev,entry,s);
+        int is_dds=extension && !_stricmp(extension,".dds");
+        ULONGLONG t0=now_ms();
+        int loaded;
+#if !defined(_WIN32)
+        jobs_reap(now);
+        loaded=is_dds ? upload_dds(dev,entry,s) : g_sync_load ? upload_png(dev,entry,s) : upload_png_async(dev,entry,s,now);
+        if(loaded==-2) return 0;
+#else
+        loaded=is_dds ? upload_dds(dev,entry,s) : upload_png(dev,entry,s);
+#endif
+        { unsigned took=(unsigned)(now_ms()-t0);
+          if(loaded>0) { g_win.loads++; g_win.ms+=took; g_win.bytes+=entry->bytes; if(took>g_win.max_ms) g_win.max_ms=took; }
+          if(g_trace) fprintf(stderr,"[TEXPACK] upload %s %ux%u: %u ms (%d)\n",entry->id,s->width,s->height,took,loaded); }
         if(loaded<0) { entry->retry=now+1000; return 0; }
         if(!loaded) { entry->failed=1; warn("Replacement rejected; using original",entry->path); return 0; }
         if(g_loads++<32) fprintf(stderr,"[TEXPACK] loaded %s (%u mips, %llu bytes)\n",entry->id,entry->levels,(unsigned long long)entry->bytes);
@@ -506,6 +703,9 @@ void texture_pack_shutdown(IDirect3DDevice8 *dev)
     size_t i;
     if(g_active) fprintf(stderr,"[TEXPACK] hits=%llu misses=%llu dumps=%llu hashed=%llu resident=%llu\n",
         (unsigned long long)g_hits,(unsigned long long)g_misses,(unsigned long long)g_dumps,(unsigned long long)g_hashed,(unsigned long long)g_resident);
+#if !defined(_WIN32)
+    workers_stop();
+#endif
     if(dev) for(i=0;i<g_count;i++) release_entry(dev,&g_entries[i]);
     free(g_entries); g_entries=NULL; g_count=g_capacity=0;
     memset(g_sources,0,sizeof g_sources);
