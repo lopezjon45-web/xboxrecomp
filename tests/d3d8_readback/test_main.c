@@ -187,7 +187,7 @@ int main(void)
     CHECK(d3d8_readback_begin(1) == -1, "begin before a device must be unsupported");
     if (!d3d || d3d->lpVtbl->CreateDevice(d3d, 0, 1, pp.hDeviceWindow, 0, &pp, &dev) != 0 || !dev) {
         printf("SKIP: no Direct3D 8 device on this machine\n");
-        return 0;
+        return 77;      /* ctest: skipped, not passed */
     }
 
     /* Probe: is there an asynchronous path at all? */

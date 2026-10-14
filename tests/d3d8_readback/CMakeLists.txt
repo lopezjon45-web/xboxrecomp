@@ -2,8 +2,9 @@ cmake_minimum_required(VERSION 3.20)
 project(d3d8_readback_fixture C)
 set(CMAKE_C_STANDARD 11)
 # The asynchronous back-buffer read-back against LockRect, on this platform's
-# real Direct3D 8 device. Needs a Direct3D 11 device (WARP will do) on Windows,
-# a Vulkan driver (lavapipe will do) elsewhere; with neither it reports SKIP.
+# real Direct3D 8 device. Needs a Direct3D 11 hardware device (the Basic Render Driver of a
+# machine without a GPU will do) on Windows,
+# a Vulkan driver (lavapipe will do) elsewhere; with neither ctest reports it skipped.
 add_subdirectory(../../src/platform platform)
 add_subdirectory(../../src/d3d d3d)
 add_executable(d3d8_readback_test test_main.c)
@@ -13,3 +14,4 @@ if(NOT WIN32)
 endif()
 enable_testing()
 add_test(NAME d3d8_readback COMMAND d3d8_readback_test)
+set_tests_properties(d3d8_readback PROPERTIES SKIP_RETURN_CODE 77)
