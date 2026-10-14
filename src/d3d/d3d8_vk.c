@@ -34,6 +34,7 @@
 #include "d3d8_combiners.h"
 #include "d3d8_vk.h"
 #include "d3d8_present.h"  /* d3d8_canvas_width */
+#include "d3d8_readback.h"
 #include "win32_compat.h"   /* GetTickCount64 */
 
 #include <vulkan/vulkan.h>
@@ -458,6 +459,9 @@ static void pass_end(void)
 /* Hand the frame's commands to the GPU and wait for them. Uploads first:
  * they were recorded apart so they need not interrupt the render pass. */
 static uint64_t g_fence_wait_ticks, g_acquire_ticks, g_present_ticks;   /* time spent waiting for the GPU, for the 2 s line */
+/* Submits that have completed. Every submit waits on its fence, so a command
+ * recorded before submit n has finished once this is n or more. */
+static uint64_t g_submits_done;
 static void frame_submit_wait(VkSemaphore wait)
 {
     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
@@ -488,6 +492,7 @@ static void frame_submit_wait(VkSemaphore wait)
         QueryPerformanceCounter(&b);
         g_fence_wait_ticks += (uint64_t)(b.QuadPart - a.QuadPart);
     }
+    g_submits_done++;
     vk.frame_open = 0;
     for (i = 0; i < vk.retired_n; i++) {
         vkDestroyImageView(vk.dev, vk.retired[i].view, NULL);
@@ -1290,6 +1295,112 @@ static HRESULT __stdcall sf_LockRect(IDirect3DSurface8 *s, D3DLOCKED_RECT *lr, c
     return D3D_OK;
 }
 static HRESULT __stdcall sf_UnlockRect(IDirect3DSurface8 *s) { (void)s; return D3D_OK; }
+
+/* ── Asynchronous read-back (d3d8_readback.h) ──────────────────────────── */
+
+/* The same copy as sf_LockRect, into a buffer of the slot's own, recorded in
+ * the frame's command buffer and left to complete with the frame's own
+ * submission. A slot is free, in flight (`after` is the count of completed
+ * submits when it was recorded) or held: handed out by poll until the next
+ * poll or begin. */
+enum { RB_FREE, RB_FLIGHT, RB_HELD };
+static struct {
+    Ring     buf;
+    int      state;
+    uint64_t after, seq, tag;
+} s_rb[D3D8_READBACK_SLOTS];
+static uint64_t s_rb_seq;
+static int      s_rb_broken;        /* a slot's buffer could not be made: unsupported from then on */
+
+static void rb_release_held(void)
+{
+    int i;
+    for (i = 0; i < D3D8_READBACK_SLOTS; i++)
+        if (s_rb[i].state == RB_HELD)
+            s_rb[i].state = RB_FREE;
+}
+
+int d3d8_readback_begin(uint64_t tag)
+{
+    VkBufferImageCopy region;
+    VkDeviceSize bytes = (VkDeviceSize)vk.tw * vk.th * 4;
+    int i, slot = -1;
+
+    if (!vk.ready || s_rb_broken)
+        return -1;
+    rb_release_held();
+    for (i = 0; i < D3D8_READBACK_SLOTS && slot < 0; i++)
+        if (s_rb[i].state == RB_FREE)
+            slot = i;
+    if (slot < 0)
+        return 0;
+    if (!s_rb[slot].buf.map && !ring_make(&s_rb[slot].buf, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
+        s_rb_broken = 1;
+        return -1;
+    }
+    frame_begin();
+    pass_end();
+    image_layout(vk.cmd, vk.color, VK_IMAGE_ASPECT_COLOR_BIT,
+                 VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    memset(&region, 0, sizeof region);
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.layerCount = 1;
+    region.imageExtent.width = vk.tw;
+    region.imageExtent.height = vk.th;
+    region.imageExtent.depth = 1;
+    vkCmdCopyImageToBuffer(vk.cmd, vk.color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           s_rb[slot].buf.buf, 1, &region);
+    image_layout(vk.cmd, vk.color, VK_IMAGE_ASPECT_COLOR_BIT,
+                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    s_rb[slot].state = RB_FLIGHT;
+    s_rb[slot].after = g_submits_done;
+    s_rb[slot].seq = ++s_rb_seq;
+    s_rb[slot].tag = tag;
+    return 1;
+}
+
+int d3d8_readback_poll(D3D8Readback *out)
+{
+    int i, best = -1;
+
+    rb_release_held();
+    for (i = 0; i < D3D8_READBACK_SLOTS; i++)
+        if (s_rb[i].state == RB_FLIGHT && (best < 0 || s_rb[i].seq < s_rb[best].seq))
+            best = i;
+    /* Copies finish in the order they were recorded: when the oldest has
+     * not, none has. */
+    if (best < 0 || g_submits_done <= s_rb[best].after || !out)
+        return 0;
+    s_rb[best].state = RB_HELD;
+    out->pixels = s_rb[best].buf.map;   /* host-coherent: no invalidate */
+    out->pitch = (int)(vk.tw * 4);
+    out->width = vk.tw;
+    out->height = vk.th;
+    out->bgra = 0;
+    out->tag = s_rb[best].tag;
+    return 1;
+}
+
+void d3d8_readback_reset(void)
+{
+    int i, flight = 0;
+
+    for (i = 0; i < D3D8_READBACK_SLOTS; i++)
+        if (s_rb[i].state == RB_FLIGHT && g_submits_done <= s_rb[i].after)
+            flight = 1;
+    /* A copy still in the open command buffer names its buffer: finish it
+     * before the buffer goes. */
+    if (flight && vk.frame_open)
+        frame_submit();
+    for (i = 0; i < D3D8_READBACK_SLOTS; i++) {
+        if (s_rb[i].buf.buf)
+            vkDestroyBuffer(vk.dev, s_rb[i].buf.buf, NULL);
+        if (s_rb[i].buf.mem)
+            vkFreeMemory(vk.dev, s_rb[i].buf.mem, NULL);
+        memset(&s_rb[i], 0, sizeof s_rb[i]);
+    }
+    s_rb_broken = 0;
+}
 
 static const IDirect3DSurface8Vtbl g_sf_vtbl = {
     sf_QueryInterface, sf_AddRef, sf_Release,
