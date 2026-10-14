@@ -7,13 +7,17 @@
  * Each frame clears to its own colour and draws a triangle, takes the LockRect
  * picture as the reference, starts an asynchronous copy tagged with the frame
  * number and presents. Polled afterwards, every tag must come back once, in
- * order, with the reference's bytes. Also: a busy ring answers 0, and Vulkan,
+ * order, with the reference's bytes and size. Run with "scaled", the device
+ * presents through a scaled target at render scale 2 (the Direct3D 11 game texture
+ * instead of the swap chain; a 1280x960 target everywhere). Also: a busy ring
+ * answers 0, and Vulkan,
  * which completes a copy only with a submission, has nothing before Present.
  * Last, the time a frame spends capturing each way is printed (not judged:
  * a software device on a shared runner is no measurement).
  */
 #include "d3d8_xbox.h"
 #include "d3d8_readback.h"
+#include "d3d8_present.h"
 
 #ifndef _WIN32
 #include "win32_compat.h"   /* QueryPerformanceCounter */
@@ -34,7 +38,7 @@ static int failures;
 typedef struct { float x, y, z, rhw; DWORD color; float u, v; } Vertex;   /* 28 bytes */
 
 static uint8_t *g_ref[FRAMES];
-static int      g_ref_pitch;
+static uint32_t g_ref_w, g_ref_h;   /* the back buffer's size: the title's times the render scale */
 
 static void draw_frame(IDirect3DDevice8 *dev, int k)
 {
@@ -57,16 +61,20 @@ static int lock_reference(IDirect3DDevice8 *dev, int k)
     D3DLOCKED_RECT lr;
     int y;
 
+    D3DSURFACE_DESC desc;
+
     if (dev->lpVtbl->GetBackBuffer(dev, 0, 0, &bb) != 0 || !bb)
         return 0;
-    if (bb->lpVtbl->LockRect(bb, &lr, NULL, D3DLOCK_READONLY) != 0) {
+    if (bb->lpVtbl->GetDesc(bb, &desc) != 0 || !desc.Width || !desc.Height
+            || bb->lpVtbl->LockRect(bb, &lr, NULL, D3DLOCK_READONLY) != 0) {
         bb->lpVtbl->Release(bb);
         return 0;
     }
-    g_ref_pitch = W * 4;
-    g_ref[k] = malloc((size_t)W * H * 4);
-    for (y = 0; y < H; y++)
-        memcpy(g_ref[k] + (size_t)y * W * 4, (const uint8_t *)lr.pBits + (size_t)y * lr.Pitch, W * 4);
+    g_ref_w = desc.Width;
+    g_ref_h = desc.Height;
+    g_ref[k] = malloc((size_t)g_ref_w * g_ref_h * 4);
+    for (y = 0; y < (int)g_ref_h; y++)
+        memcpy(g_ref[k] + (size_t)y * g_ref_w * 4, (const uint8_t *)lr.pBits + (size_t)y * lr.Pitch, g_ref_w * 4);
     bb->lpVtbl->UnlockRect(bb);
     bb->lpVtbl->Release(bb);
     return 1;
@@ -77,10 +85,12 @@ static int compare(const D3D8Readback *rb)
     int k = (int)rb->tag, y;
     if (k < 0 || k >= FRAMES || !g_ref[k])
         return 0;
-    if (rb->width != W || rb->height != H)
+    if (rb->width != g_ref_w || rb->height != g_ref_h) {
+        printf("frame %d: asynchronous %ux%u, LockRect %ux%u\n", k, rb->width, rb->height, g_ref_w, g_ref_h);
         return 0;
-    for (y = 0; y < H; y++)
-        if (memcmp(rb->pixels + (size_t)y * rb->pitch, g_ref[k] + (size_t)y * g_ref_pitch, W * 4) != 0)
+    }
+    for (y = 0; y < (int)g_ref_h; y++)
+        if (memcmp(rb->pixels + (size_t)y * rb->pitch, g_ref[k] + (size_t)y * g_ref_w * 4, g_ref_w * 4) != 0)
             return 0;
     return 1;
 }
@@ -143,7 +153,7 @@ static void timing(IDirect3DDevice8 *dev)
         async_frame[k] = now_ms() - f;
     }
     d3d8_readback_reset();
-    printf("capture calls, median of %d frames at %dx%d: LockRect %.3f ms, asynchronous %.3f ms\n",
+    printf("capture calls, median of %d frames, title %dx%d: LockRect %.3f ms, asynchronous %.3f ms\n",
            TIMED, W, H, median(sync_ms, TIMED), median(async_ms, TIMED));
     printf("whole frame (draw, capture, Present), median: no capture %.3f ms, LockRect %.3f ms, asynchronous %.3f ms\n",
            median(none_frame, TIMED), median(sync_frame, TIMED), median(async_frame, TIMED));
@@ -167,8 +177,9 @@ static HWND make_window(void)
 static HWND make_window(void) { return NULL; }
 #endif
 
-int main(void)
+int main(int argc, char **argv)
 {
+    int scaled = argc > 1 && !strcmp(argv[1], "scaled");
     IDirect3D8 *d3d = xbox_Direct3DCreate8(0);
     IDirect3DDevice8 *dev = NULL;
     D3DPRESENT_PARAMETERS pp;
@@ -184,6 +195,10 @@ int main(void)
     pp.hDeviceWindow = make_window();
     pp.Windowed = TRUE;
 
+    if (scaled) {
+        d3d8_present_enable_scaling(1);
+        d3d8_present_set_render_scale(2);
+    }
     CHECK(d3d8_readback_begin(1) == -1, "begin before a device must be unsupported");
     if (!d3d || d3d->lpVtbl->CreateDevice(d3d, 0, 1, pp.hDeviceWindow, 0, &pp, &dev) != 0 || !dev) {
         printf("SKIP: no Direct3D 8 device on this machine\n");
@@ -261,7 +276,8 @@ int main(void)
         }
     }
     CHECK(got == FRAMES, "all %d frames came back (%d)", FRAMES, got);
-    CHECK(g_ref[0] && g_ref[1] && memcmp(g_ref[0], g_ref[1], (size_t)W * H * 4) != 0,
+    CHECK(!scaled || g_ref_w >= 2 * W, "scaled: the target is at least twice the title's width (%u)", g_ref_w);
+    CHECK(g_ref[0] && g_ref[1] && memcmp(g_ref[0], g_ref[1], (size_t)g_ref_w * g_ref_h * 4) != 0,
           "consecutive frames differ, so a wrong frame would be caught");
 
     d3d8_readback_reset();
@@ -270,6 +286,7 @@ int main(void)
     d3d8_readback_reset();
     timing(dev);
 
-    printf("%s: %d frames compared, %d failure(s)\n", failures ? "FAILED" : "PASSED", got, failures);
+    printf("%s: %d frames compared at %ux%u%s, %d failure(s)\n", failures ? "FAILED" : "PASSED", got,
+           g_ref_w, g_ref_h, scaled ? " (scaled presentation)" : "", failures);
     return failures ? 1 : 0;
 }
