@@ -972,10 +972,17 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
  *
  * Source samples are fetched in small chunks with voice_get_samples, which is
  * what advances the voice's CBO, so the play position the title reads back runs
- * at most one chunk ahead of what has been heard. The state is dropped when the
+ * at most one chunk (VRS_CHUNK) ahead of what has been heard. The state is dropped when the
  * voice is new or when its CBO is not where the last fetch left it (a title
  * that seeks, or a voice restarted on the same handle). */
-#define VRS_CHUNK 64
+/* How far ahead of the heard sample a voice's CBO may run. The title reads CBO as the
+ * play cursor and writes its own mix into a looping buffer near it (voices 0xF8-0xFA, the
+ * six-channel stream). With 64 the cursor it saw led what was heard by up to 64 samples;
+ * measured over 200 s of start-up, menus and the opening scene, the mixed output had
+ * 310-430 more step discontinuities than chance at slice phases 0 and 16 (32-sample
+ * slices), about two a second, and with 8 it has none. Why the title's writes are
+ * sensitive to the lead is not traced. */
+#define VRS_CHUNK 8
 typedef struct {
     float buf[VRS_CHUNK + 2][2];   /* source samples; [pos] and [pos + 1] are interpolated */
     int n, pos;                     /* valid samples, current index */
