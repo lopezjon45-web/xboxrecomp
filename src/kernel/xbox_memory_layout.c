@@ -3889,6 +3889,15 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
             contig_insert(g_contig_block_count, result, size, 0);
         }
         g_contig_next = result + size;
+        {
+            static uint32_t reported_mb;
+            uint32_t mb = (g_contig_next - XBOX_CONTIG_BASE) >> 22;   /* 4 MiB steps */
+            if (mb > reported_mb) {
+                reported_mb = mb;
+                fprintf(stderr, "  [CONTIG] high-water %u MiB of %u (reclaim %s)\n",
+                        mb << 2, (unsigned)(XBOX_CONTIG_SIZE >> 20), reclaim ? "on" : "off");
+            }
+        }
     }
     if (reclaim)
         ReleaseSRWLockExclusive(&g_contig_lock);
