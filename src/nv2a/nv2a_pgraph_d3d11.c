@@ -1661,6 +1661,68 @@ int pgraph_d3d11_draw_program(const float *verts, uint32_t nverts, uint32_t used
     return 1;
 }
 
+/* Release every cached texture, so the next bind of each uploads again from
+ * the title's memory as it is now.
+ *
+ * The cache is keyed by address and its change check samples one word in 61,
+ * so a texture the title replaces with another of the same shape at the same
+ * address can be shown as the old one, and a UI texture bound every frame is
+ * never the least recently used to leave. A loading screen is where the
+ * title reuses its memory, so that is where this runs (see
+ * pgraph_d3d11_flush). Every stage is cleared first: the device keeps a bare
+ * pointer per stage, as the eviction in set_texture_ready explains. */
+static int ready_tex_drop_all(void)
+{
+    IDirect3DDevice8 *dev = xbox_GetD3DDevice();
+    int i, dropped = 0;
+
+    if (!dev)
+        return 0;
+    for (i = 0; i < 4; i++)
+        dev->lpVtbl->SetTexture(dev, (DWORD)i, NULL);
+    for (i = 0; i < s_ready_tex_count; i++) {
+        if (s_ready_tex[i].tex) {
+            s_ready_tex[i].tex->lpVtbl->Release(s_ready_tex[i].tex);
+            dropped++;
+        }
+        s_ready_tex[i].tex = NULL;
+        s_ready_tex[i].addr = 0;
+    }
+    s_ready_tex_count = 0;
+    return dropped;
+}
+
+/* A scene change shows up as a stretch of nearly empty frames: the loading
+ * screens in a Steam Deck session drew 60-90 calls a frame for several
+ * hundred frames, against 170-640 in menus and fights. After this many such
+ * frames in a row, the first busy one flushes the texture cache once.
+ * RECOMP_NO_SCENE_FLUSH=1 turns it off, to tell whether it is what fixed a
+ * corrupted screen. */
+#define SCENE_QUIET_DRAWS  100
+#define SCENE_QUIET_FRAMES 45
+
+static void scene_change_check(void)
+{
+    static uint32_t last_draws, quiet_run, flushes;
+    static int off = -1;
+    uint32_t drawn = g_pg.stats.draw_calls - last_draws;
+
+    last_draws = g_pg.stats.draw_calls;
+    if (off < 0)
+        off = getenv("RECOMP_NO_SCENE_FLUSH") != NULL;
+    if (drawn < SCENE_QUIET_DRAWS) {
+        quiet_run++;
+        return;
+    }
+    if (quiet_run >= SCENE_QUIET_FRAMES && !off) {
+        int dropped = ready_tex_drop_all();
+        fprintf(stderr, "[PGRAPH-D3D11] scene change after %u quiet frames (frame %u);"
+                        " dropped %d cached textures (#%u)\n",
+                quiet_run, g_pg.stats.frames, dropped, ++flushes);
+    }
+    quiet_run = 0;
+}
+
 void pgraph_d3d11_flush(void)
 {
     if (g_pg.in_draw) {
@@ -1668,6 +1730,7 @@ void pgraph_d3d11_flush(void)
         g_pg.in_draw = 0;
     }
     g_pg.stats.frames++;
+    scene_change_check();
 }
 
 void pgraph_d3d11_set_chyron_scroll(uint32_t pixels)
