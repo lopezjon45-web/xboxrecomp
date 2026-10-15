@@ -20,6 +20,9 @@
  */
 
 #include "apu_state.h"
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 #include "apu.h"
 #include "apu_xaudio2.h"
 #include "fpconv.h"
@@ -508,9 +511,52 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
  * Throttle (timing control for frame pacing)
  * ============================================================ */
 
+/* The eight 32-sample slices of a period used to run back to back and the thread then
+ * slept out the rest of its 5.33 ms, so a voice's play position (CBO) jumped 256 samples
+ * at once where hardware advances 32 every 0.67 ms. Measured in 200 s of the opening
+ * scene, the game's mixing buffer (voices 0xF8-0xFA) played back the previous lap's
+ * samples (the title had not written them yet) about 4.3 times a second, and about 2.2
+ * with each slice at its own moment. That is half of them, not all; what drives the rest
+ * is not found. Waits shorter than a millisecond need a sleep the host's condition
+ * variable does not have, so this is for POSIX hosts: on by default on Linux (the host
+ * it was measured on), RECOMP_APU_SLICE_PACE=1/0 to choose, and off on Windows. */
+static int slice_pace_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_APU_SLICE_PACE");
+#if defined(_WIN32)
+        on = 0;
+#elif defined(__linux__)
+        on = !(e && *e == '0');
+#else
+        on = e && *e == '1';
+#endif
+    }
+    return on;
+}
+
 static void throttle(MCPXAPUState *d)
 {
+    static int64_t period_base_us;
     if (d->ep_frame_div % 8) {
+#ifndef _WIN32
+        if (slice_pace_enabled() && period_base_us && !d->pause_requested) {
+            int64_t due = period_base_us + (int64_t)(d->ep_frame_div % 8) * EP_FRAME_US / 8;
+            for (;;) {
+                int64_t rem = due - qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+                if (rem <= 0 || d->pause_requested)
+                    break;
+                if (rem >= 2000) {
+                    qemu_cond_timedwait(&d->cond, &d->lock, (int)(rem / 1000) - 1);
+                } else {
+                    qemu_mutex_unlock(&d->lock);
+                    usleep((useconds_t)rem);
+                    qemu_mutex_lock(&d->lock);
+                }
+            }
+        }
+#endif
         return;
     }
 
@@ -532,6 +578,7 @@ static void throttle(MCPXAPUState *d)
             break;
         }
     }
+    period_base_us = d->next_frame_time_us;
     d->next_frame_time_us += EP_FRAME_US;
     /* A pause request cuts the wait short, and a frame thread kept running by
      * the mixer while paused comes back here at once: the deadline then ran
