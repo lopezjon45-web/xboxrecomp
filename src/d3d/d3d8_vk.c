@@ -134,6 +134,7 @@ typedef struct {
     VkDeviceMemory mem;
     uint8_t       *map;
     VkDeviceSize   size, at;
+    int            coherent;    /* 0: host-cached only; invalidate before the CPU reads */
 } Ring;
 
 typedef struct { VkImage img; VkDeviceMemory mem; VkImageView view; } Retired;
@@ -300,12 +301,29 @@ static uint32_t mem_type(uint32_t bits, VkMemoryPropertyFlags want)
     return 0;
 }
 
-static int ring_make(Ring *r, VkDeviceSize size, VkBufferUsageFlags usage)
+static uint32_t mem_type_any(uint32_t bits, VkMemoryPropertyFlags want, VkMemoryPropertyFlags avoid)
+{
+    uint32_t i;
+    for (i = 0; i < vk.memprops.memoryTypeCount; i++) {
+        VkMemoryPropertyFlags f = vk.memprops.memoryTypes[i].propertyFlags;
+        if ((bits & (1u << i)) && (f & want) == want && !(f & avoid))
+            return i;
+    }
+    return UINT32_MAX;
+}
+
+/* `readback`: the CPU reads this buffer, so prefer host-cached memory. Plain
+ * host-visible memory can be uncached (write-combined) -- the Steam Deck's APU
+ * is one -- where reading a picture back costs hundreds of milliseconds.
+ * Without a cached type the buffer is the plain one it always was. */
+static int ring_make_ex(Ring *r, VkDeviceSize size, VkBufferUsageFlags usage, int readback)
 {
     VkBufferCreateInfo bi = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
     VkMemoryRequirements mr;
     VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
     void *p = NULL;
+    uint32_t type = UINT32_MAX;
+    int coherent = 1;
 
     bi.size = size;
     bi.usage = usage;
@@ -313,8 +331,21 @@ static int ring_make(Ring *r, VkDeviceSize size, VkBufferUsageFlags usage)
         return 0;
     vkGetBufferMemoryRequirements(vk.dev, r->buf, &mr);
     ai.allocationSize = mr.size;
-    ai.memoryTypeIndex = mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
-                                                     | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (readback) {
+        type = mem_type_any(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                            | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 0);
+        if (type == UINT32_MAX) {
+            type = mem_type_any(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                                | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 0);
+            coherent = 0;
+        }
+    }
+    if (type == UINT32_MAX) {
+        type = mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                                           | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        coherent = 1;
+    }
+    ai.memoryTypeIndex = type;
     if (vkAllocateMemory(vk.dev, &ai, NULL, &r->mem) != VK_SUCCESS
             || vkBindBufferMemory(vk.dev, r->buf, r->mem, 0) != VK_SUCCESS
             || vkMapMemory(vk.dev, r->mem, 0, size, 0, &p) != VK_SUCCESS)
@@ -322,7 +353,24 @@ static int ring_make(Ring *r, VkDeviceSize size, VkBufferUsageFlags usage)
     r->map = p;
     r->size = size;
     r->at = 0;
+    r->coherent = coherent;
     return 1;
+}
+
+static int ring_make(Ring *r, VkDeviceSize size, VkBufferUsageFlags usage)
+{
+    return ring_make_ex(r, size, usage, 0);
+}
+
+/* Make a finished GPU write visible to the CPU (a no-op on coherent memory). */
+static void ring_invalidate(const Ring *r)
+{
+    VkMappedMemoryRange range = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE };
+    if (r->coherent)
+        return;
+    range.memory = r->mem;
+    range.size = VK_WHOLE_SIZE;
+    vkInvalidateMappedMemoryRanges(vk.dev, 1, &range);
 }
 
 static int image_make_levels(uint32_t w, uint32_t h, uint32_t levels, VkFormat fmt, VkImageUsageFlags usage,
@@ -1289,6 +1337,7 @@ static HRESULT __stdcall sf_LockRect(IDirect3DSurface8 *s, D3DLOCKED_RECT *lr, c
         b->pixels = malloc(bytes);
     if (!b->pixels)
         return D3DERR_INVALIDCALL;
+    ring_invalidate(&vk.readback);
     memcpy(b->pixels, vk.readback.map, bytes);
     lr->Pitch = (INT)(vk.tw * 4);
     lr->pBits = b->pixels;
@@ -1334,7 +1383,7 @@ int d3d8_readback_begin(uint64_t tag)
             slot = i;
     if (slot < 0)
         return 0;
-    if (!s_rb[slot].buf.map && !ring_make(&s_rb[slot].buf, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
+    if (!s_rb[slot].buf.map && !ring_make_ex(&s_rb[slot].buf, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, 1)) {
         s_rb_broken = 1;
         return -1;
     }
@@ -1372,7 +1421,8 @@ int d3d8_readback_poll(D3D8Readback *out)
     if (best < 0 || g_submits_done <= s_rb[best].after || !out)
         return 0;
     s_rb[best].state = RB_HELD;
-    out->pixels = s_rb[best].buf.map;   /* host-coherent: no invalidate */
+    ring_invalidate(&s_rb[best].buf);
+    out->pixels = s_rb[best].buf.map;
     out->pitch = (int)(vk.tw * 4);
     out->width = vk.tw;
     out->height = vk.th;
@@ -2253,7 +2303,7 @@ static int shot_record(uint32_t image)
             vkDestroyBuffer(vk.dev, s_shot_ring.buf, NULL);
             vkFreeMemory(vk.dev, s_shot_ring.mem, NULL);
         }
-        if (!ring_make(&s_shot_ring, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
+        if (!ring_make_ex(&s_shot_ring, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, 1)) {
             s_shot_done = 1;
             return 0;
         }
@@ -2292,6 +2342,7 @@ static void shot_write(void)
         LOG("RECOMP_WINDOW_SHOT: cannot write %s", path ? path : "(nothing)");
         return;
     }
+    ring_invalidate(&s_shot_ring);
     head[0] = 14 + 40 + pixel_bytes;            /* file size */
     head[1] = 0;
     head[2] = 14 + 40;                          /* pixel data offset */
@@ -3090,7 +3141,7 @@ static int resources_make(void)
             || !ring_make(&vk.idx, 4u << 20, VK_BUFFER_USAGE_INDEX_BUFFER_BIT)
             || !ring_make(&vk.ubo, 16u << 20, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)
             || !ring_make(&vk.stage, 64u << 20, VK_BUFFER_USAGE_TRANSFER_SRC_BIT)
-            || !ring_make(&vk.readback, (VkDeviceSize)vk.tw * vk.th * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT))
+            || !ring_make_ex(&vk.readback, (VkDeviceSize)vk.tw * vk.th * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, 1))
         return 0;
 
     /* The attachments into the layouts the render pass expects, and the
