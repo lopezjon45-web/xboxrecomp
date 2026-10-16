@@ -35,6 +35,7 @@
 #include <sys/stat.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <pthread/qos.h>
 #else
 #include <sys/sysinfo.h>
 #endif
@@ -1135,12 +1136,66 @@ DWORD QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data)
 /* Sleep                                                                 */
 /* ===================================================================== */
 
+/* RECOMP_PRECISE_SLEEP (default 1): sleeps of a time-critical guest thread end on time,
+ * and the thread asks the host for interactive service (Darwin: user-interactive QoS, which
+ * also caps timer lateness at 1 ms). 0 sleeps as every other thread does. */
+static int precise_sleep_wanted(void)
+{
+    static int on = -1;
+    static __thread int qos_done;
+    w32_object *o = t_self_obj;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_PRECISE_SLEEP");
+        on = !(e && *e == '0');
+    }
+    if (!on || !o || o->kind != K_THREAD || o->priority < THREAD_PRIORITY_TIME_CRITICAL)
+        return 0;
+#if defined(__APPLE__)
+    if (!qos_done) {
+        qos_done = 1;
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    }
+#else
+    (void)qos_done;
+#endif
+    return 1;
+}
+
 VOID Sleep(DWORD ms)
 {
     if (ms == 0) { gc_yield(); sched_yield(); return; }
     struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
     int blocked = gc_block();
-    while (nanosleep(&ts, &ts) == -1 && errno == EINTR) { }
+    if (precise_sleep_wanted()) {
+        /* A time-critical thread wakes when it asked to. Darwin lets an ordinary thread's
+         * timer fire late by up to a quarter of the interval (5 ms at most): a 15 ms sleep
+         * of Def Jam's audio writer came back 3-4 ms late, past the end of the 50 ms ring it
+         * refills, and the voice processor replayed the previous lap -- the crackle. Sleep in
+         * steps of three quarters of what is left, so the lateness of each step is covered
+         * by the rest, and yield through the last 0.2 ms. */
+        struct timespec a;
+        int64_t end;
+        clock_gettime(CLOCK_MONOTONIC, &a);
+        end = (int64_t)a.tv_sec * 1000000000LL + a.tv_nsec + (int64_t)ms * 1000000LL;
+        for (;;) {
+            struct timespec now, step;
+            int64_t left;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            left = end - ((int64_t)now.tv_sec * 1000000000LL + now.tv_nsec);
+            if (left <= 0)
+                break;
+            if (left <= 200000) {
+                sched_yield();
+                continue;
+            }
+            left = left > 800000 ? left * 3 / 4 : left - 200000;
+            step.tv_sec = (time_t)(left / 1000000000LL);
+            step.tv_nsec = (long)(left % 1000000000LL);
+            while (nanosleep(&step, &step) == -1 && errno == EINTR) { }
+        }
+    } else {
+        while (nanosleep(&ts, &ts) == -1 && errno == EINTR) { }
+    }
     gc_unblock(blocked);
 }
 
