@@ -4111,20 +4111,35 @@ static void bridge_NtReadFile(void)
          * whatever precedes the file it actually wants, and a read that stops
          * early looks identical to one that never started -- until you can
          * see where each one landed. */
+        char line[160];
         if (poff)
-            fprintf(stderr, "  [READ] from=0x%08X ev=%08X apc=%08X @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+            snprintf(line, sizeof line, "  [READ] from=0x%08X ev=%08X apc=%08X @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
                     g_xbox_kernel_caller, STACK_ARG(1), STACK_ARG(2),
                     (long long)off.QuadPart, length, got,
                     (uint32_t)ios.Status,
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
                     got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
         else
-            fprintf(stderr, "  [READ] from=0x%08X @seq want=%u got=%u st=0x%08X  %02X %02X %02X %02X  h=%08X\n",
+            snprintf(line, sizeof line, "  [READ] from=0x%08X @seq want=%u got=%u st=0x%08X  %02X %02X %02X %02X  h=%08X\n",
                     g_xbox_kernel_caller,
                     length, got, (uint32_t)ios.Status,
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
                     got > 2 ? p[2] : 0, got > 3 ? p[3] : 0, STACK_ARG(0));
-        fflush(stderr);
+        /* Written without the guest CPU: a scene load reads thousands of chunks,
+         * and with the log busy (the push-buffer thread writes to it too) a
+         * write that waited kept every guest thread, the audio writer among
+         * them, waiting as well. The line is formatted first, so nothing of the
+         * title's is read while another thread runs. */
+        {
+#if !defined(_WIN32)
+            int left = guest_turn_leave();
+#endif
+            fputs(line, stderr);
+            fflush(stderr);
+#if !defined(_WIN32)
+            guest_turn_return(left);
+#endif
+        }
     }
     bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
     bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3),

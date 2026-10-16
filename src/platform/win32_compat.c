@@ -244,6 +244,23 @@ void guest_turn_join(void)
     pthread_setspecific(gc_key, t);
     t_gc = t;
     gc_bind_self(t);
+#if defined(__APPLE__)
+    /* The default QoS left a holder off the CPU for tens of milliseconds at a time
+     * (0.2 ms of CPU in 48) while a busy host thread logged or a scene loaded,
+     * and every guest thread, the time-critical audio writer among them, waited
+     * behind it: the audio gaps at Story scene changes. A guest thread holds the
+     * console's one CPU, so it runs at the QoS the writer already has.
+     * RECOMP_GUEST_QOS=0 leaves the default. */
+    {
+        static int qos = -1;
+        if (qos < 0) {
+            const char *e = getenv("RECOMP_GUEST_QOS");
+            qos = !(e && *e == '0');
+        }
+        if (qos)
+            pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    }
+#endif
     gc_acquire(t, 0);
 }
 
@@ -327,6 +344,9 @@ static void gc_unblock(int blocked)
         gc_acquire(t_gc, 1);
 }
 
+int guest_turn_leave(void)       { return gc_block(); }
+void guest_turn_return(int left) { gc_unblock(left); }
+
 /* Let a waiting thread run, as a yield on one core does. */
 static void gc_yield(void)
 {
@@ -337,7 +357,11 @@ static void gc_yield(void)
         return;
     t->busy = 1;
     pthread_mutex_lock(&gc_lock);
-    waiting = gc_next != gc_serving + 1;
+    /* A time-critical thread waits outside the tickets, and a holder that came in
+     * that way took none of its own. Counting tickets alone, a thread spinning on
+     * SwitchToThread in host code (Direct3D's fence hold) kept a waiting
+     * time-critical thread out for up to 100 ms. */
+    waiting = gc_urgent_waiting || gc_next != gc_serving + !t->via_urgent;
     pthread_mutex_unlock(&gc_lock);
     t->busy = 0;
     if (waiting) {
