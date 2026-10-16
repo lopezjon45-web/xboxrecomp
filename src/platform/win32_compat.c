@@ -89,6 +89,9 @@ typedef struct {
     volatile uintptr_t asked_pc;    /* where it was when first asked ... */
     struct timespec asked_at;       /* ... and when */
     volatile sig_atomic_t busy;     /* inside the token's own code */
+    void *obj;                      /* its w32_object, for its priority */
+    int via_urgent;                 /* holds the CPU outside the ticket order */
+    int yielding;                   /* gave the CPU up on purpose: queue behind the rest */
 } gc_thread;
 
 static pthread_mutex_t gc_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -99,6 +102,13 @@ static int       gc_held;
 static volatile uint64_t gc_handoffs, gc_kicks;
 static uintptr_t gc_code_lo, gc_code_hi;
 static volatile long gc_longest_wait_ms;    /* by a thread due to run at once */
+/* RECOMP_GUEST_TURN_PRIO (default 1): a thread the title made time-critical is served
+ * before the threads queued in arrival order, as a higher priority runs first on the
+ * console. Def Jam's audio writer, which refills the 50 ms ring the voice processor plays,
+ * otherwise waited 24-52 ms behind other threads while a Story scene loaded. 0 restores
+ * plain arrival order. */
+static int       gc_prio = -1;
+static int       gc_urgent_waiting;         /* urgent threads waiting for the CPU */
 static pthread_key_t  gc_key;
 static pthread_once_t gc_once = PTHREAD_ONCE_INIT;
 static __thread gc_thread *t_gc;
@@ -109,7 +119,10 @@ static void gc_release(gc_thread *t)
     pthread_mutex_lock(&gc_lock);
     t->holding = 0;
     gc_held = 0;
-    gc_serving++;
+    if (t->via_urgent)
+        t->via_urgent = 0;          /* took no ticket */
+    else
+        gc_serving++;
     pthread_cond_broadcast(&gc_cond);
     pthread_mutex_unlock(&gc_lock);
     t->busy = 0;
@@ -117,16 +130,27 @@ static void gc_release(gc_thread *t)
 
 static void gc_acquire(gc_thread *t, int waited)
 {
-    uint64_t me;
+    uint64_t me = 0;
     struct timespec t0, t1;
-    int timed = waited;     /* a thread that should have run at once */
+    int timed, urgent;
 
     t->busy = 1;
+    if (gc_prio < 0) {
+        const char *e = getenv("RECOMP_GUEST_TURN_PRIO");
+        gc_prio = !(e && *e == '0');
+    }
+    urgent = gc_prio && t->urgent && !t->yielding;
+    if (urgent)
+        waited = 1;
+    timed = waited;         /* a thread that should have run at once */
     if (timed)
         clock_gettime(CLOCK_MONOTONIC, &t0);
     pthread_mutex_lock(&gc_lock);
-    me = gc_next++;
-    while (gc_serving != me) {
+    if (urgent)
+        gc_urgent_waiting++;
+    else
+        me = gc_next++;
+    while (urgent ? gc_held : (gc_serving != me || gc_held || gc_urgent_waiting)) {
         struct timespec ts;
         /* The holder cannot exit without this lock, so it is there to be
          * signalled. A signal that finds it between two holds is lost, which
@@ -140,6 +164,10 @@ static void gc_acquire(gc_thread *t, int waited)
         if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
         if (pthread_cond_timedwait(&gc_cond, &gc_lock, &ts) == ETIMEDOUT)
             waited = 1;
+    }
+    if (urgent) {
+        gc_urgent_waiting--;
+        t->via_urgent = 1;
     }
     gc_holder = pthread_self();
     gc_held = 1;
@@ -178,12 +206,16 @@ static void gc_preempt(int sig, siginfo_t *si, void *uctx)
     errno = e;
 }
 
+static void gc_bind_self(gc_thread *t);
+static void gc_unbind(gc_thread *t);
+
 static void gc_thread_gone(void *p)
 {
     gc_thread *t = p;
 
     if (t->holding)
         gc_release(t);
+    gc_unbind(t);
     free(t);
 }
 
@@ -211,6 +243,7 @@ void guest_turn_join(void)
         return;
     pthread_setspecific(gc_key, t);
     t_gc = t;
+    gc_bind_self(t);
     gc_acquire(t, 0);
 }
 
@@ -310,7 +343,9 @@ static void gc_yield(void)
     if (waiting) {
         t->pending = 0;
         gc_release(t);
+        t->yielding = 1;
         gc_acquire(t, t->urgent);
+        t->yielding = 0;
     } else {
         t->pending = 0;     /* whoever asked has been and gone */
     }
@@ -561,6 +596,7 @@ typedef struct w32_object {
     LPTHREAD_START_ROUTINE start;
     LPVOID          start_param;
     int             priority;
+    void           *gc;             /* its guest-CPU turn state, once it has joined */
     PAPCFUNC        apc_func[W32_MAX_APC];
     ULONG_PTR       apc_data[W32_MAX_APC];
     int             apc_count;
@@ -589,6 +625,25 @@ typedef struct w32_object {
 #define PSEUDO_CURRENT_THREAD  ((HANDLE)(LONG_PTR)-2)
 
 static __thread w32_object *t_self_obj = NULL;
+
+/* A title usually sets a thread's priority from the thread that created it, so the
+ * thread's turn state is reached through its object as well as from the thread itself. */
+static void gc_bind_self(gc_thread *t)
+{
+    w32_object *o = t_self_obj;
+    if (!o || o->kind != K_THREAD)
+        return;
+    o->gc = t;
+    t->obj = o;
+    t->urgent = o->priority >= THREAD_PRIORITY_TIME_CRITICAL;
+}
+
+static void gc_unbind(gc_thread *t)
+{
+    w32_object *o = t->obj;
+    if (o && o->gc == t)
+        o->gc = NULL;
+}
 static __thread DWORD       t_tid      = 0;
 static volatile LONG        s_next_tid = 1000;
 
@@ -1102,7 +1157,11 @@ BOOL TerminateThread(HANDLE h, DWORD exitCode)
 BOOL SetThreadPriority(HANDLE h, int priority)
 {
     w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
-    if (o && o->kind == K_THREAD) o->priority = priority;
+    if (o && o->kind == K_THREAD) {
+        o->priority = priority;
+        if (o->gc)
+            ((gc_thread *)o->gc)->urgent = priority >= THREAD_PRIORITY_TIME_CRITICAL;
+    }
     if (t_gc && (h == PSEUDO_CURRENT_THREAD || (o && o == t_self_obj)))
         t_gc->urgent = priority >= THREAD_PRIORITY_TIME_CRITICAL;
     return TRUE;   /* real RT priorities need privileges; tracked only */
