@@ -613,6 +613,11 @@ void guest_turn_counts(uint64_t *handoffs, uint64_t *kicks);
 /* The longest a thread that was due to run at once (woken, or time-critical)
  * has waited for the guest CPU since this was last asked. */
 long guest_turn_longest_wait_ms(void);
+/* Around host work that may wait and changes nothing the title can see (a log
+ * line written while the log is busy): give the guest CPU up, then take it back
+ * with what the first returned. */
+int  guest_turn_leave(void);
+void guest_turn_return(int left);
 
 #ifdef __cplusplus
 }
