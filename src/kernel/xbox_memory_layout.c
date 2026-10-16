@@ -22,6 +22,9 @@
 #if !defined(_WIN32)
 #include <unistd.h>   /* _exit */
 #endif
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+#endif
 
 /* XBE header field offsets (per xboxdevwiki.net/Xbe) */
 #define XBE_MAGIC_OFFSET        0x0000
@@ -1777,8 +1780,42 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
     return 0;
 }
 
+/* KeTickCount on a clock of its own.
+ *
+ * It used to move only between passes of the ack loop above, and a pass took 12-18 ms
+ * at a time while a Story scene played on the Mac. Def Jam's audio writer
+ * (sub_001242D0) runs on a 10 ms grid of GetTickCount -- a read of KeTickCount -- and
+ * sleeps "deadline - now": with the tick standing still it slept up to 29 ms against the
+ * 21 ms it had written ahead of the play cursor, and the voice processor replayed the
+ * previous lap of the title's mix buffer (the crackle of issues #30, #29, #11). A
+ * millisecond thread keeps the count as live as the console's clock interrupt does.
+ * RECOMP_TICK_THREAD=0 leaves it to the ack loop alone. */
+static DWORD WINAPI tick_thread(LPVOID param)
+{
+    (void)param;
+#if defined(__APPLE__)
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+    for (;;) {
+        *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
+                               + g_memory_offset) = (uint32_t)xbox_GuestUptimeMs();
+        Sleep(1);
+    }
+    return 0;
+}
+
+static void tick_thread_start(void)
+{
+    const char *e = getenv("RECOMP_TICK_THREAD");
+    if (e && *e == '0')
+        return;
+    CloseHandle(CreateThread(NULL, 0, tick_thread, NULL, 0, NULL));
+    fprintf(stderr, "  KeTickCount: own 1 ms thread (RECOMP_TICK_THREAD=0 to leave it to the ack loop)%c", 10);
+}
+
 static void xbox_Nv2aAckStart(void)
 {
+    tick_thread_start();
     dsp_ack_init();
     poke_init();
     g_nv2a_ack_stop = 0;
