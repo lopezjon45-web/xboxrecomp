@@ -1790,13 +1790,16 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
  * previous lap of the title's mix buffer (the crackle of issues #30, #29, #11). A
  * millisecond thread keeps the count as live as the console's clock interrupt does.
  * RECOMP_TICK_THREAD=0 leaves it to the ack loop alone. */
+static HANDLE g_tick_thread;
+static volatile LONG g_tick_stop;
+
 static DWORD WINAPI tick_thread(LPVOID param)
 {
     (void)param;
 #if defined(__APPLE__)
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 #endif
-    for (;;) {
+    while (!InterlockedCompareExchange(&g_tick_stop, 0, 0)) {
         *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
                                + g_memory_offset) = (uint32_t)xbox_GuestUptimeMs();
         Sleep(1);
@@ -1807,9 +1810,10 @@ static DWORD WINAPI tick_thread(LPVOID param)
 static void tick_thread_start(void)
 {
     const char *e = getenv("RECOMP_TICK_THREAD");
-    if (e && *e == '0')
+    if ((e && *e == '0') || g_tick_thread)
         return;
-    CloseHandle(CreateThread(NULL, 0, tick_thread, NULL, 0, NULL));
+    g_tick_stop = 0;
+    g_tick_thread = CreateThread(NULL, 0, tick_thread, NULL, 0, NULL);
     fprintf(stderr, "  KeTickCount: own 1 ms thread (RECOMP_TICK_THREAD=0 to leave it to the ack loop)%c", 10);
 }
 
@@ -3486,6 +3490,13 @@ void xbox_ProtectMirrorsForDebug(void)
 
 void xbox_MemoryLayoutShutdown(void)
 {
+    /* The tick thread writes into guest memory: stop it before anything is unmapped. */
+    if (g_tick_thread) {
+        InterlockedExchange(&g_tick_stop, 1);
+        WaitForSingleObject(g_tick_thread, 1000);
+        CloseHandle(g_tick_thread);
+        g_tick_thread = NULL;
+    }
     if (g_kernel_memory) {
         VirtualFree(g_kernel_memory, 0, MEM_RELEASE);
         g_kernel_memory = NULL;
