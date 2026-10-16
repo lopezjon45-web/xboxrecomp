@@ -27,6 +27,9 @@
 #include "apu_xaudio2.h"
 #include "fpconv.h"
 #include "../kernel/xbox_memory_layout.h"   /* XBOX_WORKER_STACK_TOP */
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+#endif
 
 /* ============================================================
  * Globals
@@ -639,6 +642,13 @@ int64_t  g_apu_trap_stall_us;
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+#if defined(__APPLE__)
+    /* Guest threads run at user-interactive QoS on Darwin (win32_compat.c, so the title's
+     * audio writer gets the guest CPU at scene loads). This thread produces every sample
+     * the device plays: left at the default it lost the cores to them in a four-fighter
+     * fight and the device ran dry 23 times in four minutes instead of 10. */
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {
