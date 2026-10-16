@@ -518,8 +518,8 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
  * samples (the title had not written them yet) about 4.3 times a second, and about 2.2
  * with each slice at its own moment. That is half of them, not all; what drives the rest
  * is not found. Waits shorter than a millisecond need a sleep the host's condition
- * variable does not have, so this is for POSIX hosts: on by default on Linux (the host
- * it was measured on), RECOMP_APU_SLICE_PACE=1/0 to choose, and off on Windows. */
+ * variable does not have, so this is for POSIX hosts: on by default on Linux and macOS
+ * (measured on both), RECOMP_APU_SLICE_PACE=1/0 to choose, and off on Windows. */
 static int slice_pace_enabled(void)
 {
     static int on = -1;
@@ -527,10 +527,8 @@ static int slice_pace_enabled(void)
         const char *e = getenv("RECOMP_APU_SLICE_PACE");
 #if defined(_WIN32)
         on = 0;
-#elif defined(__linux__)
-        on = !(e && *e == '0');
 #else
-        on = e && *e == '1';
+        on = !(e && *e == '0');
 #endif
     }
     return on;
