@@ -1287,6 +1287,9 @@ static void framebuffer_probe_tick(void)
  * (nv2a_pb_stall), level with it otherwise. */
 static uint32_t s_run_pos;
 static volatile uint32_t *s_put_reg;
+/* For the hitch probe: the executor stopped at a software method, and since when. */
+static volatile int s_probe_waiting;
+static volatile LONGLONG s_probe_wait_t0;
 
 /* How far the executor is behind PUT, in bytes of Direct3D's ring: from where
  * its current run began, so an overestimate by up to the run in progress. 0
@@ -1325,6 +1328,35 @@ uint32_t xbox_Nv2aBacklog(void)
     if (at > put && at - put < 0x10000u)
         return 0;
     return put >= at ? put - at : put + (limit - base) - at;
+}
+
+/* What a hitch probe says about the GPU (guest_turn_probe, win32_compat.c): where
+ * the executor is against PUT, whether it is stopped at a software method and for
+ * how long, the interrupt side's state, and the fence against Direct3D's latest. */
+int xbox_nv2a_probe_json(char *out, size_t size)
+{
+    extern void kernel_nv2a_swm_state(int *queued, uint32_t *intr, int *servicing, uint32_t *fifo);
+    uint32_t latest = 0, fence = 0, intr = 0, fifo = 0;
+    uint32_t put = s_put_reg ? *s_put_reg & 0x0FFFFFFFu : 0;
+    volatile uint32_t *f = g_fence_mirror_count ? fence_location(0, &latest) : NULL;
+    int queued = 0, servicing = 0, n;
+    long wait_ms = -1;
+
+    if (f)
+        fence = *f;
+    if (s_probe_waiting) {
+        LARGE_INTEGER now, freq;
+        QueryPerformanceCounter(&now);
+        QueryPerformanceFrequency(&freq);
+        wait_ms = (long)((now.QuadPart - s_probe_wait_t0) * 1000 / freq.QuadPart);
+    }
+    kernel_nv2a_swm_state(&queued, &intr, &servicing, &fifo);
+    n = snprintf(out, size, "{\"run\":\"0x%08X\",\"put\":\"0x%08X\",\"backlog\":%u,\"swm_wait_ms\":%ld,"
+                            "\"swm_queued\":%d,\"pgraph_intr\":\"0x%X\",\"servicing\":%d,\"fifo\":\"0x%X\","
+                            "\"fence\":\"0x%X\",\"latest\":\"0x%X\",\"released\":\"0x%X\",\"fence_by\":\"%s\"}",
+                 s_run_pos, put, xbox_Nv2aBacklog(), wait_ms, queued, intr, servicing, fifo,
+                 fence, latest, s_last_release, s_fence_by);
+    return n > 0 && (size_t)n < size ? n : 0;
 }
 
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
@@ -1435,6 +1467,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     s_stall_ms += (double)(t1.QuadPart - s_stall_t0.QuadPart) * 1000.0
                                   / (double)s_freq.QuadPart;
                 }
+                s_probe_waiting = 0;
                 at = nv2a_pb_run(XBOX_CONTIG_BASE | s_run_pos,
                                  XBOX_CONTIG_BASE | p, &stalled);
                 /* At PUT with nothing more to read, what was held back for the
@@ -1444,7 +1477,9 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 if (stalled) {
                     s_stalls++;
                     QueryPerformanceCounter(&s_stall_t0);
+                    s_probe_wait_t0 = s_stall_t0.QuadPart;
                 }
+                s_probe_waiting = stalled;
                 if (!stalled && (at & 0x0FFFFFFFu) != p) {
                     /* Stopped short of PUT without a software method: whatever
                      * lies between is skipped, fences included. Say so. */
@@ -1823,6 +1858,9 @@ static void xbox_Nv2aAckStart(void)
     dsp_ack_init();
     poke_init();
     g_nv2a_ack_stop = 0;
+#if !defined(_WIN32)
+    guest_turn_note_extra("gpu", xbox_nv2a_probe_json);
+#endif
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);
     if (g_nv2a_ack_thread) {
