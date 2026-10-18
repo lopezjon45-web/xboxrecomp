@@ -1363,6 +1363,18 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
     s_put_reg = (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
+#if defined(__APPLE__)
+    /* This thread is the GPU: every frame waits for it, in Direct3D's fence hold if not
+     * before. Guest threads and the APU's frame thread run at user-interactive QoS; left at
+     * the default (priority 31, with every ordinary thread on the host) it ran 8 ms of a
+     * 54 ms window on a busy Mac while the game waited for its fences -- a 100-300 ms
+     * stall in a Story scene. RECOMP_EXECUTOR_QOS=0 leaves the default. */
+    {
+        const char *e = getenv("RECOMP_EXECUTOR_QOS");
+        if (!(e && *e == '0'))
+            pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    }
+#endif
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
             volatile uint32_t *r =

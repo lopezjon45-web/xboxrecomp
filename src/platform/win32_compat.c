@@ -36,6 +36,7 @@
 #include <sys/stat.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <mach/thread_switch.h>
 #include <pthread/qos.h>
 #else
 #include <sys/sysinfo.h>
@@ -474,6 +475,7 @@ typedef struct {
     uint32_t start_ctx;
     int run_state;
     long cpu_ms;
+    int pri, depressed;
     int nframes;
     uintptr_t pc[PROBE_FRAMES];
 } probe_thread;
@@ -640,7 +642,8 @@ static void probe_thread_json(jbuf *b, const probe_thread *p, int frames, uintpt
             jput(b, "]");
         }
     }
-    jput(b, ",\"run\":\"%s\",\"cpu_ms\":%ld,\"stack\":[", probe_run_state(p->run_state), p->cpu_ms);
+    jput(b, ",\"run\":\"%s\",\"cpu_ms\":%ld,\"pri\":%d%s,\"stack\":[", probe_run_state(p->run_state),
+         p->cpu_ms, p->pri, p->depressed ? ",\"depressed\":true" : "");
     for (i = 0; i < p->nframes && i < frames; i++) {
         if (i)
             jput(b, ",");
@@ -726,6 +729,16 @@ int guest_turn_probe(char *holder, size_t holder_size, char *all, size_t all_siz
             p->run_state = bi.run_state;
             p->cpu_ms = (long)(bi.user_time.seconds + bi.system_time.seconds) * 1000 +
                         (bi.user_time.microseconds + bi.system_time.microseconds) / 1000;
+        }
+        {
+            policy_timeshare_info_data_t ts;
+            mach_msg_type_number_t tc = POLICY_TIMESHARE_INFO_COUNT;
+            if (thread_info(p->port, THREAD_SCHED_TIMESHARE_INFO, (thread_info_t)&ts, &tc) == KERN_SUCCESS) {
+                p->pri = ts.cur_priority;
+                p->depressed = ts.depressed;
+            } else {
+                p->pri = -1;
+            }
         }
         if (thread_suspend(p->port) == KERN_SUCCESS) {
             p->nframes = probe_walk(p->port, p->pc, PROBE_FRAMES);
@@ -1601,7 +1614,34 @@ int GetThreadPriority(HANDLE h)
     return (o && o->kind == K_THREAD) ? o->priority : THREAD_PRIORITY_NORMAL;
 }
 
-VOID SwitchToThread(void) { gc_yield(); sched_yield(); }
+/* A yield that lets another thread run without falling behind every thread on the host.
+ *
+ * Darwin's sched_yield() is swtch_pri(0): it depresses the caller to priority 0 until it
+ * next runs. A thread that yields in a loop -- Direct3D's fence hold waiting for the
+ * push-buffer executor, the executor between passes, the APU frame thread -- then waits
+ * behind every runnable thread on the machine, whatever its QoS, and on a busy host (an
+ * 8-core Mac with a browser and the system's daemons) both halves of a frame starved
+ * together: a Story scene's frame lasted 100-300 ms while the game and the executor ran
+ * for 3 and 8 ms of a 54 ms probe window. thread_switch() with no option yields the CPU
+ * to a thread that is ready at the caller's priority and keeps that priority.
+ * RECOMP_YIELD_DEPRESS=1 restores sched_yield(). Elsewhere sched_yield() does not depress. */
+static void host_yield(void)
+{
+#if defined(__APPLE__)
+    static int depress = -1;
+    if (depress < 0) {
+        const char *e = getenv("RECOMP_YIELD_DEPRESS");
+        depress = e && *e == '1';
+    }
+    if (!depress) {
+        thread_switch(MACH_PORT_NULL, SWITCH_OPTION_NONE, 0);
+        return;
+    }
+#endif
+    sched_yield();
+}
+
+VOID SwitchToThread(void) { gc_yield(); host_yield(); }
 
 DWORD QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data)
 {
@@ -1650,7 +1690,7 @@ static int precise_sleep_wanted(void)
 
 VOID Sleep(DWORD ms)
 {
-    if (ms == 0) { gc_yield(); sched_yield(); return; }
+    if (ms == 0) { gc_yield(); host_yield(); return; }
     struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
     int blocked = gc_block();
     if (precise_sleep_wanted()) {
@@ -1672,7 +1712,7 @@ VOID Sleep(DWORD ms)
             if (left <= 0)
                 break;
             if (left <= 200000) {
-                sched_yield();
+                host_yield();
                 continue;
             }
             left = left > 800000 ? left * 3 / 4 : left - 200000;
