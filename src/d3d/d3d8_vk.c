@@ -203,6 +203,10 @@ typedef struct { uint32_t hash, used; int points, failed; uint32_t shader; uint6
 typedef struct { int used; NV2ACombinerState st; uint32_t shader; } CombEntry;
 #define COMB_SLOTS 256
 #define MAX_SHADERS 1024
+/* Each HLSL text made into a module this run, by two hashes of it and its
+ * stage: the same text gets the same module. Twice MAX_SHADERS, never full. */
+typedef struct { uint64_t key, check; uint32_t id; } ShaderSeen;
+#define SEEN_SLOTS (2 * MAX_SHADERS)
 
 static struct {
     int ready;
@@ -273,11 +277,12 @@ static struct {
     uint64_t        pcache_hash;    /* of the data last read or written: unchanged is not written */
     ULONGLONG       pcache_last_new;
     /* What shaders and pipelines cost: counts and microseconds. */
-    uint32_t spv_hits, spv_misses, pipes_made;
+    uint32_t spv_hits, spv_misses, spv_reused, pipes_made;
     uint64_t spv_load_us, spv_compile_us, pipes_us;
     uint32_t perf_printed;
     VkShaderModule shaders[MAX_SHADERS];
     uint32_t       shader_n;
+    ShaderSeen     seen[SEEN_SLOTS];
     uint32_t       vs_fixed, ps_tex, ps_notex;
 
     PipeEntry pipes[PIPE_SLOTS];
@@ -679,6 +684,29 @@ static uint64_t usec_now(void)
     return (uint64_t)((double)q.QuadPart * 1e6 / (double)f.QuadPart);
 }
 
+/* The module already made from this text this run, or the slot to note it in.
+ * Different programs (a vertex program's hash, a combiner state) often
+ * translate to the same text; they share one module, and so their pipelines. */
+static ShaderSeen *shader_seen(const char *hlsl, size_t len, int vertex)
+{
+    uint8_t st = (uint8_t)(vertex ? 1 : 0);
+    uint64_t key = vkc_hash64(hlsl, len, vkc_hash64(&st, 1, VKC_HASH_SEED));
+    uint64_t check = vkc_hash64(hlsl, len, 0x9e3779b97f4a7c15ull ^ st);
+    uint32_t i;
+
+    for (i = 0; i < SEEN_SLOTS; i++) {
+        ShaderSeen *e = &vk.seen[(key + i) % SEEN_SLOTS];
+        if (!e->id) {
+            e->key = key;
+            e->check = check;
+            return e;
+        }
+        if (e->key == key && e->check == check)
+            return e;
+    }
+    return NULL;
+}
+
 /* Compile HLSL to a shader module, or take the SPIR-V an earlier run made from
  * the same text. Returns its id (1-based), 0 on failure. */
 static uint32_t shader_make(const char *hlsl, int vertex, const char *name)
@@ -688,6 +716,12 @@ static uint32_t shader_make(const char *hlsl, int vertex, const char *name)
     uint32_t id = 0, *cached;
     size_t len = strlen(hlsl), bytes;
     uint64_t t0 = usec_now();
+    ShaderSeen *seen = shader_seen(hlsl, len, vertex);
+
+    if (seen && seen->id) {
+        vk.spv_reused++;
+        return seen->id;
+    }
     if (vk.shader_n >= MAX_SHADERS)
         return 0;
     cached = vkc_spirv_load(hlsl, len, vertex, &bytes);
@@ -700,6 +734,8 @@ static uint32_t shader_make(const char *hlsl, int vertex, const char *name)
         if (id) {
             vk.spv_hits++;
             vk.spv_load_us += usec_now() - t0;
+            if (seen)
+                seen->id = id;
             return id;
         }
     }
@@ -716,6 +752,8 @@ static uint32_t shader_make(const char *hlsl, int vertex, const char *name)
         if (vkCreateShaderModule(vk.dev, &ci, NULL, &vk.shaders[vk.shader_n]) == VK_SUCCESS) {
             id = ++vk.shader_n;
             vkc_spirv_store(hlsl, len, vertex, ci.pCode, ci.codeSize);
+            if (seen)
+                seen->id = id;
         }
     }
     shaderc_result_release(res);
@@ -1076,14 +1114,14 @@ static void cache_tick(ULONGLONG now)
 /* The cost of shaders and pipelines so far, when it changed. */
 static void cache_perf_line(void)
 {
-    uint32_t n = vk.spv_hits + vk.spv_misses + vk.pipes_made;
+    uint32_t n = vk.spv_hits + vk.spv_misses + vk.spv_reused + vk.pipes_made;
     if (n == vk.perf_printed)
         return;
     vk.perf_printed = n;
-    fprintf(stderr, "  [VKCACHE] shaders: %u from cache (%.1f ms), %u compiled (%.1f ms); "
+    fprintf(stderr, "  [VKCACHE] shaders: %u from cache (%.1f ms), %u compiled (%.1f ms), %u reused; "
                     "pipelines: %u made (%.1f ms)\n",
             vk.spv_hits, (double)vk.spv_load_us / 1000.0, vk.spv_misses,
-            (double)vk.spv_compile_us / 1000.0, vk.pipes_made, (double)vk.pipes_us / 1000.0);
+            (double)vk.spv_compile_us / 1000.0, vk.spv_reused, vk.pipes_made, (double)vk.pipes_us / 1000.0);
 }
 
 /* ── Texture formats ───────────────────────────────────────────────────── */
