@@ -272,9 +272,29 @@ static void read_pack(const char *root, const char *name)
         for(i=start;i<g_count;i++) g_entries[i].channel_mips=channel_mips;
     }
 }
+/* "a;b;c", read in order so later packs take precedence. A list too long to hold
+ * keeps the whole names that fit and says so. */
+#define PACK_LIST_CAP 1024
+static void read_packs(const char *root,const char *list)
+{
+    char packs[PACK_LIST_CAP],*next,*name;
+    size_t length=strlen(list);
+    snprintf(packs,sizeof packs,"%s",list);
+    if(length>=sizeof packs) {
+        if(list[sizeof packs-1]!=';') { next=strrchr(packs,';'); if(next) *next=0; else packs[0]=0; }
+        fprintf(stderr,"[TEXPACK] Pack list is %zu characters, more than %u; only the packs in its first %zu are read\n",
+                length,(unsigned)sizeof packs-1,strlen(packs));
+    }
+    name=packs;
+    while(*name) {
+        next=strchr(name,';'); if(next) *next++=0;
+        read_pack(root,trim(name));
+        if(!next) break; name=next;
+    }
+}
 static void initialize(void)
 {
-    char root[PATH_CAP],packs[1024],*next,*name;
+    char root[PATH_CAP];
     const char *e;
     long mb;
     if(g_initialized) return;
@@ -291,13 +311,7 @@ static void initialize(void)
     e=getenv("RECOMP_TEXTURE_ROOT");
     if(e && *e) snprintf(root,sizeof root,"%s",e);
     else { e=getenv("DEFJAM_DATA"); snprintf(root,sizeof root,"%s/mods",e && *e ? e : "."); }
-    e=getenv("RECOMP_TEXTURE_PACKS"); snprintf(packs,sizeof packs,"%s",e ? e : "");
-    name=packs;
-    while(*name) {
-        next=strchr(name,';'); if(next) *next++=0;
-        read_pack(root,trim(name));
-        if(!next) break; name=next;
-    }
+    e=getenv("RECOMP_TEXTURE_PACKS"); read_packs(root,e ? e : "");
     if(g_count) qsort(g_entries,g_count,sizeof(*g_entries),entry_compare);
     index_wide();
     g_active=g_count || g_stretch_count || g_dump[0];

@@ -27,12 +27,15 @@ static void lock_enter(void) { pthread_mutex_lock(&g_lock); }
 static void lock_leave(void) { pthread_mutex_unlock(&g_lock); }
 #endif
 
-#define MAX_LINE     512
 #define MAX_UNKNOWN  256
 
+/* A line the table does not take, written back as it was read: a key this table
+ * does not know (owner NULL), or text too long for a known string setting, which
+ * replaces that setting's line until the setting is changed. */
 typedef struct UnknownLine {
     char section[64];
-    char line[MAX_LINE];    /* "key = value", as read */
+    char *line;             /* "key = value", as read; NULL once dropped */
+    const RecompSetting *owner;
 } UnknownLine;
 
 static RecompSetting *g_table;
@@ -45,7 +48,7 @@ static void (*g_log)(const char *message);
 
 static void report(const char *fmt, ...)
 {
-    char buf[MAX_LINE + 128];
+    char buf[RECOMP_SETTING_TEXT_MAX + 384];
     va_list ap;
     if (!g_log) return;
     va_start(ap, fmt);
@@ -100,6 +103,12 @@ static int parse_value(const RecompSetting *s, const char *text, int *out)
     return 0;
 }
 
+/* Text a string setting cannot hold, reported by length rather than in full. */
+static int too_long(const RecompSetting *s, const char *text)
+{
+    return s->type == RECOMP_SETTING_STRING && strlen(text) >= RECOMP_SETTING_TEXT_MAX;
+}
+
 /* The text a string setting is reset to. */
 static void default_text(RecompSetting *s)
 {
@@ -141,6 +150,9 @@ static void apply_env(RecompSetting *s)
         if (s->type == RECOMP_SETTING_STRING)
             snprintf(s->value_text, sizeof(s->value_text), "%s", e);
         s->source = RECOMP_SETTING_FROM_ENV;
+    } else if (too_long(s, e)) {
+        report("settings: %s is %u characters, more than the %d %s.%s holds; ignored",
+               s->env, (unsigned)strlen(e), RECOMP_SETTING_TEXT_MAX - 1, s->section, s->key);
     } else {
         report("settings: %s=%s is not a valid value for %s.%s; ignored",
                s->env, e, s->section, s->key);
@@ -160,10 +172,37 @@ void recomp_settings_register(RecompSetting *table, size_t count)
     }
 }
 
+static void forget_unknown(void)
+{
+    size_t i;
+    for (i = 0; i < g_unknown_count; i++) free(g_unknown[i].line);
+    g_unknown_count = 0;
+}
+
+/* The setting's own value is written again from now on. */
+static void drop_kept(const RecompSetting *s)
+{
+    size_t i;
+    for (i = 0; i < g_unknown_count; i++)
+        if (g_unknown[i].owner == s && g_unknown[i].line) {
+            free(g_unknown[i].line);
+            g_unknown[i].line = NULL;
+        }
+}
+
+static const char *kept_line(const RecompSetting *s)
+{
+    size_t i;
+    for (i = 0; i < g_unknown_count; i++)
+        if (g_unknown[i].owner == s && g_unknown[i].line) return g_unknown[i].line;
+    return NULL;
+}
+
 void recomp_settings_reset(void)
 {
     g_table = NULL;
     g_count = 0;
+    forget_unknown();
     free(g_unknown);
     g_unknown = NULL;
     g_unknown_count = 0;
@@ -231,10 +270,15 @@ int recomp_settings_set_text(const char *section, const char *key, const char *t
     if (s->type == RECOMP_SETTING_STRING) {
         char copy[RECOMP_SETTING_TEXT_MAX], *t;
         int stored_changed, effective_changed;
-        if (strlen(text) >= sizeof(copy)) return -1;
+        if (too_long(s, text)) {
+            report("settings: %s.%s cannot hold %u characters (at most %d); not changed",
+                   s->section, s->key, (unsigned)strlen(text), RECOMP_SETTING_TEXT_MAX - 1);
+            return -1;
+        }
         snprintf(copy, sizeof(copy), "%s", text);
         t = trim(copy);
         lock_enter();
+        drop_kept(s);
         stored_changed = strcmp(s->stored_text, t) != 0;
         effective_changed = 0;
         snprintf(s->stored_text, sizeof(s->stored_text), "%s", t);
@@ -295,23 +339,102 @@ void recomp_settings_on_change(RecompSettingChanged callback, void *user)
 
 void recomp_settings_set_log(void (*log)(const char *message)) { g_log = log; }
 
-static void keep_unknown(const char *section, const char *line)
+/* Takes `line`, a heap copy, whether or not it is kept. */
+static void keep_line(const char *section, char *line, const RecompSetting *owner)
 {
     UnknownLine *u;
-    if (g_unknown_count >= MAX_UNKNOWN) return;
-    if (!g_unknown) {
+    if (owner) drop_kept(owner);
+    if (!g_unknown && g_unknown_count < MAX_UNKNOWN)
         g_unknown = (UnknownLine *)calloc(MAX_UNKNOWN, sizeof(UnknownLine));
-        if (!g_unknown) return;
-    }
+    if (!g_unknown || g_unknown_count >= MAX_UNKNOWN) { free(line); return; }
     u = &g_unknown[g_unknown_count++];
     snprintf(u->section, sizeof(u->section), "%s", section);
-    snprintf(u->line, sizeof(u->line), "%s", line);
+    u->line = line;
+    u->owner = owner;
+}
+
+static char *copy_text(const char *text)
+{
+    size_t n = strlen(text) + 1;
+    char *copy = (char *)malloc(n);
+    if (copy) memcpy(copy, text, n);
+    return copy;
+}
+
+/* The next line without its end, however long; NULL at the end of the file. */
+static char *read_line(FILE *f)
+{
+    size_t len = 0, cap = 256;
+    char *buf = (char *)malloc(cap);
+    int c = EOF;
+    if (!buf) return NULL;
+    while ((c = fgetc(f)) != EOF && c != '\n') {
+        if (len + 1 >= cap) {
+            char *grown = (char *)realloc(buf, cap * 2);
+            if (!grown) { free(buf); return NULL; }
+            buf = grown;
+            cap *= 2;
+        }
+        buf[len++] = (char)c;
+    }
+    if (c == EOF && !len) { free(buf); return NULL; }
+    buf[len] = 0;
+    return buf;
+}
+
+/* One line of the file. Returns 1 if it set a known key. */
+static int load_line(char *line, char *section, size_t section_size)
+{
+    char *eq, *key, *val, *copy;
+    RecompSetting *s;
+    int v;
+    line = trim(line);
+    /* A UTF-8 byte-order mark, which Notepad may add. */
+    if ((unsigned char)line[0] == 0xEF && (unsigned char)line[1] == 0xBB &&
+        (unsigned char)line[2] == 0xBF)
+        line = trim(line + 3);
+    if (!*line || *line == ';' || *line == '#') return 0;
+    if (*line == '[') {
+        char *close = strchr(line, ']');
+        if (close) {
+            *close = 0;
+            snprintf(section, section_size, "%s", trim(line + 1));
+        }
+        return 0;
+    }
+    eq = strchr(line, '=');
+    if (!eq) return 0;
+    copy = copy_text(line);
+    *eq = 0;
+    key = trim(line);
+    val = trim(eq + 1);
+    s = recomp_settings_find(section, key);
+    if (!s) { if (copy) keep_line(section, copy, NULL); return 0; }
+    if (parse_value(s, val, &v)) {
+        free(copy);
+        drop_kept(s);
+        s->stored = v;
+        if (s->type == RECOMP_SETTING_STRING)
+            snprintf(s->stored_text, sizeof(s->stored_text), "%s", val);
+        s->source = RECOMP_SETTING_FROM_FILE;
+        return 1;
+    }
+    if (too_long(s, val)) {
+        report("settings: [%s] %s is %u characters, more than the %d it holds; using the default "
+               "\"%s\" (the file keeps the text until the setting is changed)", section, key,
+               (unsigned)strlen(val), RECOMP_SETTING_TEXT_MAX - 1, s->def_text ? s->def_text : "");
+        if (copy) keep_line(section, copy, s);
+        return 0;
+    }
+    free(copy);
+    report("settings: [%s] %s = %s is not valid; using the default", section, key, val);
+    return 0;
 }
 
 int recomp_settings_load(const char *path)
 {
     FILE *f;
-    char raw[MAX_LINE], section[64] = "";
+    char *raw, section[64] = "";
     int read = 0;
     size_t i;
 
@@ -320,7 +443,7 @@ int recomp_settings_load(const char *path)
         default_text(&g_table[i]);
         g_table[i].source = RECOMP_SETTING_FROM_DEFAULT;
     }
-    g_unknown_count = 0;
+    forget_unknown();
 
     f = path ? fopen(path, "r") : NULL;
     if (!f) {
@@ -333,44 +456,9 @@ int recomp_settings_load(const char *path)
         return 0;
     }
 
-    while (fgets(raw, sizeof(raw), f)) {
-        char *line = trim(raw), *eq, *key, *val;
-        RecompSetting *s;
-        int v;
-        /* A UTF-8 byte-order mark, which Notepad may add. */
-        if ((unsigned char)line[0] == 0xEF && (unsigned char)line[1] == 0xBB &&
-            (unsigned char)line[2] == 0xBF)
-            line = trim(line + 3);
-        if (!*line || *line == ';' || *line == '#') continue;
-        if (*line == '[') {
-            char *close = strchr(line, ']');
-            if (close) {
-                *close = 0;
-                snprintf(section, sizeof(section), "%s", trim(line + 1));
-            }
-            continue;
-        }
-        eq = strchr(line, '=');
-        if (!eq) continue;
-        {
-            char copy[MAX_LINE];
-            snprintf(copy, sizeof(copy), "%s", line);
-            *eq = 0;
-            key = trim(line);
-            val = trim(eq + 1);
-            s = recomp_settings_find(section, key);
-            if (!s) { keep_unknown(section, copy); continue; }
-        }
-        if (parse_value(s, val, &v)) {
-            s->stored = v;
-            if (s->type == RECOMP_SETTING_STRING)
-                snprintf(s->stored_text, sizeof(s->stored_text), "%s", val);
-            s->source = RECOMP_SETTING_FROM_FILE;
-            read++;
-        } else {
-            report("settings: [%s] %s = %s is not valid; using the default",
-                   section, key, val);
-        }
+    while ((raw = read_line(f)) != NULL) {
+        read += load_line(raw, section, sizeof(section));
+        free(raw);
     }
     fclose(f);
     for (i = 0; i < g_count; i++) apply_env(&g_table[i]);
@@ -381,7 +469,7 @@ static void write_unknown(FILE *f, const char *section)
 {
     size_t i;
     for (i = 0; i < g_unknown_count; i++)
-        if (equal_nocase(g_unknown[i].section, section))
+        if (!g_unknown[i].owner && g_unknown[i].line && equal_nocase(g_unknown[i].section, section))
             fprintf(f, "%s\n", g_unknown[i].line);
 }
 
@@ -427,8 +515,11 @@ int recomp_settings_save(const char *path)
             }
             if (t->flags & RECOMP_SETTING_RESTART)
                 fprintf(f, "; takes effect at the next start\n");
-            fprintf(f, "%s = %s\n", t->key,
-                    recomp_settings_format(t, t->stored, text, sizeof(text)));
+            if (kept_line(t))
+                fprintf(f, "%s\n", kept_line(t));
+            else
+                fprintf(f, "%s = %s\n", t->key,
+                        recomp_settings_format(t, t->stored, text, sizeof(text)));
         }
         write_unknown(f, s->section);
     }
