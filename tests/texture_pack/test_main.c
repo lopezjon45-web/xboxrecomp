@@ -291,6 +291,34 @@ int main(void)
         assert(!upload_dds(&device,&entry,&source));
         remove_file(entry.path);
     }
+    /* A list longer than the old 256-character buffer reads every pack in it; one longer than the
+     * loader holds reads the whole names that fit. */
+    {
+        char list[2048]="",name[64],pack_id[65];
+        unsigned count=7;
+        for(i=0;i<count;i++) {
+            snprintf(name,sizeof name,"faithful-hd-0123456789a%u-opacity-with-a-longer-name",i);
+            snprintf(path,sizeof path,"%s/%s",root,name); assert(make_dir(path));
+            snprintf(manifest,sizeof manifest,"%s/manifest.ini",path);
+            memcpy(pack_id,id,65); pack_id[0]="0123456789abcdef"[i];
+            file=fopen(manifest,"wb"); assert(file);
+            fprintf(file,"[pack]\nschema=1\n[textures]\n%s=textures/p%u.png\n",pack_id,i); fclose(file);
+            if(i) strcat(list,";");
+            strcat(list,name);
+        }
+        assert(strlen(list)>256);
+        g_count=0; g_errors=0; read_packs(root,list);
+        assert(g_count==count && g_errors==0);
+        for(i=0;i<count;i++) assert(strstr(g_entries[i].path,"textures/p") && g_entries[i].path[strlen(g_entries[i].path)-5]==(char)('0'+i));
+        while(strlen(list)<PACK_LIST_CAP+40) strcat(list,";faithful-hd-0123456789a0-opacity-with-a-longer-name");
+        g_count=0; read_packs(root,list);
+        assert(g_count>count && g_errors==0);   /* the cut name is dropped, not read as a bad name */
+        g_count=0;
+        for(i=0;i<count;i++) {
+            snprintf(path,sizeof path,"%s/faithful-hd-0123456789a%u-opacity-with-a-longer-name/manifest.ini",root,i); remove_file(path);
+            snprintf(path,sizeof path,"%s/faithful-hd-0123456789a%u-opacity-with-a-longer-name",root,i); remove_dir(path);
+        }
+    }
     snprintf(path,sizeof path,"%s/one",root); make_dir(path);
     snprintf(manifest,sizeof manifest,"%s/one/manifest.ini",root);
     file=fopen(manifest,"wb"); assert(file);
@@ -362,6 +390,6 @@ int main(void)
         snprintf(path,sizeof path,"%s/%s",root,i?"two":"one"); remove_dir(path);
     }
     remove_dir(root);
-    printf("texture-pack fixture passed: hash, palette, stride, PNG alpha/mips, background decoding, DDS bounds, precedence, eviction (%u resources)\n",creates);
+    printf("texture-pack fixture passed: hash, palette, stride, PNG alpha/mips, background decoding, DDS bounds, long pack lists, precedence, eviction (%u resources)\n",creates);
     return 0;
 }

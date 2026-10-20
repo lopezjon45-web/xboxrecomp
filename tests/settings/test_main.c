@@ -228,6 +228,94 @@ int main(void)
             CHECK(g_logged == 1);
             CHECK(!strcmp(recomp_settings_get_text("keyboard", "a", buf, sizeof(buf), "?"), "L, Space"));
         }
+
+        /* A list of folder names well past the old 95-character limit (a texture
+         * pack list) is read, kept and written back whole. */
+        {
+            char list[256] = "", line[512];
+            int i;
+            for (i = 0; i < 7; i++) {
+                char name[48];
+                snprintf(name, sizeof(name), "%sfaithful-hd-0123456789a%d-opacity", i ? ";" : "", i);
+                strcat(list, name);
+            }
+            CHECK(strlen(list) > 200);
+            snprintf(line, sizeof(line), "[keyboard]\nb = %s\n", list);
+            write_file(path, line);
+            g_logged = 0;
+            CHECK(recomp_settings_load(path) == 1);
+            CHECK(g_logged == 0);
+            CHECK(!strcmp(recomp_settings_get_text("keyboard", "b", buf, sizeof(buf), "?"), list));
+            CHECK(recomp_settings_save(path) == 0);
+            snprintf(line, sizeof(line), "b = %s\n", list);
+            CHECK(file_contains(path, line));
+        }
+
+        /* A value too long for its setting is reported, the setting uses its
+         * default, and the rest of the line is not read as a line of its own.
+         * The file keeps the text until the setting is changed. A long unknown
+         * key survives a save. */
+        {
+            size_t n = RECOMP_SETTING_TEXT_MAX * 3, unknown_len = RECOMP_SETTING_TEXT_MAX - 100;
+            char *text = (char *)malloc(n + 64), *unknown = (char *)malloc(unknown_len + 1);
+            size_t o = 0;
+            memset(unknown, 'u', unknown_len);
+            unknown[unknown_len] = 0;
+            o += (size_t)snprintf(text + o, n + 64 - o, "[keyboard]\na = ");
+            memset(text + o, 'x', RECOMP_SETTING_TEXT_MAX * 2);
+            o += RECOMP_SETTING_TEXT_MAX * 2;
+            snprintf(text + o, n + 64 - o, " b = tail\nb = ok\n");
+            write_file(path, text);
+            g_logged = 0;
+            CHECK(recomp_settings_load(path) == 1);
+            CHECK(g_logged == 1);
+            CHECK(!strcmp(recomp_settings_get_text("keyboard", "a", buf, sizeof(buf), "?"), "L, Space"));
+            CHECK(!strcmp(recomp_settings_get_text("keyboard", "b", buf, sizeof(buf), "?"), "ok"));
+            CHECK(recomp_settings_save(path) == 0);
+            {
+                FILE *f = fopen(path, "r");
+                char *back = (char *)malloc(n + 64);
+                size_t got = f ? fread(back, 1, n + 63, f) : 0;
+                back[got] = 0;
+                if (f) fclose(f);
+                CHECK(strstr(back, text + strlen("[keyboard]\n")) != NULL);
+                CHECK(!strstr(back, "a = L, Space"));
+                free(back);
+            }
+            CHECK(recomp_settings_load(path) == 1 && g_logged == 2);
+            CHECK(recomp_settings_set_text("keyboard", "a", "K") == 1);
+            CHECK(recomp_settings_save(path) == 0);
+            CHECK(file_contains(path, "a = K\n") && !file_contains(path, "xxxxxxxx"));
+
+            snprintf(text, n + 64, "[keyboard]\nextra = %s\n", unknown);
+            write_file(path, text);
+            recomp_settings_load(path);
+            CHECK(recomp_settings_save(path) == 0);
+            recomp_settings_load(path);
+            CHECK(recomp_settings_save(path) == 0);
+            {
+                FILE *f = fopen(path, "r");
+                char *back = (char *)malloc(n + 64);
+                size_t got = f ? fread(back, 1, n + 63, f) : 0;
+                back[got] = 0;
+                if (f) fclose(f);
+                snprintf(text, n + 64, "extra = %s\n", unknown);
+                CHECK(strstr(back, text) != NULL);
+                free(back);
+            }
+
+            /* An environment value too long for the setting is reported and ignored. */
+            memset(text, 'e', RECOMP_SETTING_TEXT_MAX + 10);
+            text[RECOMP_SETTING_TEXT_MAX + 10] = 0;
+            set_env("TEST_KEY_A", text);
+            g_logged = 0;
+            recomp_settings_load(path);
+            CHECK(g_logged == 1);
+            CHECK(!strcmp(recomp_settings_get_text("keyboard", "a", buf, sizeof(buf), "?"), "L, Space"));
+            set_env("TEST_KEY_A", NULL);
+            free(text);
+            free(unknown);
+        }
         remove(path);
         recomp_settings_reset();
     }
