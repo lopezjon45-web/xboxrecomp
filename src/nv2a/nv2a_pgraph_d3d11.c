@@ -815,6 +815,39 @@ int pgraph_d3d11_try_texture_pack(const RecompTextureSource *source,
     }
     return bound;
 }
+static IDirect3DBaseTexture8 *g_wide_saved;
+static int g_wide_saving;
+int pgraph_d3d11_wide_slabs(int *dt, unsigned max)
+{
+    return g_pg.initialized ? texture_pack_wide_slabs(0, dt, max) : 0;
+}
+int pgraph_d3d11_wide_bind(unsigned slab)
+{
+    IDirect3DDevice8 *dev = xbox_GetD3DDevice();
+    if (!g_pg.initialized || !dev)
+        return 0;
+    if (!g_wide_saving) {
+        g_wide_saved = NULL;
+        if (FAILED(dev->lpVtbl->GetTexture(dev, 0, &g_wide_saved)))
+            g_wide_saved = NULL;
+        g_wide_saving = 1;
+    }
+    return texture_pack_wide_bind(dev, 0, slab);
+}
+const char *pgraph_d3d11_stage0_id(void) { return texture_pack_stage_id(0); }
+int pgraph_d3d11_stage0_stretch(void) { return g_pg.initialized && texture_pack_wide_stretch(0); }
+void pgraph_d3d11_wide_end(void)
+{
+    IDirect3DDevice8 *dev = xbox_GetD3DDevice();
+    if (!g_wide_saving)
+        return;
+    g_wide_saving = 0;
+    if (dev)
+        dev->lpVtbl->SetTexture(dev, 0, g_wide_saved);
+    if (g_wide_saved)
+        g_wide_saved->lpVtbl->Release(g_wide_saved);
+    g_wide_saved = NULL;
+}
 #define READY_TEX_CACHE 256
 static struct {
     uint32_t addr, format, width, height;

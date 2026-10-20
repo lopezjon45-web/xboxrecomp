@@ -43,9 +43,28 @@ typedef struct PackEntry {
     int failed;
     ULONGLONG retry;
     struct LoadJob *job;     /* a background decode in flight or finished, not yet uploaded */
+    /* A [wide] slab: drawn beside the anchor source, shifted dt anchor texels (a widescreen side
+     * extension). Its id is "~<n>", which no source id matches, so lookup() never returns it. */
+    char anchor[65];
+    int dt;
+    int inner;               /* "inner:" slab: also replaces the anchor itself in widescreen */
 } PackEntry;
 static PackEntry *g_entries;
 static size_t g_count, g_capacity;
+/* The [wide] anchors, built after the entries are sorted: each names a run of slab entries. */
+#define WIDE_MAX_SLABS 16
+typedef struct WideAnchor { char id[65]; unsigned order; size_t first, count; PackEntry *inner; } WideAnchor;
+static WideAnchor *g_wide;
+static size_t g_wide_count;
+static unsigned g_wide_serial;
+static int g_widescreen;     /* texture_pack_set_widescreen: inner slabs replace their anchors */
+/* [wide] <id> = stretch: a full-screen overlay (a vignette) drawn across the whole widescreen
+ * picture instead of centred with the 4:3 art. */
+static char (*g_stretch)[65];
+static size_t g_stretch_count;
+/* What texture_pack_bind last saw on each stage, for texture_pack_wide_*. */
+static char g_stage_id[4][65];
+static RecompTextureSource g_stage_shape[4];
 static struct SourceState {
     RecompTextureSource shape;
     char id[65];
@@ -130,6 +149,82 @@ static int entry_compare(const void *a,const void *b)
     int c=strcmp(x->id,y->id);
     return c ? c : (x->order>y->order)-(x->order<y->order);
 }
+static PackEntry *new_entry(void)
+{
+    if(g_count==MAX_ENTRIES) return NULL;
+    if(g_count==g_capacity) {
+        size_t capacity=g_capacity ? g_capacity*2 : 256;
+        PackEntry *grown=realloc(g_entries,capacity*sizeof(*grown));
+        if(!grown) return NULL;
+        g_entries=grown; g_capacity=capacity;
+    }
+    memset(&g_entries[g_count],0,sizeof g_entries[g_count]);
+    g_entries[g_count].order=(unsigned)g_count;
+    return &g_entries[g_count];
+}
+/* [wide] <anchor source id> = <dt>:<path>;<dt>:<path>;...  Each slab is a PNG with the anchor
+ * replacement's shape (a uniform 1-8x of the source); dt is the horizontal shift in source texels
+ * at which the renderer draws the anchor's own geometry again with that slab. The renderer clips
+ * slabs to the widescreen side areas, so only what lies beyond the 4:3 picture shows. An item
+ * written inner:<path> is a dt 0 slab that, with a widescreen picture, is also bound in place of
+ * the anchor's own replacement (art whose 4:3 edges were made for the wide view). */
+static void read_wide(const char *root,const char *name,const char *path,char *key,char *value)
+{
+    char *item=value,*next;
+    unsigned n=0;
+    for(char *c=key;*c;c++) *c=(char)tolower((unsigned char)*c);
+    if(!valid_id(key)) { warn("Invalid wide anchor",key); return; }
+    if(!strcmp(trim(value),"stretch")) {
+        char (*grown)[65]=realloc(g_stretch,(g_stretch_count+1)*sizeof *grown);
+        if(!grown) return;
+        g_stretch=grown; memcpy(g_stretch[g_stretch_count++],key,65);
+        return;
+    }
+    while(item && *item) {
+        char *colon,*end,*shift,*file; long dt; int inner; PackEntry *e;
+        next=strchr(item,';'); if(next) *next++=0;
+        item=trim(item);
+        colon=strchr(item,':');
+        if(!colon) { warn("Invalid wide slab",path); return; }
+        *colon=0; shift=trim(item); file=trim(colon+1);
+        inner=!strcmp(shift,"inner");
+        dt=inner ? 0 : strtol(shift,&end,10);
+        if((!inner && (*end || !*shift)) || dt<-16384 || dt>16384 || !valid_name(file,1)) { warn("Invalid wide slab",path); return; }
+        end=strrchr(file,'.');
+        if(!end || _stricmp(end,".png")) { warn("Wide slabs must be PNG",path); return; }
+        if(++n>WIDE_MAX_SLABS) { warn("Too many wide slabs",path); return; }
+        if(!(e=new_entry())) { warn("Pack entry limit",path); return; }
+        snprintf(e->id,sizeof e->id,"~%08u",g_wide_serial++);
+        memcpy(e->anchor,key,65); e->dt=(int)dt; e->inner=inner;
+        if(snprintf(e->path,PATH_CAP,"%s/%s/%s",root,name,file)>=PATH_CAP) return;
+        g_count++;
+        item=next;
+    }
+}
+static void index_wide(void)
+{
+    size_t i=0;
+    while(i<g_count) {
+        size_t j=i,k; unsigned order; int fresh=0;
+        if(g_entries[i].id[0]!='~') { i++; continue; }
+        while(j<g_count && g_entries[j].id[0]=='~' && !strcmp(g_entries[j].anchor,g_entries[i].anchor)
+              && g_entries[j].order==g_entries[i].order+(unsigned)(j-i)) j++;
+        order=g_entries[i].order;
+        for(k=0;k<g_wide_count && strcmp(g_wide[k].id,g_entries[i].anchor);k++) ;
+        if(k==g_wide_count) {
+            WideAnchor *grown=realloc(g_wide,(g_wide_count+1)*sizeof *grown);
+            if(!grown) return;
+            g_wide=grown; g_wide_count++; fresh=1;
+        }
+        if(fresh || order>g_wide[k].order) {   /* the later pack wins */
+            size_t m;
+            memcpy(g_wide[k].id,g_entries[i].anchor,65); g_wide[k].order=order;
+            g_wide[k].first=i; g_wide[k].count=j-i; g_wide[k].inner=NULL;
+            for(m=i;m<j;m++) if(g_entries[m].inner) g_wide[k].inner=&g_entries[m];
+        }
+        i=j;
+    }
+}
 static void read_pack(const char *root, const char *name)
 {
     char path[PATH_CAP],line[2048],section[32]="";
@@ -158,22 +253,15 @@ static void read_pack(const char *root, const char *name)
             else if(!strcmp(equal,"opacity")) channel_mips=0;
             else mips_valid=0;
         }
+        if(!strcmp(section,"wide")) { read_wide(root,name,path,s,equal); continue; }
         if(strcmp(section,"textures")) continue;
         if(!valid_id(s) || !valid_name(equal,1)) { warn("Invalid texture entry",s); continue; }
         end=strrchr(equal,'.');
         if(!end || (_stricmp(end,".png") && _stricmp(end,".dds"))) { warn("Unsupported extension",equal); continue; }
-        if(g_count==MAX_ENTRIES) { warn("Pack entry limit",path); break; }
-        if(g_count==g_capacity) {
-            size_t capacity=g_capacity ? g_capacity*2 : 256;
-            PackEntry *grown=realloc(g_entries,capacity*sizeof(*grown));
-            if(!grown) break;
-            g_entries=grown; g_capacity=capacity;
-        }
-        memset(&g_entries[g_count],0,sizeof g_entries[g_count]);
+        if(!new_entry()) { warn("Pack entry limit",path); break; }
         for(end=s;*end;end++) *end=(char)tolower((unsigned char)*end);
         memcpy(g_entries[g_count].id,s,65);
         if(snprintf(g_entries[g_count].path,PATH_CAP,"%s/%s/%s",root,name,equal)>=PATH_CAP) continue;
-        g_entries[g_count].order=(unsigned)g_count;
         g_count++;
     }
     fclose(file);
@@ -186,7 +274,7 @@ static void read_pack(const char *root, const char *name)
 }
 static void initialize(void)
 {
-    char root[PATH_CAP],packs[256],*next,*name;
+    char root[PATH_CAP],packs[1024],*next,*name;
     const char *e;
     long mb;
     if(g_initialized) return;
@@ -211,11 +299,12 @@ static void initialize(void)
         if(!next) break; name=next;
     }
     if(g_count) qsort(g_entries,g_count,sizeof(*g_entries),entry_compare);
-    g_active=g_count || g_dump[0];
+    index_wide();
+    g_active=g_count || g_stretch_count || g_dump[0];
     if(g_active) {
         host_init();
         if(g_dump[0]) make_directories(g_dump);
-        fprintf(stderr,"[TEXPACK] schema=1 entries=%zu cache=%ld MiB dump=%s\n",g_count,mb,g_dump);
+        fprintf(stderr,"[TEXPACK] schema=1 entries=%zu wide=%zu stretch=%zu cache=%ld MiB dump=%s\n",g_count,g_wide_count,g_stretch_count,mb,g_dump);
     }
 }
 int texture_pack_active(void) { initialize(); return g_active; }
@@ -700,6 +789,8 @@ static int upload_png_async(IDirect3DDevice8 *dev,PackEntry *e,const RecompTextu
     return result;
 }
 
+static const WideAnchor *wide_anchor(unsigned stage);
+static int bind_slab(IDirect3DDevice8 *dev,unsigned stage,PackEntry *e,const char *anchor);
 int texture_pack_bind(IDirect3DDevice8 *dev,unsigned stage,const RecompTextureSource *s,RecompTextureSample sample,void *user)
 {
     struct SourceState *state=NULL; char id[65]; PackEntry *entry;
@@ -707,6 +798,7 @@ int texture_pack_bind(IDirect3DDevice8 *dev,unsigned stage,const RecompTextureSo
     unsigned i, slot=source_slot(s);
     ULONGLONG now=now_ms();
     if(!texture_pack_active() || !dev || stage>3) return 0;
+    g_stage_id[stage][0]=0;
     if(!g_win.start) g_win.start=now;
     if(now-g_win.start>=2000) {
         if(g_win.loads || g_win.evictions)
@@ -750,6 +842,7 @@ int texture_pack_bind(IDirect3DDevice8 *dev,unsigned stage,const RecompTextureSo
         if(state->changes>=REVALIDATE_UNSTABLE_CHANGES) { state->unstable=1; state->interval=REVALIDATE_UNSTABLE_MS; }
         else state->interval=REVALIDATE_MIN_MS;
     }
+    memcpy(g_stage_id[stage],id,65); g_stage_shape[stage]=*s;
     if(!state->dumped && g_dump[0] && g_dumps<(uint64_t)g_dump_limit && sample && source_readable(s)) {
         state->dumped=1;
         char path[PATH_CAP]; snprintf(path,sizeof path,"%s/%s.png",g_dump,id);
@@ -772,6 +865,10 @@ int texture_pack_bind(IDirect3DDevice8 *dev,unsigned stage,const RecompTextureSo
             }
         }
     }
+    if(g_widescreen) {
+        const WideAnchor *a=wide_anchor(stage);
+        if(a && a->inner && bind_slab(dev,stage,a->inner,a->id)) { ++g_hits; return 1; }
+    }
     entry=lookup(id); if(!entry) { ++g_misses; return 0; }
     if(entry->failed || now<entry->retry) return 0;
     if(!entry->texture) {
@@ -793,6 +890,51 @@ int texture_pack_bind(IDirect3DDevice8 *dev,unsigned stage,const RecompTextureSo
     if(FAILED(dev->lpVtbl->SetTexture(dev,stage,(IDirect3DBaseTexture8 *)entry->texture))) return 0;
     /* SetTexture leaves the title's combiners, addressing and filtering intact. */
     return 1;
+}
+const char *texture_pack_stage_id(unsigned stage) { return stage<4 ? g_stage_id[stage] : ""; }
+static const WideAnchor *wide_anchor(unsigned stage)
+{
+    size_t i;
+    if(stage>3 || !g_wide_count || !g_stage_id[stage][0]) return NULL;
+    for(i=0;i<g_wide_count;i++) if(!strcmp(g_wide[i].id,g_stage_id[stage])) return &g_wide[i];
+    return NULL;
+}
+int texture_pack_wide_slabs(unsigned stage,int *dt,unsigned max)
+{
+    const WideAnchor *a=wide_anchor(stage); size_t i;
+    if(!a) return 0;
+    for(i=0;i<a->count && i<max;i++) dt[i]=g_entries[a->first+i].dt;
+    return (int)i;
+}
+void texture_pack_set_widescreen(int on) { g_widescreen=on; }
+int texture_pack_wide_stretch(unsigned stage)
+{
+    size_t i;
+    if(stage>3 || !g_stage_id[stage][0]) return 0;
+    for(i=0;i<g_stretch_count;i++) if(!strcmp(g_stretch[i],g_stage_id[stage])) return 1;
+    return 0;
+}
+int texture_pack_wide_bind(IDirect3DDevice8 *dev,unsigned stage,unsigned slab)
+{
+    const WideAnchor *a=wide_anchor(stage);
+    if(!a || slab>=a->count || !dev) return 0;
+    return bind_slab(dev,stage,&g_entries[a->first+slab],a->id);
+}
+static int bind_slab(IDirect3DDevice8 *dev,unsigned stage,PackEntry *e,const char *anchor)
+{
+    ULONGLONG now=now_ms();
+    if(e->failed || now<e->retry) return 0;
+    if(!e->texture) {
+        int loaded;
+        jobs_reap(now);
+        loaded=g_sync_load ? upload_png(dev,e,&g_stage_shape[stage]) : upload_png_async(dev,e,&g_stage_shape[stage],now);
+        if(loaded==-2) return 0;
+        if(g_trace) fprintf(stderr,"[TEXPACK] wide slab %s dt %d%s: %d\n",anchor,e->dt,e->inner ? " inner" : "",loaded);
+        if(loaded<0) { e->retry=now+1000; return 0; }
+        if(!loaded) { e->failed=1; warn("Wide slab rejected (it must have the anchor's shape)",e->path); return 0; }
+    }
+    e->used=++g_clock;
+    return SUCCEEDED(dev->lpVtbl->SetTexture(dev,stage,(IDirect3DBaseTexture8 *)e->texture));
 }
 void texture_pack_shutdown(IDirect3DDevice8 *dev)
 {

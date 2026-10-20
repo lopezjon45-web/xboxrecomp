@@ -34,6 +34,13 @@ void pgraph_d3d11_init(void);
 void pgraph_d3d11_shutdown(void);
 int pgraph_d3d11_try_texture_pack(const RecompTextureSource *source,
                                 RecompTextureSample sample, void *user);
+/* Widescreen side slabs of the stage-0 source (texture_pack_wide_slabs). wide_bind puts slab
+ * `slab` on stage 0, remembering what was bound the first time; wide_end puts that back. */
+int pgraph_d3d11_wide_slabs(int *dt, unsigned max);
+int pgraph_d3d11_wide_bind(unsigned slab);
+void pgraph_d3d11_wide_end(void);
+const char *pgraph_d3d11_stage0_id(void);
+int pgraph_d3d11_stage0_stretch(void);
 
 /* Process an NV2A PGRAPH method call. Called from push buffer parser.
  * Returns 1 if handled, 0 if unhandled (caller should log/ignore). */

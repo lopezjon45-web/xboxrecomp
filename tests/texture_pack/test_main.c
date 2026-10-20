@@ -304,6 +304,46 @@ int main(void)
     assert(lookup(id)->channel_mips==1 && g_entries[0].channel_mips==0);
     file=fopen(manifest,"wb"); fprintf(file,"[pack]\nschema=1\npng_mips=invalid\n[textures]\n%s=textures/rejected.png\n",id); fclose(file);
     read_pack(root,"two"); assert(g_count==2 && strstr(lookup(id)->path,"second.png"));
+    /* [wide]: one anchor's slabs in order with an inner slab, a stretch overlay, a line with a
+     * malformed item kept only up to it; slab entries are never returned by lookup(). */
+    {
+        static const char third[]="abababababababababababababababababababababababababababababababab";
+        static const char overlay[]="cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+        int dt[16]; PackEntry *slab;
+        snprintf(path,sizeof path,"%s/wide",root); make_dir(path);
+        snprintf(path,sizeof path,"%s/wide/slabs",root); make_dir(path);
+        snprintf(manifest,sizeof manifest,"%s/wide/manifest.ini",root);
+        file=fopen(manifest,"wb"); assert(file);
+        fprintf(file,"[pack]\nschema=1\n[wide]\n%s=-4:slabs/m4.png;inner:slabs/in.png;4:slabs/p4.png\n%s=stretch\n%s=1:slabs/ok.png;2:bad+name.png\n",
+                id,overlay,third);
+        fclose(file);
+        read_pack(root,"wide"); qsort(g_entries,g_count,sizeof(*g_entries),entry_compare); index_wide();
+        assert(g_count==6 && g_wide_count==2 && g_stretch_count==1);
+        assert(strstr(lookup(id)->path,"second.png") && !lookup(overlay));
+        memcpy(g_stage_id[0],id,65);
+        assert(texture_pack_wide_slabs(0,dt,16)==3 && dt[0]==-4 && dt[1]==0 && dt[2]==4 && !texture_pack_wide_stretch(0));
+        assert(wide_anchor(0)->inner && strstr(wide_anchor(0)->inner->path,"in.png"));
+        memcpy(g_stage_id[0],overlay,65);
+        assert(texture_pack_wide_stretch(0) && !texture_pack_wide_slabs(0,dt,16));
+        memcpy(g_stage_id[0],third,65);
+        assert(texture_pack_wide_slabs(0,dt,16)==1 && dt[0]==1);
+        /* A slab loads with the anchor's shape (2x here) and binds; a wrongly sized one is rejected. */
+        memcpy(g_stage_id[0],id,65);
+        g_stage_shape[0]=(RecompTextureSource){1,6,1,1,1,pixel,4,0,0,0,NULL,0};
+        snprintf(path,sizeof path,"%s/wide/slabs/m4.png",root); assert(write_png(path,pixel,2,2));
+        snprintf(path,sizeof path,"%s/wide/slabs/p4.png",root); assert(write_png(path,pixel,2,1));
+        g_sync_load=1; g_budget=1u<<20;
+        assert(texture_pack_wide_bind(&device,0,0)==1 && bound[0]);
+        assert(texture_pack_wide_bind(&device,0,2)==0);
+        slab=&g_entries[wide_anchor(0)->first+2]; assert(slab->failed);
+        slab=&g_entries[wide_anchor(0)->first]; set_texture(&device,0,NULL); release_entry(&device,slab);
+        g_sync_load=0; g_stage_id[0][0]=0;
+        snprintf(path,sizeof path,"%s/wide/slabs/m4.png",root); remove_file(path);
+        snprintf(path,sizeof path,"%s/wide/slabs/p4.png",root); remove_file(path);
+        remove_file(manifest);
+        snprintf(path,sizeof path,"%s/wide/slabs",root); remove_dir(path);
+        snprintf(path,sizeof path,"%s/wide",root); remove_dir(path);
+    }
     /* LRU eviction must unbind all stages and release every retained resource. */
     g_budget=64; g_active=1;
     snprintf(g_entries[0].path,PATH_CAP,"%s/alpha.png",root);
@@ -362,6 +402,6 @@ int main(void)
         snprintf(path,sizeof path,"%s/%s",root,i?"two":"one"); remove_dir(path);
     }
     remove_dir(root);
-    printf("texture-pack fixture passed: hash, palette, stride, PNG alpha/mips, background decoding, DDS bounds, precedence, eviction (%u resources)\n",creates);
+    printf("texture-pack fixture passed: hash, palette, stride, PNG alpha/mips, background decoding, DDS bounds, precedence, wide slabs, eviction (%u resources)\n",creates);
     return 0;
 }
