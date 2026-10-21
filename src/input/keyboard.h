@@ -66,6 +66,10 @@ extern "C" {
 #define XBOX_VK_DIVIDE    0x6F
 #define XBOX_VK_F1        0x70      /* through XBOX_VK_F12, 0x7B */
 #define XBOX_VK_F12       0x7B
+/* Def Jam fork: the mouse wheel as two keys, a notch held briefly (input_host.c
+ * holds each for 120 ms). 0x88 and 0x89 are unassigned in the Win32 table. */
+#define XBOX_VK_WHEEL_UP   0x88
+#define XBOX_VK_WHEEL_DOWN 0x89
 #define XBOX_VK_LSHIFT    0xA0
 #define XBOX_VK_RSHIFT    0xA1
 #define XBOX_VK_LCONTROL  0xA2

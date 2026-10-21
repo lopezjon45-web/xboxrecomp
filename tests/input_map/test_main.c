@@ -17,11 +17,11 @@ static int g_checks;
 /* Every name the first version of this module (d9a0a38) wrote or read, with
  * the Windows virtual-key code it means, from winuser.h, written out here
  * rather than taken from the module. Strings saved by that version must keep
- * reading as the same keys. The wheel had no VK and is gone: those two names
- * are now rejected. */
+ * reading as the same keys. The wheel had no VK; upstream dropped those two
+ * names, and the Def Jam fork keeps them as VKs 0x88/0x89 (keyboard.h). */
 static const struct { const char *name; int vk; } k_names[] = {
     { "mouse1", 0x01 }, { "mouse2", 0x02 }, { "mouse3", 0x04 }, { "mouse4", 0x05 }, { "mouse5", 0x06 },
-    { "wheelup", -1 }, { "wheeldown", -1 },
+    { "wheelup", 0x88 }, { "wheeldown", 0x89 },
     { "backspace", 0x08 }, { "tab", 0x09 }, { "enter", 0x0D }, { "shift", 0x10 }, { "ctrl", 0x11 },
     { "alt", 0x12 }, { "pause", 0x13 }, { "capslock", 0x14 }, { "escape", 0x1B }, { "space", 0x20 },
     { "pageup", 0x21 }, { "pagedown", 0x22 }, { "end", 0x23 }, { "home", 0x24 },
@@ -68,7 +68,7 @@ static void test_key_names(void)
     CHECK(xbox_InputMap_KeyFromName("Esc") == XBOX_VK_ESCAPE);
     CHECK(xbox_InputMap_KeyFromName("mouse1") == XBOX_VK_LBUTTON);
     CHECK(xbox_InputMap_KeyFromName("Mouse3") == XBOX_VK_MBUTTON);
-    CHECK(xbox_InputMap_KeyFromName("WheelUp") == -1);
+    CHECK(xbox_InputMap_KeyFromName("WheelUp") == XBOX_VK_WHEEL_UP);
     CHECK(xbox_InputMap_KeyFromName("lshift") == XBOX_VK_LSHIFT);
     CHECK(xbox_InputMap_KeyFromName("") == -1);
     CHECK(xbox_InputMap_KeyFromName("banana") == -1);
@@ -111,7 +111,7 @@ static void test_key_names(void)
         snprintf(buf, sizeof(buf), "%s", n);
         CHECK(xbox_InputMap_KeyFromName(buf) == c);
     }
-    CHECK(named == N_NAMES - N_ALIASES - 2);       /* less the aliases and the wheel */
+    CHECK(named == N_NAMES - N_ALIASES);           /* less the aliases */
 
     /* Side-specific modifiers are their own keys, apart from the aggregate. */
     CHECK(xbox_InputMap_KeyFromName("lshift") != xbox_InputMap_KeyFromName("rshift"));
@@ -154,9 +154,10 @@ static void test_bindings(void)
     CHECK(xbox_InputMap_BindingsParse(&b, INPUT_A, "Enter, return") == 0 && b.count[INPUT_A] == 1);
 
     /* Unknown names are skipped and counted, known ones kept. The wheel is
-     * not a key here. */
-    CHECK(xbox_InputMap_BindingsParse(&b, INPUT_X, "K, banana, wheeldown, 99, slash") == 3);
-    CHECK(b.count[INPUT_X] == 2 && b.key[INPUT_X][0] == 'K' && b.key[INPUT_X][1] == XBOX_VK_OEM_2);
+     * a key in the Def Jam fork. */
+    CHECK(xbox_InputMap_BindingsParse(&b, INPUT_X, "K, banana, wheeldown, 99, slash") == 2);
+    CHECK(b.count[INPUT_X] == 3 && b.key[INPUT_X][0] == 'K'
+          && b.key[INPUT_X][1] == XBOX_VK_WHEEL_DOWN && b.key[INPUT_X][2] == XBOX_VK_OEM_2);
 
     /* Four is the most; the fifth is counted as rejected. */
     CHECK(xbox_InputMap_BindingsParse(&b, INPUT_Y, "A,B,C,D,E") == 1);
@@ -177,8 +178,8 @@ static void test_saved_strings(void)
         { "esc, tab, capslock",            0, 3, { 0x1B, 0x09, 0x14 } },
         { "semicolon, quote, grave",       0, 3, { 0xBA, 0xDE, 0xC0 } },
         { "mouse4, mouse5",                0, 2, { 0x05, 0x06 } },
-        { "W, wheelup",                    1, 1, { 'W' } },
-        { "wheeldown",                     1, 0, { 0 } },
+        { "W, wheelup",                    0, 2, { 'W', 0x88 } },
+        { "wheeldown",                     0, 1, { 0x89 } },
         { "none",                          0, 0, { 0 } },
     };
     size_t i;

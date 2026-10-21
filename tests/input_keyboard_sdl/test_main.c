@@ -124,6 +124,10 @@ static void test_keycodes(void)
         int hit = 0;
         if (!xbox_InputMap_KeyName(vk))
             continue;
+        /* The Def Jam fork's wheel keys come from the port's mouse wheel
+         * events, not from an SDL key or button. */
+        if (vk == XBOX_VK_WHEEL_UP || vk == XBOX_VK_WHEEL_DOWN)
+            continue;
         for (size_t i = 0; i < sizeof rows / sizeof rows[0]; i++)
             hit |= rows[i].vk == vk;
         for (size_t i = 0; i < sizeof sides / sizeof sides[0]; i++)

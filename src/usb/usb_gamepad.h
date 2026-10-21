@@ -33,6 +33,13 @@ typedef struct {
  */
 int usb_gamepad_control(int pad, const UsbSetup *setup, uint8_t *out, int max);
 
+/* Data the title sent to pad `pad`: an interrupt OUT transfer on endpoint 2, or
+ * the data stage of a class SET_REPORT. The only report it knows is rumble, six
+ * bytes -- id 0, length 6, the left (heavy) motor and the right (light) motor as
+ * 16-bit little-endian values -- which is passed on to the host pad. Anything
+ * else is ignored. */
+void usb_gamepad_out(int pad, const uint8_t *data, int len);
+
 /* Fill in pad `pad`'s 20-byte input report. Returns the byte count written. */
 int usb_gamepad_report(int pad, uint8_t *out, int max);
 
@@ -44,5 +51,9 @@ int usb_gamepad_configured(int pad);
 /* Up to four pads, one per Xbox controller port. Pad n is driven by host
  * XInput pad n and by pad-script steps prefixed "p<n+1>-". */
 #define USB_GAMEPAD_MAX 4
+
+/* Its port was reset (by the hub it sits behind): back to address 0. */
+void usb_gamepad_reset(int pad);
+uint32_t usb_gamepad_reset_generation(int pad);
 
 #endif /* XBOX_USB_GAMEPAD_H */

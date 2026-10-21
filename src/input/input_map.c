@@ -87,6 +87,7 @@ static const KeyName k_keys[] = {
     { "period", XBOX_VK_OEM_PERIOD }, { "slash", XBOX_VK_OEM_2 }, { "grave", XBOX_VK_OEM_3 },
     { "leftbracket", XBOX_VK_OEM_4 }, { "backslash", XBOX_VK_OEM_5 }, { "rightbracket", XBOX_VK_OEM_6 },
     { "quote", XBOX_VK_OEM_7 },
+    { "wheelup", XBOX_VK_WHEEL_UP }, { "wheeldown", XBOX_VK_WHEEL_DOWN },   /* Def Jam fork */
 };
 #define KEY_TABLE_COUNT ((int)(sizeof(k_keys) / sizeof(k_keys[0])))
 
