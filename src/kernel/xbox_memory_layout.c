@@ -506,6 +506,10 @@ uint32_t xbox_Nv2aRegRead(uint32_t va)
     int i = nv2a_hooked_index(va);
     if (i >= 0)
         return g_nv2a_hooked[i].read(va);
+    /* Nothing mapped yet (or a fixture with no guest layout at all, whose
+     * timer thread still runs the interrupt model): reads as zero. */
+    if (!g_nv2a_memory)
+        return 0;
     return *(volatile uint32_t *)((uintptr_t)va + g_memory_offset);
 }
 
@@ -516,7 +520,8 @@ void xbox_Nv2aRegWrite(uint32_t va, uint32_t value)
         g_nv2a_hooked[i].write(va, value);
         return;
     }
-    *(volatile uint32_t *)((uintptr_t)va + g_memory_offset) = value;
+    if (g_nv2a_memory)
+        *(volatile uint32_t *)((uintptr_t)va + g_memory_offset) = value;
 }
 
 static const struct { uint32_t offset; uint32_t busy_mask; } NV2A_ACK[] = {

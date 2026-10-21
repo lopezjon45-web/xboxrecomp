@@ -945,6 +945,99 @@ int xbox_IrqlCurrent(void)
     return (int)g_current_irql;
 }
 
+/* What DISPATCH_LEVEL buys on the console: on its one CPU, code that has
+ * raised to DISPATCH_LEVEL cannot be interrupted by a DPC. Drivers rely on
+ * that instead of locks -- XInputGetState raises, reads the device the USB
+ * driver's DPC maintains, and lowers. Here DPCs run on other host threads, so
+ * that exclusion has to be a lock: a thread holds it while its IRQL is at or
+ * above DISPATCH_LEVEL, and DPC routines run holding it
+ * (xbox_DispatchLockEnter). Without it the pad's device record was read while
+ * a DPC rewrote it, and once in about fifteen starts XInputGetState followed a
+ * half-written pointer (0xFFFEFFFF) and the title crashed.
+ *
+ * Interrupt service routines are not excluded: they run above DISPATCH_LEVEL
+ * on the console too. */
+static CRITICAL_SECTION g_dispatch_cs;
+static INIT_ONCE g_dispatch_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK dispatch_init(PINIT_ONCE o, PVOID p, PVOID *c)
+{
+    (void)o; (void)p; (void)c;
+    InitializeCriticalSection(&g_dispatch_cs);
+    return TRUE;
+}
+
+static void dispatch_lock(void)
+{
+    InitOnceExecuteOnce(&g_dispatch_once, dispatch_init, NULL, NULL);
+    EnterCriticalSection(&g_dispatch_cs);
+}
+
+static void dispatch_unlock(void)
+{
+    LeaveCriticalSection(&g_dispatch_cs);
+}
+
+/* For a DPC runner: wait for any thread at DISPATCH_LEVEL to lower, but not
+ * for ever -- an unbalanced raise would otherwise stop every DPC in the
+ * title. Returns 1 if the lock was taken (release with
+ * xbox_DispatchLockLeave), 0 if it ran without it after the wait. */
+int xbox_DispatchLockEnter(void)
+{
+    int tries;
+    /* Upstream's one-CPU gate (RECOMP_DISPATCH_GATE, #192) does this job
+     * itself when it is on; taking both would invert their lock order. */
+    if (xbox_DispatchGateOn())
+        return 0;
+    InitOnceExecuteOnce(&g_dispatch_once, dispatch_init, NULL, NULL);
+    for (tries = 0; tries < 2000; tries++) {        /* about 200 ms */
+        if (TryEnterCriticalSection(&g_dispatch_cs))
+            return 1;
+        if (tries < 50)
+            SwitchToThread();
+        else
+            Sleep(0);
+        if (tries >= 1000)
+            Sleep(1);
+    }
+    {
+        static int told;
+        if (!told++)
+            fprintf(stderr, "  [IRQL] a thread stayed at DISPATCH_LEVEL for 200 ms;"
+                            " running a DPC anyway\n");
+    }
+    return 0;
+}
+
+void xbox_DispatchLockLeave(void)
+{
+    dispatch_unlock();
+}
+
+/* The runtime's interrupt threads run ISRs, which on the console are above
+ * DISPATCH_LEVEL and never wait for it; their own raises take no lock (a DPC
+ * they run takes it explicitly). */
+static XBOX_THREAD_LOCAL int g_interrupt_thread;
+void xbox_IrqlInterruptThread(void) { g_interrupt_thread = 1; }
+/* Whether this thread may be held back while the GPU is serviced: a title
+ * thread below DISPATCH_LEVEL. One at DISPATCH holds the dispatch lock, which
+ * the deferred routine being waited for needs. */
+int xbox_IrqlPreemptible(void)
+{
+    return !g_interrupt_thread && g_current_irql < DISPATCH_LEVEL;
+}
+
+/* Crossing DISPATCH_LEVEL takes or drops the lock. */
+static void irql_changed(KIRQL old, KIRQL now)
+{
+    if (g_interrupt_thread || xbox_DispatchGateOn())
+        return;
+    if (old < DISPATCH_LEVEL && now >= DISPATCH_LEVEL)
+        dispatch_lock();
+    else if (old >= DISPATCH_LEVEL && now < DISPATCH_LEVEL)
+        dispatch_unlock();
+}
+
 /*
  * KfRaiseIrql - Raises IRQL to the specified level.
  * Returns the previous IRQL. Uses __fastcall (ECX = NewIrql).
@@ -959,9 +1052,11 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
             old, NewIrql);
     }
 
+    if (NewIrql > old) irql_changed(old, NewIrql);
     irql_track(old, NewIrql, IRQL_CALLER());
     g_current_irql = NewIrql;
     irql_publish();
+    if (NewIrql < old) irql_changed(old, NewIrql);
     /* This thread now owns the processor at DISPATCH or above (any raise
      * that crosses DISPATCH from below, to a device IRQL too): what an ISR
      * queued runs before the caller's critical region, as it would have run
@@ -1011,9 +1106,11 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
     }
 
     old = g_current_irql;
+    if (NewIrql > old) irql_changed(old, NewIrql);
     irql_track(old, NewIrql, IRQL_CALLER());
     g_current_irql = NewIrql;
     irql_publish();
+    if (NewIrql < old) irql_changed(old, NewIrql);
     /* Down from a device level to DISPATCH: the thread keeps the gate, and
      * the interrupts the level held off are taken now, as the console takes
      * them at the lower. The thunk's safe point came before this, still at
@@ -1030,11 +1127,23 @@ KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
 {
     KIRQL old = g_current_irql;
 
+    irql_changed(old, DISPATCH_LEVEL);
     irql_track(old, DISPATCH_LEVEL, IRQL_CALLER());
     g_current_irql = DISPATCH_LEVEL;
     irql_publish();
     if (old < DISPATCH_LEVEL)
         dpc_run_here();
+    return old;
+}
+
+/* SYNCH_LEVEL crosses the same dispatch-exclusion boundary. */
+KIRQL __stdcall xbox_KeRaiseIrqlToSynchLevel(void)
+{
+    KIRQL old = g_current_irql;
+    irql_changed(old, 26);
+    irql_track(old, 26, IRQL_CALLER());
+    g_current_irql = 26;
+    irql_publish();
     return old;
 }
 
@@ -1048,10 +1157,64 @@ KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
 
 volatile ULONG xbox_KeTickCount = 0;
 
+/* ============================================================================
+ * The guest's own boot
+ *
+ * Every clock a title can read -- KeTickCount, the interrupt time, the
+ * performance counter -- counts from the console's power-on, and a title
+ * starts seconds after that. These used to hand the host's uptime straight
+ * through, so after six days of host uptime a title saw half a billion
+ * milliseconds. Def Jam's intro movie then began stalling at start-up, on a
+ * build that had played it cleanly an hour earlier; a clock that big loses
+ * its low bits in any float or 32-bit arithmetic a title does with it.
+ *
+ * So the guest boots when the process does, ten seconds before the title
+ * starts: never zero, which some code reads as "not set yet", and small, as it
+ * would be on a console. Host-side timers keep using host time.
+ * ============================================================================ */
+#define XBOX_GUEST_UPTIME_AT_START_MS 10000ull
+
+static ULONGLONG s_guest_boot_ms;
+static LONGLONG  s_guest_boot_qpc;
+
+static void guest_clock_init(void)
+{
+    if (!s_guest_boot_ms) {
+        LARGE_INTEGER q, f;
+        QueryPerformanceCounter(&q);
+        QueryPerformanceFrequency(&f);
+        s_guest_boot_qpc = q.QuadPart
+            - (LONGLONG)(XBOX_GUEST_UPTIME_AT_START_MS * (ULONGLONG)f.QuadPart / 1000ull);
+        s_guest_boot_ms = GetTickCount64() - XBOX_GUEST_UPTIME_AT_START_MS;
+    }
+}
+
+/* Milliseconds since the guest's power-on.
+ *
+ * From the performance counter. The console's KeTickCount moves every
+ * millisecond; GetTickCount64 moves in 15.6 ms steps, so every clock built on
+ * this one -- KeTickCount, the interrupt time, XAPI's GetTickCount -- jumped
+ * 15 or 16 at a time, and a title turning each frame's elapsed milliseconds
+ * into whole game steps rounded that up (patch 0067). */
+ULONGLONG xbox_GuestUptimeMs(void)
+{
+    static LONGLONG freq;
+    LARGE_INTEGER q;
+    guest_clock_init();
+    if (!freq) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        freq = f.QuadPart ? f.QuadPart : 1;
+    }
+    QueryPerformanceCounter(&q);
+    return (ULONGLONG)((q.QuadPart - s_guest_boot_qpc) / freq) * 1000ull
+         + (ULONGLONG)(((q.QuadPart - s_guest_boot_qpc) % freq) * 1000 / freq);
+}
+
 /* Call this periodically or on-demand to update KeTickCount */
 static void xbox_update_tick_count(void)
 {
-    xbox_KeTickCount = GetTickCount();
+    xbox_KeTickCount = (ULONG)xbox_GuestUptimeMs();
 }
 
 /* ============================================================================
@@ -1064,7 +1227,9 @@ static void xbox_update_tick_count(void)
 LARGE_INTEGER __stdcall xbox_KeQueryPerformanceCounter(void)
 {
     LARGE_INTEGER counter;
+    guest_clock_init();
     QueryPerformanceCounter(&counter);
+    counter.QuadPart -= s_guest_boot_qpc;   /* since the guest's power-on */
     return counter;
 }
 
@@ -1748,11 +1913,11 @@ VOID __stdcall xbox_DbgBreakPoint(void)
 ULONGLONG __stdcall xbox_KeQueryInterruptTime(void)
 {
     /*
-     * Time since boot in NT 100ns units. GetTickCount64 is milliseconds, so
-     * scale by 10,000. Resolution is coarser than the real kernel's, but it is
-     * monotonic, which is the property callers actually depend on.
+     * Time since the guest's boot in NT 100ns units, from milliseconds, so
+     * scaled by 10,000. Resolution is coarser than the real kernel's, but it
+     * is monotonic, which is the property callers actually depend on.
      */
-    return (ULONGLONG)GetTickCount64() * 10000ULL;
+    return xbox_GuestUptimeMs() * 10000ULL;
 }
 
 /* ============================================================================
@@ -1933,4 +2098,17 @@ void xbox_Cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4])
         out[3] = 0x0C040800u;   /* L1 D, DTLB 4M, L1 I, no L2 */
         break;
     }
+}
+
+/* Def Jam fork: the fork's port names, for generated code lifted before
+ * v0.16 (which emits xbox_PortIn/xbox_PortOut instead). Thin wrappers. */
+uint8_t  xbox_IoRead8 (uint16_t port) { return (uint8_t) xbox_PortIn(port, 1); }
+uint16_t xbox_IoRead16(uint16_t port) { return (uint16_t)xbox_PortIn(port, 2); }
+uint32_t xbox_IoRead32(uint16_t port) { return           xbox_PortIn(port, 4); }
+void xbox_IoWrite8 (uint16_t port, uint8_t  v) { xbox_PortOut(port, v, 1); }
+void xbox_IoWrite16(uint16_t port, uint16_t v) { xbox_PortOut(port, v, 2); }
+void xbox_IoWrite32(uint16_t port, uint32_t v) { xbox_PortOut(port, v, 4); }
+/* The fork's port census is upstream's first-use log now (port_first_use). */
+void xbox_IoPortReport(void)
+{
 }
