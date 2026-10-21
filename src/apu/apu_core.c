@@ -20,11 +20,17 @@
  */
 
 #include "apu_state.h"
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 #include "apu.h"
 #include "apu_xaudio2.h"
 #include "apu_wav.h"
 #include "fpconv.h"
 #include "../kernel/xbox_memory_layout.h"   /* XBOX_WORKER_STACK_TOP */
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+#endif
 
 /* ============================================================
  * Globals
@@ -57,7 +63,25 @@ void mcpx_debug_begin_frame(void) {}
 void mcpx_debug_end_frame(void) {}
 
 /* ============================================================
- * IRQ handling (stubbed - no PCI bus in standalone)
+ * Physical addresses
+ *
+ * The APU is handed physical addresses -- the voice array, the notifier
+ * block, the scatter-gather lists and every page of sample data -- and the
+ * model used to read physical P at guest address P. That is low RAM, and
+ * DirectSound allocates all of those from the contiguous window, which here is
+ * separate storage at 0x80000000 + P (xbox_memory_layout.c says why). So the
+ * model and the title each kept their own copy of every voice: the model
+ * played voices the title could not see move, a stream's position never
+ * advanced where the title read it, and a title that paces its mixer on that
+ * position mixed nothing. Def Jam's EA audio library does exactly that, so a
+ * movie's sound was never consumed and the movie never finished.
+ *
+ * The kernel records every translation it hands out (xbox_PhysicalToVirtual)
+ * and that answer is exact; an address it never handed out is taken to be in
+ * the contiguous window, the same rule the OHCI model uses. The lookup is a
+ * linear scan and the voice processor makes half a million accesses a
+ * second, so answers are cached per page and dropped when the kernel's map
+ * changes.
  * ============================================================ */
 
 /* Physical addresses, resolved much as the other bus masters here do it
@@ -89,7 +113,7 @@ static inline uint32_t apu_mapped_ram(void)
     return (uint32_t)(g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram);
 }
 
-uint8_t *mcpx_apu_phys(uint64_t addr)
+static uint8_t *apu_phys_classify(uint64_t addr)
 {
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
     /* RAM above the window's 64 MB. On a 128 MB layout (a devkit) most of
@@ -172,10 +196,72 @@ static int apu_mmio_trace(void)
     return on;
 }
 
+/* Def Jam fork: the kernel's exact record where the classifier would guess.
+ * MmGetPhysicalAddress and the contiguous allocator record every translation
+ * they hand out (xbox_PhysicalToVirtual), the same record the OHCI resolves its
+ * bus addresses through, so a physical number a title actually obtained
+ * resolves to the page it came from. The classifier's certain cases (a named
+ * heap page, a live contiguous page) come first; a number nobody recorded
+ * falls back to its guesses (the image, the arena's high-water mark). Exact hits are cached per page, keyed by the record's
+ * generation; the classifier's answers are not, since its page maps change as
+ * memory is allocated. */
+extern uint32_t xbox_PhysicalToVirtual(uint32_t pa);
+extern uint32_t xbox_PhysMapGeneration(void);
+
+#define APU_PHYS_CACHE 256
+
+uint8_t *mcpx_apu_phys(uint64_t addr)
+{
+    /* One 64-bit word per entry so a reader on another thread sees a whole
+     * entry or none: generation (24 bits, offset by one so a zeroed entry
+     * never matches), physical page (20), guest page (20). */
+    static volatile uint64_t cache[APU_PHYS_CACHE];
+    uint32_t pa = (uint32_t)addr & 0x03FFFFFFu;
+    uint32_t pn = pa >> 12;
+    uint64_t tag = ((uint64_t)((xbox_PhysMapGeneration() + 1) & 0xFFFFFFu) << 40)
+                 | ((uint64_t)pn << 20);
+#ifdef _MSC_VER
+    uint64_t e = (uint64_t)_InterlockedCompareExchange64(
+        (volatile __int64 *)&cache[pn % APU_PHYS_CACHE], 0, 0);
+#else
+    uint64_t e = __atomic_load_n(&cache[pn % APU_PHYS_CACHE], __ATOMIC_ACQUIRE);
+#endif
+    uint32_t vn, va;
+
+    if (((uint32_t)addr & 0x0FFFFFFFu) >= (64u << 20))
+        return apu_phys_classify(addr);          /* above 64 MB: RAM, as upstream */
+    /* What the classifier knows for certain comes first: a heap page the
+     * title named (RAM) and a page the contiguous allocator holds now
+     * (window). The record decides only where the classifier would guess. */
+    if (xbox_PhysRamNameMap()[pn] || xbox_ContiguousPageMap()[pn])
+        return apu_phys_classify(addr);
+    if ((e & ~(uint64_t)0xFFFFF) == tag) {
+        vn = (uint32_t)(e & 0xFFFFF);
+        return g_apu_ram_ptr + ((uintptr_t)vn << 12) + (pa & 0xFFFu);
+    }
+    va = xbox_PhysicalToVirtual(pa);
+    if (!va)
+        return apu_phys_classify(addr);
+    vn = va >> 12;
+#ifdef _MSC_VER
+    _InterlockedExchange64((volatile __int64 *)&cache[pn % APU_PHYS_CACHE],
+                           (__int64)(tag | vn));
+#else
+    __atomic_store_n(&cache[pn % APU_PHYS_CACHE], tag | vn, __ATOMIC_RELEASE);
+#endif
+    return g_apu_ram_ptr + ((uintptr_t)vn << 12) + (pa & 0xFFFu);
+}
+
 /* The interrupt line, as the frame thread sees it. update_irq used to call
  * pci_irq_assert, which is an empty stub here, so DirectSound's service
  * routine never ran and no voice completion ever reached it. */
 static volatile LONG s_irq_line;
+/* Def Jam fork: the line is delivered by the kernel timer's vector-5 path
+ * (kernel_bridge.c), not by this thread; this is what it polls. */
+int xbox_ApuIrqPending(void)
+{
+    return InterlockedCompareExchange(&s_irq_line, 0, 0) != 0;
+}
 
 /* FETINTSTS is not derived from FECTL here. It is latched once, where the
  * front end traps (fe_method), and an ISTS write clears it like any other
@@ -200,6 +286,7 @@ static void update_irq(MCPXAPUState *d)
          d->regs[NV_PAPU_IEN])) {
         qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_GINTSTS);
         InterlockedExchange(&s_irq_line, 1);
+        pci_irq_assert(PCI_DEVICE(d));
     } else {
         qatomic_and(&d->regs[NV_PAPU_ISTS], ~NV_PAPU_ISTS_GINTSTS);
         InterlockedExchange(&s_irq_line, 0);
@@ -877,6 +964,70 @@ static void waveout_submit(MCPXAPUState *d, const int16_t period[][2])
  * This used to clear frame_buf before rendering the tone and the mixer into
  * it, so whatever the VP and DSP produced never reached the device, and it
  * rendered a whole device buffer (1024 samples) per 256-sample period. */
+/* Def Jam fork: what the port's tools read from the output.
+ *
+ * g_xa2_dropped counts periods that never reached the device (refused by the
+ * backend, or dropped while the device was stopped); g_xa2_starved counts the
+ * device's dry spells (xa2_underruns). The port's recorder reads both every
+ * frame; RECOMP_APU_LEVEL's line reports and resets them once a second.
+ *
+ * RECOMP_APU_PCM=<file>: the samples handed to the device, as raw 48 kHz
+ * stereo 16-bit PCM (no header), for checking output without a listener.
+ * Read until it opens: the port's recorder sets it after start-up.
+ *
+ * RECOMP_APU_LEVEL=1: once a second,
+ *   [APU] output peak P over the last second; V voices, SECTL S FECTL F;
+ *   buffers dropped D, device ran dry R
+ * in exactly this form (the port's evidence scripts parse it). */
+int g_xa2_dropped, g_xa2_starved;
+
+static void apu_fork_tap(MCPXAPUState *d, const int16_t (*pcm)[2], int n)
+{
+    static FILE *pcm_file;
+    static int level = -1, peak, periods, lines;
+    int i;
+
+    if (!pcm_file) {
+        const char *path = getenv("RECOMP_APU_PCM");
+        if (path && *path)
+            pcm_file = fopen(path, "wb");
+    }
+    if (pcm_file)
+        fwrite(pcm, sizeof pcm[0], (size_t)n, pcm_file);
+
+    if (level < 0) {
+        extern int g_apu_route_on;
+        level = getenv("RECOMP_APU_LEVEL") != NULL;
+        g_apu_route_on = level;
+    }
+    if (!level)
+        return;
+    for (i = 0; i < n; i++) {
+        int a = abs(pcm[i][0]), b = abs(pcm[i][1]);
+        if (a > peak) peak = a;
+        if (b > peak) peak = b;
+    }
+    if (++periods < 48000 / MIXER_FRAME_SAMPLES)
+        return;
+    if (lines++ < 600) {
+        extern int mcpx_apu_vp_count_voices(MCPXAPUState *d);
+        fprintf(stderr, "[APU] output peak %d over the last second; %d voices,"
+                        " SECTL %08X FECTL %08X; buffers dropped %d, device ran dry %d\n",
+                peak, mcpx_apu_vp_count_voices(d),
+                d->regs[NV_PAPU_SECTL], d->regs[NV_PAPU_FECTL],
+                g_xa2_dropped, g_xa2_starved);
+        g_xa2_dropped = g_xa2_starved = 0;
+        if (lines % 5 == 1 && lines < 120) {
+            extern void mcpx_apu_vp_dump_voices(MCPXAPUState *d);
+            extern void mcpx_apu_vp_dump_routing(void);
+            mcpx_apu_vp_dump_voices(d);
+            mcpx_apu_vp_dump_routing();
+        }
+    }
+    peak = 0;
+    periods = 0;
+}
+
 void mcpx_apu_monitor_frame(MCPXAPUState *d)
 {
     int16_t period[MIXER_FRAME_SAMPLES][2];
@@ -911,15 +1062,28 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
 
     /* A period dropped while pacing is stalled never reaches the device,
      * so it stays out of the dump too. */
-    if (!(xa2_is_active() && d->pace_stalled))
+    if (!(xa2_is_active() && d->pace_stalled)) {
         apu_wav_write((const int16_t *)period, MIXER_FRAME_SAMPLES);
+        apu_fork_tap(d, (const int16_t (*)[2])period, MIXER_FRAME_SAMPLES);
+    } else {
+        g_xa2_dropped++;
+    }
 
     if (xa2_is_active()) {
         if (!d->pace_stalled) {
             int q = hs_poll();
-            hs_submit(MIXER_FRAME_SAMPLES,
-                      xa2_submit_samples((const int16_t *)period,
-                                         MIXER_FRAME_SAMPLES), q);
+            int ok = xa2_submit_samples((const int16_t *)period,
+                                        MIXER_FRAME_SAMPLES);
+            if (!ok)
+                g_xa2_dropped++;
+            hs_submit(MIXER_FRAME_SAMPLES, ok, q);
+        }
+        {
+            static int last_underruns;
+            int u = xa2_underruns();
+            if (u > last_underruns)
+                g_xa2_starved += u - last_underruns;
+            last_underruns = u;
         }
         return;
     }
@@ -930,6 +1094,29 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
 /* ============================================================
  * Throttle (timing control for frame pacing)
  * ============================================================ */
+
+/* The eight 32-sample slices of a period used to run back to back and the thread then
+ * slept out the rest of its 5.33 ms, so a voice's play position (CBO) jumped 256 samples
+ * at once where hardware advances 32 every 0.67 ms. Measured in 200 s of the opening
+ * scene, the game's mixing buffer (voices 0xF8-0xFA) played back the previous lap's
+ * samples (the title had not written them yet) about 4.3 times a second, and about 2.2
+ * with each slice at its own moment. That is half of them, not all; what drives the rest
+ * is not found. Waits shorter than a millisecond need a sleep the host's condition
+ * variable does not have, so this is for POSIX hosts: on by default on Linux and macOS
+ * (measured on both), RECOMP_APU_SLICE_PACE=1/0 to choose, and off on Windows. */
+static int slice_pace_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_APU_SLICE_PACE");
+#if defined(_WIN32)
+        on = 0;
+#else
+        on = !(e && *e == '0');
+#endif
+    }
+    return on;
+}
 
 /* How long the device queue may sit at high without falling before the
  * device counts as stopped. A consuming device takes a buffer (10.7 ms at
@@ -1017,6 +1204,8 @@ int64_t mcpx_apu_pace_step(MCPXAPUState *d, int64_t now_us)
         d->pace_stalled = false;
     }
 
+    /* Up to four periods late is made up, which covers the front-end traps
+     * the frame thread waits out; later than that and the clock starts again. */
     if (d->next_frame_time_us == 0 ||
         now_us - d->next_frame_time_us > EP_FRAME_US)
         d->next_frame_time_us = now_us;
@@ -1038,9 +1227,45 @@ void mcpx_apu_pace_rendered(MCPXAPUState *d)
     d->next_frame_time_us += EP_FRAME_US;
 }
 
+/* Def Jam fork: each 32-sample slice at its own moment (POSIX). The period
+ * itself is released by mcpx_apu_pace_step; the seven slices after its first
+ * are then spread over it from the period's scheduled start, as hardware
+ * advances CBO 32 samples every 0.67 ms. A period the device queue released
+ * ahead of the clock (a render-ahead after a hitch) is not paced: those
+ * slices are the refill, and spacing them out would undo it. */
+static void slice_pace_wait(MCPXAPUState *d, int64_t period_base_us)
+{
+#ifndef _WIN32
+    int64_t due = period_base_us + (int64_t)(d->ep_frame_div % 8) * EP_FRAME_US / 8;
+    for (;;) {
+        int64_t rem = due - qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+        if (rem <= 0 || d->pause_requested)
+            break;
+        if (rem >= 2000) {
+            qemu_cond_timedwait(&d->cond, &d->lock, (int)(rem / 1000) - 1);
+        } else {
+            qemu_mutex_unlock(&d->lock);
+            usleep((useconds_t)rem);
+            qemu_mutex_lock(&d->lock);
+        }
+    }
+#else
+    (void)d; (void)period_base_us;
+#endif
+}
+
 static void throttle(MCPXAPUState *d)
 {
+    static int64_t period_base_us;
     int64_t start_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+
+    if (d->ep_frame_div % 8) {
+        if (slice_pace_enabled() && period_base_us && !d->pause_requested) {
+            slice_pace_wait(d, period_base_us);
+            d->sleep_acc_us += (int)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) - start_us);
+        }
+        return;
+    }
 
     while (!d->pause_requested) {
         int64_t wait_us = mcpx_apu_pace_step(
@@ -1049,6 +1274,11 @@ static void throttle(MCPXAPUState *d)
             break;
         qemu_cond_timedwait(&d->cond, &d->lock,
                             (int)((wait_us + 999) / 1000));
+    }
+    {
+        int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+        period_base_us = d->next_frame_time_us <= now_us
+                       ? d->next_frame_time_us : 0;
     }
 
     d->sleep_acc_us += (int)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) - start_us);
@@ -1125,6 +1355,13 @@ static void apu_irq_stats_line(void)
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+#if defined(__APPLE__)
+    /* Guest threads run at user-interactive QoS on Darwin (win32_compat.c, so the title's
+     * audio writer gets the guest CPU at scene loads). This thread produces every sample
+     * the device plays: left at the default it lost the cores to them in a four-fighter
+     * fight and the device ran dry 23 times in four minutes instead of 10. */
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {
@@ -1224,7 +1461,8 @@ static void *mcpx_apu_frame_thread(void *arg)
             update_irq(d);
             d->set_irq = false;
         }
-        apu_deliver_irq(d);
+        /* Def Jam fork: the pinned kernel timer delivers the line to the guest
+         * (xbox_ApuIrqPending, kernel_bridge.c); this thread mixes audio. */
         apu_irq_stats_line();
 
         /* Let the guest in once per frame.

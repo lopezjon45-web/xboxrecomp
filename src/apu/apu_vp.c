@@ -47,6 +47,8 @@ static const struct {
  * Notify status helper
  * ============================================================ */
 
+unsigned g_apu_notifies;   /* read by the status line in apu_core.c */
+
 static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
                               int status)
 {
@@ -57,6 +59,7 @@ static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
 
     stb_phys(address_space_memory, notify_offset, (uint8_t)status);
     stb_phys(address_space_memory, notify_offset - 1, 1);
+    g_apu_notifies++;
 
     qatomic_or(&d->regs[NV_PAPU_ISTS],
                NV_PAPU_ISTS_FEVINTSTS | NV_PAPU_ISTS_FENINTSTS);
@@ -196,6 +199,18 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     d->regs[NV_PAPU_FEDECMETH] = method;
     d->regs[NV_PAPU_FEDECPARAM] = argument;
     unsigned int selected_handle, list;
+
+    /* Whether the title starts voices at all: the first question when a
+     * title waits on its audio, and not otherwise visible. */
+    {
+        static unsigned on, off;
+        if (method == NV1BA0_PIO_VOICE_ON && (on++ < 6 || on % 1000 == 0))
+            fprintf(stderr, "[APU] voice on 0x%X (#%u)\n",
+                    argument & NV1BA0_PIO_VOICE_ON_HANDLE, on);
+        if (method == NV1BA0_PIO_VOICE_OFF && (off++ < 6 || off % 1000 == 0))
+            fprintf(stderr, "[APU] voice off 0x%X (#%u)\n",
+                    argument & NV1BA0_PIO_VOICE_OFF_HANDLE, off);
+    }
 
     switch (method) {
     case NV1BA0_PIO_VOICE_LOCK:
@@ -1314,6 +1329,23 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
     return sample_count;
 }
 
+struct apu_route { double energy; float gain; uint8_t bin; };
+struct apu_route g_apu_route[MCPX_HW_MAX_VOICES][8];
+int g_apu_route_on;
+
+/* Print and clear the routing table: every voice slot that carried sound. */
+void mcpx_apu_vp_dump_routing(void)
+{
+    for (int v = 0; v < MCPX_HW_MAX_VOICES; v++)
+        for (int b = 0; b < 8; b++)
+            if (g_apu_route[v][b].energy > 0.0) {
+                fprintf(stderr, "[APU]   route voice 0x%02X slot %d -> bin %d gain %.3f energy %.1f%c",
+                        v, b, g_apu_route[v][b].bin, g_apu_route[v][b].gain,
+                        g_apu_route[v][b].energy, 10);
+                g_apu_route[v][b].energy = 0.0;
+            }
+}
+
 /* ============================================================
  * Voice resampling (linear interpolation in place of libsamplerate)
  *
@@ -1490,6 +1522,30 @@ static void voice_process(MCPXAPUState *d,
             if (count == 0 && ++empty > 4) break;
             sample_count += count;
         }
+        {
+            /* RECOMP_APU_VOICE_PCM=<prefix>: what voices 0xF8-0xFA (the
+             * title's six-channel stream) produced each frame, before volume,
+             * as raw 48 kHz stereo 16-bit in <prefix>F8.pcm etc. Local only. */
+            static const char *prefix = (const char *)1;
+            static FILE *f[3];
+            if (prefix == (const char *)1)
+                prefix = getenv("RECOMP_APU_VOICE_PCM");
+            if (prefix && v >= 0xF8 && v <= 0xFA) {
+                int k = v - 0xF8, i;
+                int16_t out[NUM_SAMPLES_PER_FRAME][2];
+                if (!f[k]) {
+                    char path[512];
+                    snprintf(path, sizeof path, "%s%02X.pcm", prefix, v);
+                    f[k] = fopen(path, "wb");
+                }
+                for (i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                    out[i][0] = (int16_t)(clampf(samples[i][0], -1.0f, 1.0f) * 32767.0f);
+                    out[i][1] = (int16_t)(clampf(samples[i][1], -1.0f, 1.0f) * 32767.0f);
+                }
+                if (f[k])
+                    fwrite(out, sizeof out, 1, f[k]);
+            }
+        }
     }
 
     int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
@@ -1606,6 +1662,18 @@ static void voice_process(MCPXAPUState *d,
         f->gain_prev[b] = g;
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
             mixbins[bin[b]][i] += (g0 + step * (i + 1)) * samples[i][b % channels];
+        }
+        {
+            /* RECOMP_APU_LEVEL: what each voice sends where (routing report). */
+            extern int g_apu_route_on;
+            if (g_apu_route_on) {
+                double e = 0.0;
+                for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+                    e += (double)samples[i][b % channels] * samples[i][b % channels];
+                g_apu_route[v][b].energy += e * g * g;
+                g_apu_route[v][b].bin = (uint8_t)bin[b];
+                g_apu_route[v][b].gain = g;
+            }
         }
     }
     d->vp.filters[v].gain_valid = true;
@@ -1724,6 +1792,54 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
         }
         memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
         memset(mixbins, 0, sizeof(float) * NUM_MIXBINS * NUM_SAMPLES_PER_FRAME);
+    }
+}
+
+/* Every voice on the three lists, one line each: whether it plays, whether it
+ * is a stream and where its segment lists stand. For the status line. */
+int mcpx_apu_vp_count_voices(MCPXAPUState *d)
+{
+    int n = 0;
+    for (int list = 0; list < 3; list++) {
+        uint32_t v = d->regs[voice_list_regs[list].top];
+        for (int i = 0; v != 0xFFFF && i < 256; i++, n++)
+            v = voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_TAR_PITCH_LINK,
+                               NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
+    }
+    return n;
+}
+
+void mcpx_apu_vp_dump_voices(MCPXAPUState *d)
+{
+    for (int list = 0; list < 3; list++) {
+        uint32_t v = d->regs[voice_list_regs[list].top];
+        for (int i = 0; v != 0xFFFF && i < 16; i++) {
+            uint16_t h = (uint16_t)v;
+            fprintf(stderr, "[APU]   list %d voice 0x%02X pitch=%d ba=%X lbo=%X"
+                    " state=%08X fmt=%08X"
+                    " cbo=%X ebo=%X ssl idx %d seg %d count %u/%u base %u/%u\n",
+                    list, h,
+                    (int)(int16_t)voice_get_mask(d, h, NV_PAVS_VOICE_TAR_PITCH_LINK,
+                                                 NV_PAVS_VOICE_TAR_PITCH_LINK_PITCH),
+                    voice_get_mask(d, h, NV_PAVS_VOICE_CUR_PSL_START,
+                                   NV_PAVS_VOICE_CUR_PSL_START_BA),
+                    voice_get_mask(d, h, NV_PAVS_VOICE_CUR_PSH_SAMPLE,
+                                   NV_PAVS_VOICE_CUR_PSH_SAMPLE_LBO),
+                    voice_get_mask(d, h, NV_PAVS_VOICE_PAR_STATE, 0xFFFFFFFF),
+                    voice_get_mask(d, h, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFF),
+                    voice_get_mask(d, h, NV_PAVS_VOICE_PAR_OFFSET,
+                                   NV_PAVS_VOICE_PAR_OFFSET_CBO),
+                    voice_get_mask(d, h, NV_PAVS_VOICE_PAR_NEXT,
+                                   NV_PAVS_VOICE_PAR_NEXT_EBO),
+                    h < MCPX_HW_MAX_VOICES ? d->vp.ssl[h].ssl_index : -1,
+                    h < MCPX_HW_MAX_VOICES ? d->vp.ssl[h].ssl_seg : -1,
+                    h < MCPX_HW_MAX_VOICES ? d->vp.ssl[h].count[0] : 0,
+                    h < MCPX_HW_MAX_VOICES ? d->vp.ssl[h].count[1] : 0,
+                    h < MCPX_HW_MAX_VOICES ? d->vp.ssl[h].base[0] : 0,
+                    h < MCPX_HW_MAX_VOICES ? d->vp.ssl[h].base[1] : 0);
+            v = voice_get_mask(d, h, NV_PAVS_VOICE_TAR_PITCH_LINK,
+                               NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
+        }
     }
 }
 

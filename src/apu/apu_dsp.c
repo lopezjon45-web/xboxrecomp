@@ -155,6 +155,18 @@ static uint32_t *dsp_ack_auto_slot(MCPXAPUState *d)
     return (uint32_t *)(mcpx_apu_phys(page) + GP_DOORBELL_OFFSET);
 }
 
+/* Explicit six-speaker downmix retains centre/LFE/rear balance and headroom.
+ * Other titles keep the upstream all-bin default or legacy two-bin override. */
+static int mcpx_apu_mixdown_six(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_APU_MIXDOWN");
+        on = e && !strcmp(e, "six");
+    }
+    return on;
+}
+
 void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
 {
     int i;
@@ -278,7 +290,11 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
              * counts. This is not what a real EP does; it is the cheapest
              * mixdown that stops discarding audio. */
             float left, right;
-            if (mcpx_apu_mixdown_all()) {
+            if (mcpx_apu_mixdown_six()) {
+                float c = 0.7071f * mixbins[2][i] + 0.5f * mixbins[3][i];
+                left = 0.7f * (mixbins[0][i] + c + 0.7071f * mixbins[4][i]);
+                right = 0.7f * (mixbins[1][i] + c + 0.7071f * mixbins[5][i]);
+            } else if (mcpx_apu_mixdown_all()) {
                 left = 0.0f;
                 right = 0.0f;
                 for (int b = 0; b < NUM_MIXBINS; ++b) {
