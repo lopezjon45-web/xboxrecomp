@@ -16,6 +16,8 @@
  */
 
 #include "d3d8_internal.h"
+#include "d3d8_present.h"
+#include "d3d8_readback.h"
 #include <stdio.h>
 #include <string.h>
 #include "recomp_exit_hook.h"
@@ -44,8 +46,11 @@ typedef struct D3D8DeviceState {
 
     /* Window */
     HWND                    hwnd;
-    UINT                    width;
+    UINT                    width;          /* the back buffer, in pixels */
     UINT                    height;
+    UINT                    logical_width;  /* what the title asked for */
+    UINT                    logical_height;
+    UINT                    render_scale;   /* width / logical_width */
     D3DFORMAT               backbuffer_format;
 
     /* State tracking */
@@ -128,7 +133,31 @@ static HRESULT d3d8_present(void)
         fprintf(stderr, "D3D8: Gamma presentation failed: 0x%08lX\n", hr);
         return hr;
     }
-    hr = IDXGISwapChain_Present(g_device_state.swap_chain, 1, 0);
+    {
+        /* No wait for the host's vertical blank unless RECOMP_PRESENT_VSYNC=1.
+         * When this presents a push buffer's flips, a wait here is a wait in
+         * the GPU executor, and the executor already paces the title's flips
+         * at 60 Hz (FLIP_STALL, RECOMP_FLIP_HZ). With both, a Def Jam fight
+         * presented 13-15 frames a second; without the wait, 20-23. The intro
+         * movie once stalled without it (2 start-ups of 4, before the guest
+         * clocks moved to QPC); 6 of 6 reach the title now. */
+        static int env_vsync = -1;
+        int vsync = d3d8_present_sync_interval();   /* the host's choice, if it made one */
+        if (env_vsync < 0) {
+            const char *e = getenv("RECOMP_PRESENT_VSYNC");
+            env_vsync = (e && *e == '1') ? 1 : 0;
+        }
+        if (vsync < 0)
+            vsync = env_vsync;
+        /* With scaled presentation the title's target is not the swap chain's
+         * buffer: draw it into the window first (after the gamma pass, so the
+         * window shows the ramped picture). */
+        hr = d3d8_present_blit();
+        if (FAILED(hr))
+            fprintf(stderr, "D3D8: Scaled presentation failed: 0x%08lX\n", hr);
+        hr = IDXGISwapChain_Present(g_device_state.swap_chain, (UINT)vsync, 0);
+        d3d8_present_trace_pacing();
+    }
     d3d8_gamma_end(g_device_state.default_rtv);
     return hr;
 }
@@ -165,8 +194,24 @@ ID3D11DeviceContext *d3d8_GetD3D11Context(void) { return g_device_state.d3d11_co
 IDXGISwapChain      *d3d8_GetSwapChain(void) { return g_device_state.swap_chain; }
 ID3D11RenderTargetView *d3d8_GetDefaultRTV(void) { return g_device_state.default_rtv; }
 HWND                 d3d8_GetHWND(void) { return g_device_state.hwnd; }
-UINT                 d3d8_GetBackbufferWidth(void) { return g_device_state.width; }
-UINT                 d3d8_GetBackbufferHeight(void) { return g_device_state.height; }
+/* The title's screen size: pre-transformed vertices and full-screen quads are
+ * in these units whatever the render scale. */
+UINT                 d3d8_GetBackbufferWidth(void) { return g_device_state.logical_width; }
+UINT                 d3d8_GetBackbufferHeight(void) { return g_device_state.logical_height; }
+UINT                 d3d8_GetRenderScale(void) { return g_device_state.render_scale ? g_device_state.render_scale : 1; }
+static float g_place_kx = 1.0f, g_place_bx = 0.0f;
+void d3d8_SetDrawPlacement(float kx, float bx) { g_place_kx = kx; g_place_bx = bx; }
+void d3d8_GetDrawPlacement(float *kx, float *bx) { *kx = g_place_kx; *bx = g_place_bx; }
+float d3d8_GetCanvasScaleX(void)
+{
+    return g_device_state.logical_width ? (float)g_device_state.width / (float)g_device_state.logical_width
+                                        : (float)d3d8_GetRenderScale();
+}
+float d3d8_GetCanvasScaleY(void)
+{
+    return g_device_state.logical_height ? (float)g_device_state.height / (float)g_device_state.logical_height
+                                         : (float)d3d8_GetRenderScale();
+}
 const DWORD         *d3d8_GetRenderStates(void) { return g_device_state.render_states; }
 const DWORD         *d3d8_GetTSS(DWORD stage) { return (stage < MAX_TEXTURE_STAGES) ? g_device_state.tss[stage] : NULL; }
 IDirect3DBaseTexture8 *d3d8_GetStageTexture(DWORD stage) { return (stage < 4) ? g_cur_textures[stage] : NULL; }
@@ -198,6 +243,41 @@ UINT                 d3d8_GetNumLights(void) {
  * D3D11 initialization helpers
  * ================================================================ */
 
+#ifdef _DEBUG
+#include <d3d11sdklayers.h>
+/* The debug layer breaks on a corruption-class message by raising exception
+ * 0x87D, which with no debugger attached ends the process without a word.
+ * Print what it had to say and carry on: the message is the diagnosis. */
+static ID3D11InfoQueue *g_info_queue;
+
+static LONG CALLBACK d3d11_debug_break_handler(EXCEPTION_POINTERS *ep)
+{
+    UINT64 n, i, first;
+    static int reports;
+    if (ep->ExceptionRecord->ExceptionCode != 0x87D || !g_info_queue)
+        return EXCEPTION_CONTINUE_SEARCH;
+    n = ID3D11InfoQueue_GetNumStoredMessages(g_info_queue);
+    first = n > 6 ? n - 6 : 0;
+    if (reports++ < 8) {
+        fprintf(stderr, "[D3D11-DEBUG] debug layer break (thread %lu); last %u of %u message(s):\n",
+                GetCurrentThreadId(), (unsigned)(n - first), (unsigned)n);
+        for (i = first; i < n; i++) {
+            SIZE_T len = 0;
+            D3D11_MESSAGE *m;
+            ID3D11InfoQueue_GetMessage(g_info_queue, i, NULL, &len);
+            m = (D3D11_MESSAGE *)malloc(len);
+            if (m && SUCCEEDED(ID3D11InfoQueue_GetMessage(g_info_queue, i, m, &len)))
+                fprintf(stderr, "[D3D11-DEBUG]   sev %d id %d: %.*s\n", (int)m->Severity,
+                        (int)m->ID, (int)m->DescriptionByteLength, m->pDescription);
+            free(m);
+        }
+        fflush(stderr);
+    }
+    ID3D11InfoQueue_ClearStoredMessages(g_info_queue);
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+#endif
+
 static HRESULT d3d11_create_device_and_swap_chain(
     D3D8DeviceState *state,
     D3DPRESENT_PARAMETERS *pp)
@@ -211,10 +291,33 @@ static HRESULT d3d11_create_device_and_swap_chain(
     create_flags |= D3D11_CREATE_DEVICE_DEBUG;
 #endif
 
+    /* RECOMP_RENDER_SCALE=N (1-4, default 2): the back buffer is N times the
+     * title's size in each direction and everything rasterises at that
+     * resolution, while the title keeps working in its own units (the getters
+     * above; the viewport covers the whole buffer). Presented into a window of
+     * the title's size it is supersampled -- the edge smoothing the console
+     * gets from rendering a fight's 3D at twice the width (surface format
+     * 0x1128, anti-aliasing mode 1) and filtering it down, which is not
+     * modelled -- and in a larger window it is simply sharper. */
+    {
+        const char *e = getenv("RECOMP_RENDER_SCALE");
+        int n = e && *e ? atoi(e) : 2;
+        if (d3d8_present_render_scale())
+            n = (int)d3d8_present_render_scale();
+        state->render_scale = (UINT)(n < 1 ? 1 : n > 4 ? 4 : n);
+    }
+    state->logical_width = pp->BackBufferWidth ? pp->BackBufferWidth : 640;
+    state->logical_height = pp->BackBufferHeight ? pp->BackBufferHeight : 480;
     memset(&scd, 0, sizeof(scd));
     scd.BufferCount = pp->BackBufferCount ? pp->BackBufferCount : 1;
-    scd.BufferDesc.Width = pp->BackBufferWidth ? pp->BackBufferWidth : 640;
-    scd.BufferDesc.Height = pp->BackBufferHeight ? pp->BackBufferHeight : 480;
+    scd.BufferDesc.Width = state->logical_width * state->render_scale;
+    scd.BufferDesc.Height = state->logical_height * state->render_scale;
+    if (d3d8_present_scaling()) {
+        /* The swap chain follows the window (0 = its client area); the title
+         * renders into a target of its own, created with the render targets. */
+        scd.BufferDesc.Width = 0;
+        scd.BufferDesc.Height = 0;
+    }
     scd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     scd.BufferDesc.RefreshRate.Numerator = 60;
     scd.BufferDesc.RefreshRate.Denominator = 1;
@@ -225,28 +328,62 @@ static HRESULT d3d11_create_device_and_swap_chain(
     scd.Windowed = pp->Windowed;
     scd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
 
-    hr = D3D11CreateDeviceAndSwapChain(
-        NULL,
-        D3D_DRIVER_TYPE_HARDWARE,
-        NULL,
-        create_flags,
-        NULL, 0,
-        D3D11_SDK_VERSION,
-        &scd,
-        &state->swap_chain,
-        &state->d3d11_device,
-        &feature_level,
-        &state->d3d11_context
-    );
+    hr = E_FAIL;
+    if (d3d8_present_scaling()) {
+        /* Flip model: a borderless window is presented without a copy through
+         * the desktop compositor, which is what exclusive full screen used to
+         * be needed for, and a sync interval waits for the display properly.
+         * Windows 10 and later; older systems fall through to the blit model. */
+        DXGI_SWAP_CHAIN_DESC flip = scd;
+        flip.BufferCount = 2;
+        flip.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        hr = D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, create_flags,
+                                           NULL, 0, D3D11_SDK_VERSION, &flip, &state->swap_chain,
+                                           &state->d3d11_device, &feature_level,
+                                           &state->d3d11_context);
+        if (FAILED(hr))
+            fprintf(stderr, "D3D8: Flip-model swap chain unavailable (0x%08lX); using the blit model\n", hr);
+    }
+    if (FAILED(hr))
+        hr = D3D11CreateDeviceAndSwapChain(
+            NULL,
+            D3D_DRIVER_TYPE_HARDWARE,
+            NULL,
+            create_flags,
+            NULL, 0,
+            D3D11_SDK_VERSION,
+            &scd,
+            &state->swap_chain,
+            &state->d3d11_device,
+            &feature_level,
+            &state->d3d11_context
+        );
 
     if (FAILED(hr)) {
         fprintf(stderr, "D3D8: Failed to create D3D11 device: 0x%08lX\n", hr);
         return hr;
     }
 
+#ifdef _DEBUG
+    if (SUCCEEDED(ID3D11Device_QueryInterface(state->d3d11_device, &IID_ID3D11InfoQueue,
+                                              (void **)&g_info_queue)))
+        AddVectoredExceptionHandler(1, d3d11_debug_break_handler);
+#endif
+
     state->hwnd = pp->hDeviceWindow;
-    state->width = scd.BufferDesc.Width;
-    state->height = scd.BufferDesc.Height;
+    {
+        /* A widescreen canvas widens only the title's own target (scaling mode);
+         * the title's coordinates keep their range and spread over it. */
+        UINT num, den;
+        d3d8_present_canvas_aspect(&num, &den);
+        state->width = d3d8_canvas_width(state->logical_width, state->logical_height,
+                                         state->render_scale, num, den);
+        if (state->width != state->logical_width * state->render_scale)
+            fprintf(stderr, "D3D8: widescreen canvas %u:%u, target %ux%u for a %ux%u title\n",
+                    num, den, state->width, state->logical_height * state->render_scale,
+                    state->logical_width, state->logical_height);
+    }
+    state->height = state->logical_height * state->render_scale;
 
     return S_OK;
 }
@@ -257,17 +394,25 @@ static HRESULT d3d11_create_render_targets(D3D8DeviceState *state)
     D3D11_TEXTURE2D_DESC depth_desc;
     HRESULT hr;
 
-    /* Create render target view from swap chain back buffer */
-    hr = IDXGISwapChain_GetBuffer(state->swap_chain, 0,
-                                   &IID_ID3D11Texture2D,
-                                   (void **)&back_buffer);
-    if (FAILED(hr)) return hr;
+    if (d3d8_present_scaling()) {
+        /* The default target is a texture of the title's size; each present
+         * draws it into the swap chain's buffer (d3d8_present.c). */
+        hr = d3d8_present_create_game_target(state->width, state->height,
+                                             &state->default_rtv);
+        if (FAILED(hr)) return hr;
+    } else {
+        /* Create render target view from swap chain back buffer */
+        hr = IDXGISwapChain_GetBuffer(state->swap_chain, 0,
+                                       &IID_ID3D11Texture2D,
+                                       (void **)&back_buffer);
+        if (FAILED(hr)) return hr;
 
-    hr = ID3D11Device_CreateRenderTargetView(state->d3d11_device,
-                                              (ID3D11Resource *)back_buffer,
-                                              NULL, &state->default_rtv);
-    ID3D11Texture2D_Release(back_buffer);
-    if (FAILED(hr)) return hr;
+        hr = ID3D11Device_CreateRenderTargetView(state->d3d11_device,
+                                                  (ID3D11Resource *)back_buffer,
+                                                  NULL, &state->default_rtv);
+        ID3D11Texture2D_Release(back_buffer);
+        if (FAILED(hr)) return hr;
+    }
 
     /* Create depth stencil */
     memset(&depth_desc, 0, sizeof(depth_desc));
@@ -369,7 +514,9 @@ static ULONG __stdcall dev_Release(IDirect3DDevice8 *self)
     if (ref <= 0) {
         /* Cleanup subsystems first */
         up_ring_shutdown();
+        d3d8_readback_reset();
         d3d8_gamma_shutdown();
+        d3d8_present_shutdown();
         d3d8_vsh_shutdown();
         d3d8_combiners_shutdown();
         d3d8_states_shutdown();
@@ -480,9 +627,16 @@ static HRESULT __stdcall dev_GetBackBuffer(IDirect3DDevice8 *self, INT iBackBuff
 
     if (!ppSurface) return E_INVALIDARG;
 
-    hr = IDXGISwapChain_GetBuffer(g_device_state.swap_chain, 0,
-                                   &IID_ID3D11Texture2D,
-                                   (void **)&back_buffer);
+    if (d3d8_present_scaling() && d3d8_present_game_texture()) {
+        /* What the title drew, whatever the window's size. */
+        back_buffer = d3d8_present_game_texture();
+        ID3D11Texture2D_AddRef(back_buffer);
+        hr = S_OK;
+    } else {
+        hr = IDXGISwapChain_GetBuffer(g_device_state.swap_chain, 0,
+                                       &IID_ID3D11Texture2D,
+                                       (void **)&back_buffer);
+    }
     if (FAILED(hr)) return hr;
 
     *ppSurface = d3d8_surface_create(back_buffer, 0, 0,
@@ -997,6 +1151,119 @@ static HRESULT __stdcall dev_DrawIndexedPrimitiveUP(IDirect3DDevice8 *self, D3DP
     return S_OK;
 }
 
+/* An indexed triangle list drawn with a vertex shader, input layout and
+ * vertex constant buffers (b1, b2) the caller compiled itself -- the NV2A
+ * translator's vertex programs (M4e). Everything else is what a D3D8 draw
+ * sets up: the pixel shader for the current texture stages and FVF (the
+ * caller's shader writes the same VS_OUT), the combiners, and the render
+ * states; the caller's vertex side replaces the fixed-function one. */
+/* A geometry shader for the next d3d8_DrawIndexedExternalVS calls (NULL for
+ * none): with one set the indices are a point list and the shader makes the
+ * primitives -- how NV2A point sprites are drawn (d3d8_extvs.c). */
+static ID3D11GeometryShader *g_ext_gs;
+
+void d3d8_SetExternalGS(ID3D11GeometryShader *gs)
+{
+    g_ext_gs = gs;
+}
+
+HRESULT d3d8_DrawIndexedExternalVS(const void *verts, UINT stride, UINT nverts,
+                                   const uint16_t *idx, UINT nidx,
+                                   ID3D11VertexShader *vs, ID3D11InputLayout *il,
+                                   ID3D11Buffer *cb1, ID3D11Buffer *cb2)
+{
+    /* Two dynamic buffers written as rings (NO_OVERWRITE until full, then
+     * DISCARD), not a pair of immutable buffers created and released per
+     * batch: at several hundred batches a frame the creation was most of what
+     * a busy scene cost. */
+    enum { EXT_VB_BYTES = 16 * 1024 * 1024, EXT_IB_BYTES = 1024 * 1024 };
+    static ID3D11Buffer *ext_vb, *ext_ib;
+    static UINT vb_at, ib_at;
+    D3D11_MAPPED_SUBRESOURCE map;
+    ID3D11DeviceContext *ctx = g_device_state.d3d11_context;
+    UINT offset = 0, vbytes, ibytes, first_index;
+    HRESULT hr;
+
+    if (!verts || !idx || !stride || !nverts || nidx < (g_ext_gs ? 1u : 3u) || !vs || !il)
+        return E_INVALIDARG;
+    vbytes = nverts * stride;
+    ibytes = nidx * 2;
+    if (vbytes > EXT_VB_BYTES || ibytes > EXT_IB_BYTES)
+        return E_INVALIDARG;
+    g_d3d_draw_count++;
+
+    if (!ext_vb) {
+        D3D11_BUFFER_DESC bd;
+        memset(&bd, 0, sizeof(bd));
+        bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        bd.ByteWidth = EXT_VB_BYTES;
+        bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+        hr = ID3D11Device_CreateBuffer(g_device_state.d3d11_device, &bd, NULL, &ext_vb);
+        if (FAILED(hr)) return hr;
+        bd.ByteWidth = EXT_IB_BYTES;
+        bd.BindFlags = D3D11_BIND_INDEX_BUFFER;
+        hr = ID3D11Device_CreateBuffer(g_device_state.d3d11_device, &bd, NULL, &ext_ib);
+        if (FAILED(hr)) { ID3D11Buffer_Release(ext_vb); ext_vb = NULL; return hr; }
+    }
+
+    if (vb_at + vbytes > EXT_VB_BYTES)
+        vb_at = 0;
+    hr = ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)ext_vb, 0,
+                                 vb_at ? D3D11_MAP_WRITE_NO_OVERWRITE : D3D11_MAP_WRITE_DISCARD,
+                                 0, &map);
+    if (FAILED(hr)) return hr;
+    memcpy((BYTE *)map.pData + vb_at, verts, vbytes);
+    ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)ext_vb, 0);
+    offset = vb_at;
+    vb_at += vbytes;
+
+    if (ib_at + ibytes > EXT_IB_BYTES)
+        ib_at = 0;
+    hr = ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)ext_ib, 0,
+                                 ib_at ? D3D11_MAP_WRITE_NO_OVERWRITE : D3D11_MAP_WRITE_DISCARD,
+                                 0, &map);
+    if (FAILED(hr)) return hr;
+    memcpy((BYTE *)map.pData + ib_at, idx, ibytes);
+    ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)ext_ib, 0);
+    first_index = ib_at / 2;
+    ib_at += ibytes;
+
+    ID3D11DeviceContext_IASetVertexBuffers(ctx, 0, 1, &ext_vb, &stride, &offset);
+    ID3D11DeviceContext_IASetIndexBuffer(ctx, ext_ib, DXGI_FORMAT_R16_UINT, 0);
+
+    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
+    d3d8_combiners_prepare_draw();
+    d3d8_states_apply();
+
+    ID3D11DeviceContext_VSSetShader(ctx, vs, NULL, 0);
+    ID3D11DeviceContext_IASetInputLayout(ctx, il);
+    if (cb1) ID3D11DeviceContext_VSSetConstantBuffers(ctx, 1, 1, &cb1);
+    if (cb2) ID3D11DeviceContext_VSSetConstantBuffers(ctx, 2, 1, &cb2);
+    if (g_ext_gs) {
+        ID3D11DeviceContext_GSSetShader(ctx, g_ext_gs, NULL, 0);
+        if (cb2) ID3D11DeviceContext_GSSetConstantBuffers(ctx, 2, 1, &cb2);
+        ID3D11DeviceContext_IASetPrimitiveTopology(ctx, D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
+    } else {
+        ID3D11DeviceContext_IASetPrimitiveTopology(ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    }
+    ID3D11DeviceContext_DrawIndexed(ctx, nidx, first_index, 0);
+    if (g_ext_gs)
+        ID3D11DeviceContext_GSSetShader(ctx, NULL, NULL, 0);
+
+    if (g_cur_vb) {
+        D3D8VertexBuffer *vb = (D3D8VertexBuffer *)g_cur_vb;
+        offset = 0;
+        ID3D11DeviceContext_IASetVertexBuffers(ctx, 0, 1, &vb->d3d11_buffer, &g_cur_vb_stride, &offset);
+    }
+    if (g_cur_ib) {
+        D3D8IndexBuffer *ib = (D3D8IndexBuffer *)g_cur_ib;
+        DXGI_FORMAT fmt = (ib->format == D3DFMT_INDEX32) ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
+        ID3D11DeviceContext_IASetIndexBuffer(ctx, ib->d3d11_buffer, fmt, 0);
+    }
+    return S_OK;
+}
+
 static HRESULT __stdcall dev_CreateTexture(IDirect3DDevice8 *self, UINT Width, UINT Height, UINT Levels, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool, IDirect3DTexture8 **ppTexture)
 {
     (void)self; (void)Pool;
@@ -1246,6 +1513,28 @@ static HRESULT __stdcall dev_SetViewport(IDirect3DDevice8 *self, const D3DVIEWPO
         ID3D11DeviceContext_RSSetViewports(g_device_state.d3d11_context, 1, &d3d11_vp);
     }
     return S_OK;
+}
+
+/* The NV2A surface clip, as a scissor rectangle in guest pixels: a title
+ * letterboxes by narrowing it. Zero width or height lifts it. The rasterizer
+ * state always has the scissor test on, so a rectangle is always set. */
+void d3d8_SetScissorRect(UINT x, UINT y, UINT w, UINT h)
+{
+    static UINT last[4] = { ~0u, ~0u, ~0u, ~0u };
+    float sx = d3d8_GetCanvasScaleX(), sy = d3d8_GetCanvasScaleY();
+    D3D11_RECT r;
+    if (!g_device_state.d3d11_context)
+        return;
+    if (last[0] == x && last[1] == y && last[2] == w && last[3] == h)
+        return;
+    last[0] = x; last[1] = y; last[2] = w; last[3] = h;
+    if (w && h) {
+        r.left = (LONG)(x * sx + 0.5f);       r.top = (LONG)(y * sy + 0.5f);
+        r.right = (LONG)((x + w) * sx + 0.5f); r.bottom = (LONG)((y + h) * sy + 0.5f);
+    } else {
+        r.left = 0; r.top = 0; r.right = 16384; r.bottom = 16384;
+    }
+    ID3D11DeviceContext_RSSetScissorRects(g_device_state.d3d11_context, 1, &r);
 }
 
 static HRESULT __stdcall dev_GetViewport(IDirect3DDevice8 *self, D3DVIEWPORT8 *pViewport)
@@ -1538,6 +1827,7 @@ static HRESULT __stdcall d3d8_CreateDevice(IDirect3D8 *self, UINT Adapter, DWORD
         vp.MaxDepth = 1.0f;
         ID3D11DeviceContext_RSSetViewports(g_device_state.d3d11_context, 1, &vp);
     }
+    d3d8_SetScissorRect(0, 0, 0, 0);
 
     /* Initialize shader and state subsystems */
     hr = d3d8_shaders_init();
@@ -1568,7 +1858,9 @@ static HRESULT __stdcall d3d8_CreateDevice(IDirect3D8 *self, UINT Adapter, DWORD
     g_device_initialized = TRUE;
 
     *ppDevice = &g_device;
-    fprintf(stderr, "D3D8: Device created (%ux%u)\n", g_device_state.width, g_device_state.height);
+    fprintf(stderr, "D3D8: Device created (%ux%u, rendering at %ux%u)\n",
+            g_device_state.logical_width, g_device_state.logical_height,
+            g_device_state.width, g_device_state.height);
     return S_OK;
 }
 

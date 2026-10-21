@@ -35,6 +35,19 @@ ID3D11RenderTargetView *d3d8_GetDefaultRTV(void);
 HWND                 d3d8_GetHWND(void);
 UINT                 d3d8_GetBackbufferWidth(void);
 UINT                 d3d8_GetBackbufferHeight(void);
+UINT                 d3d8_GetRenderScale(void);
+/* Host pixels per title pixel. Equal to the render scale, except across when
+ * the target is widened to a canvas (d3d8_present_set_canvas_aspect). */
+float                d3d8_GetCanvasScaleX(void);
+float                d3d8_GetCanvasScaleY(void);
+/* Widescreen 2D placement for the next draws: clip-space x becomes x * kx + bx
+ * (1, 0 = unchanged). Set per draw by the push-buffer executor. */
+void                 d3d8_SetDrawPlacement(float kx, float bx);
+void                 d3d8_GetDrawPlacement(float *kx, float *bx);
+/* Widescreen: fill the areas beside the 4:3 box at the next present (d3d8_present.c). */
+void                 d3d8_RequestSideFill(void);
+void                d3d8_SetScissorRect(UINT x, UINT y, UINT w, UINT h);
+void                 d3d8_SetBlendColor(DWORD argb);
 
 /* Presentation-only gamma. End restores the saved backbuffer even if Present fails. */
 void d3d8_gamma_set(const D3DGAMMARAMP *ramp);
@@ -42,6 +55,18 @@ void d3d8_gamma_get(D3DGAMMARAMP *ramp);
 HRESULT d3d8_gamma_begin(ID3D11RenderTargetView *target);
 void d3d8_gamma_end(ID3D11RenderTargetView *target);
 void d3d8_gamma_shutdown(void);
+
+/* Scaled presentation (d3d8_present.c): the title's target is a texture and
+ * each present draws it into a swap chain that follows the window. */
+BOOL d3d8_present_scaling(void);
+UINT d3d8_present_render_scale(void);     /* 0 = no host override */
+void d3d8_present_canvas_aspect(UINT *num, UINT *den); /* 0, 0 = the title's own shape */
+int  d3d8_present_sync_interval(void);    /* -1 = no host choice; else Present's interval */
+void d3d8_present_trace_pacing(void);     /* RECOMP_PRESENT_PACING=1 */
+HRESULT d3d8_present_create_game_target(UINT width, UINT height, ID3D11RenderTargetView **rtv);
+ID3D11Texture2D *d3d8_present_game_texture(void);
+HRESULT d3d8_present_blit(void);
+void d3d8_present_shutdown(void);
 
 /* Current render state array accessor */
 const DWORD         *d3d8_GetRenderStates(void);
@@ -255,6 +280,7 @@ ID3D11ShaderResourceView *d3d8_base_srv(IDirect3DBaseTexture8 *texture);
 
 /* Read the D3DFORMAT of any base texture. */
 D3DFORMAT d3d8_base_format(IDirect3DBaseTexture8 *texture);
+UINT      d3d8_texel_swizzle(IDirect3DBaseTexture8 *texture);
 void      d3d8_base_set_palette(IDirect3DBaseTexture8 *texture, UINT palette);
 
 /* Re-upload every level of a P8 (palettized) texture through its

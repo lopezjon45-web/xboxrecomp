@@ -43,7 +43,7 @@ static const char g_vs_source[] =
     "    float4x4 WorldInvTranspose;\n"
     "    float2   ScreenSize;\n"
     "    uint     Flags;\n"
-    "    float    _pad0;\n"
+    "    float    PlaceBias;\n"   /* widescreen 2D placement: added to clip x (d3d8_SetDrawPlacement) */
     "    float4   EyePos;\n"
     "    float4   FogParams;\n"  /* x=start, y=end, z=density, w=vertex fog mode (0=none,1=exp,2=exp2,3=linear) */
     "    float4x4 WorldView;\n"             /* world*view (camera space) */
@@ -152,7 +152,7 @@ static const char g_vs_source[] =
     "    o.viewpos = float4(0, 0, 0, 1);\n"
     "\n"
     "    if (Flags & FLAG_PRETRANSFORMED) {\n"
-    "        o.pos.x = (input.pos.x / ScreenSize.x) * 2.0 - 1.0;\n"
+    "        o.pos.x = (input.pos.x / ScreenSize.x) * 2.0 - 1.0 + PlaceBias;\n"
     "        o.pos.y = 1.0 - (input.pos.y / ScreenSize.y) * 2.0;\n"
     "        o.pos.z = input.pos.z;\n"
     "        o.pos.w = 1.0;\n"
@@ -458,9 +458,13 @@ static void build_ps_source(UINT sig, char *buf, int bufsize)
         off += snprintf(buf + off, bufsize - off,
                         "    texels[%d] = tex%d.Sample(samp%d, input.tex%d.%s);\n",
                         i, i, i, i, dim ? "xyz" : "xy");
-        /* Xbox A8 samples white RGB; DXGI A8 supplies zero RGB. */
+        /* d3d8_texel_swizzle(): Xbox A8 samples white RGB where DXGI A8
+         * supplies zero; luminance formats replicate their one channel. */
         off += snprintf(buf + off, bufsize - off,
-                        "    if (AlphaOnly[%d]) texels[%d].rgb = 1.0;\n", i, i);
+                        "    if (AlphaOnly[%d] == 1) texels[%d].rgb = 1.0;\n"
+                        "    else if (AlphaOnly[%d] == 2) texels[%d] = float4(texels[%d].rrr, 1.0);\n"
+                        "    else if (AlphaOnly[%d] == 3) texels[%d] = texels[%d].rrrg;\n",
+                        i, i, i, i, i, i, i, i);
     }
     off += snprintf(buf + off, bufsize - off, "%s", g_ps_tail);
 }
@@ -568,7 +572,7 @@ typedef struct {
     float world_inv_transpose[16]; /* World inverse transpose (column-major) */
     float screen_w, screen_h;
     UINT  flags;
-    float _pad0;
+    float place_bias;            /* widescreen 2D placement (d3d8_SetDrawPlacement) */
     float eye_pos[4];
     float fog_params[4];         /* start, end, density, mode */
     float world_view[16];        /* World*View, camera space (column-major) */
@@ -937,6 +941,15 @@ static void ff_vs_prepare_draw(DWORD fvf)
             cb->screen_w = (float)d3d8_GetBackbufferWidth();
             cb->screen_h = (float)d3d8_GetBackbufferHeight();
             cb->flags = 0x01; /* pre-transformed */
+            {
+                /* A widescreen placement for this draw: clip x becomes x * kx + bx. */
+                float kx, bx;
+                d3d8_GetDrawPlacement(&kx, &bx);
+                if (kx != 1.0f || bx != 0.0f) {
+                    cb->screen_w /= kx;
+                    cb->place_bias = 1.0f - kx + bx;
+                }
+            }
         } else {
             float wv[16], wvp[16], wvp_t[16], world_t[16];
             float world_inv[16], world_inv_t[16];
@@ -1165,9 +1178,8 @@ void d3d8_shaders_prepare_draw(DWORD handle)
 
         /* Per-stage texture state */
         for (stage = 0; stage < 4; stage++) {
-            D3DFORMAT format = d3d8_base_format(d3d8_GetStageTexture(stage));
             const DWORD *tss = d3d8_GetTSS(stage);
-            pc->alpha_only[stage] = format == D3DFMT_A8 || format == D3DFMT_LIN_A8;
+            pc->alpha_only[stage] = d3d8_texel_swizzle(d3d8_GetStageTexture(stage));
             if (!tss) {
                 pc->stage_color[stage][0] = D3DTOP_DISABLE;
                 continue;
