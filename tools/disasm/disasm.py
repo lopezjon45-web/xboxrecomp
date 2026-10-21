@@ -40,6 +40,7 @@ class Disassembler:
                  extra_sections: Optional[list] = None,
                  seed_functions: Optional[list] = None,
                  observed_seeds: Optional[set] = None,
+                 alias_seeds: Optional[set] = None,
                  skip_library_immediates: bool = False):
         self.xbe_path = xbe_path
         self.analysis_json = analysis_json
@@ -54,6 +55,8 @@ class Disassembler:
         # Seeds a run actually reached (see _load_seed_functions). They are
         # not guesses, so the mid-instruction guard below does not apply.
         self.observed_seeds = observed_seeds or set()
+        # Seeded entry points inside a function: alias bodies, never starts.
+        self.alias_seeds = set(alias_seeds or ())
 
         # Components (initialized during run)
         self.image: Optional[BinaryImage] = None
@@ -62,6 +65,10 @@ class Disassembler:
         self.xrefs: Optional[XRefTracker] = None
         self.func_detector: Optional[FunctionDetector] = None
         self.strings: List[dict] = []
+
+    def _seed_key(self) -> list:
+        """Seeds as the cache fingerprints them: alias seeds count too."""
+        return list(self.seed_functions) + [(1 << 40) | a for a in sorted(self.alias_seeds)]
 
     def _trust_mid_instruction_seed(self, addr: int) -> bool:
         """A seed inside an instruction the sweep decoded: keep it anyway?
@@ -89,7 +96,7 @@ class Disassembler:
             if json_path and cache.is_valid(self.xbe_path, json_path,
                                              self.text_only,
                                              self.extra_sections,
-                                             self.seed_functions,
+                                             self._seed_key(),
                                              self.skip_library_immediates):
                 last_time = cache.get_last_run_time()
                 print(f"Cache hit - results unchanged (last run: "
@@ -178,6 +185,7 @@ class Disassembler:
         self.func_detector = FunctionDetector(
             self.engine, self.image, self.xrefs, self.labels,
             skip_library_immediates=self.skip_library_immediates)
+        self.func_detector.alias_seeds = self.alias_seeds
 
         # Measure bodies before accepting a seed inside a sweep instruction.
         if self.seed_functions:
@@ -208,6 +216,7 @@ class Disassembler:
             self.func_detector = FunctionDetector(
                 self.engine, self.image, self.xrefs, self.labels,
                 skip_library_immediates=self.skip_library_immediates)
+            self.func_detector.alias_seeds = self.alias_seeds
             for addr in accepted:
                 self.func_detector._add_candidate(addr, 0.95, "seed_vtable_thunk")
             if realigned:
@@ -265,7 +274,7 @@ class Disassembler:
             json_path = self._find_analysis_json()
             if json_path:
                 cache.save(self.xbe_path, json_path, self.text_only, elapsed,
-                           self.extra_sections, self.seed_functions,
+                           self.extra_sections, self._seed_key(),
                            self.skip_library_immediates)
 
             if self.verbose:

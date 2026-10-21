@@ -542,8 +542,9 @@ class FunctionDetector:
         Runs after the bodies exist, since "inside a function" is not knowable
         before that.
         """
-        seeded = sorted(addr for addr, (_conf, method) in self._candidates.items()
-                        if method == "seed_vtable_thunk")
+        seeded = sorted(set(addr for addr, (_conf, method) in self._candidates.items()
+                            if method == "seed_vtable_thunk")
+                        | set(getattr(self, "alias_seeds", ())))
         if not seeded:
             return
         bodies = sorted((f.start, f.end) for f in self.functions.values())

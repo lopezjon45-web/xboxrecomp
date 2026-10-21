@@ -105,8 +105,9 @@ def main():
         extra = [s.strip() for s in args.extra_sections.split(",")] if args.extra_sections else []
         seed_funcs = []
         observed = set()
+        alias_seeds = set()
         for _seed_path in (args.seed_functions or []):
-            _got = _load_seed_functions(_seed_path, observed)
+            _got = _load_seed_functions(_seed_path, observed, alias_seeds)
             seed_funcs.extend(_got)
             if args.verbose:
                 print(f"  Seed file {_seed_path}: {len(_got)} addresses")
@@ -122,6 +123,7 @@ def main():
             extra_sections=extra,
             seed_functions=seed_funcs,
             observed_seeds=observed,
+            alias_seeds=alias_seeds,
             skip_library_immediates=args.skip_library_immediates,
         )
         success = disassembler.run()
@@ -143,13 +145,18 @@ def main():
         sys.exit(2)
 
 
-def _load_seed_functions(path, observed=None):
+def _load_seed_functions(path, observed=None, aliases=None):
     """Load seed function addresses from a JSON file.
 
     Entries marked "observed" (tools.seed_from_log writes them: a run
     actually called or started a thread there) are also added to `observed`.
     Entries written by seed_from_log before it set the field say so in their
     note, and count too.
+
+    Entries marked "alias" go to `aliases` instead of the returned list: an
+    entry point inside a function, which becomes an alias body (as a tail-jump
+    alias does) and never a function start, so the enclosing function keeps
+    its whole extent (FunctionDetector._pass_seed_aliases).
     """
     import json
     with open(path) as f:
@@ -158,6 +165,9 @@ def _load_seed_functions(path, observed=None):
     for entry in data:
         if isinstance(entry, dict) and "start" in entry:
             addr = int(entry["start"], 16)
+            if entry.get("alias") and aliases is not None:
+                aliases.add(addr)
+                continue
             addrs.append(addr)
             if observed is not None and (
                     entry.get("observed")
