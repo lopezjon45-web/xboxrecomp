@@ -282,7 +282,7 @@ static void test_save_dir(const char *root)
     set_env("RECOMP_SAVE_DIR", ov);
     xbox_path_init(game, save);
     check(is_dir(ov), "RECOMP_SAVE_DIR is created", ov);
-    snprintf(want, sizeof want, "%s" SEP_S "UDATA" SEP_S "x", ov);
+    snprintf(want, sizeof want, "%s" SEP_S "UserData" SEP_S "x", ov);
     check_maps("\\Device\\Harddisk0\\Partition1\\UDATA\\x", want,
                "UDATA\\x goes under RECOMP_SAVE_DIR");
 
@@ -290,12 +290,14 @@ static void test_save_dir(const char *root)
     snprintf(p, sizeof p, "%s" SEP_S "TDATA", game);
     make_dir(p);                   /* saves only in the game dir */
     xbox_path_init(game, save);
-    snprintf(want, sizeof want, "%s" SEP_S "UDATA" SEP_S "x", save);
+    snprintf(want, sizeof want, "%s" SEP_S "UserData" SEP_S "x", save);
     check_maps("\\Device\\Harddisk0\\Partition1\\UDATA\\x", want,
                "unset: UDATA\\x goes under the save dir");
-    snprintf(want, sizeof want, "%s" SEP_S "TDATA" SEP_S "y", game);
+    /* Def Jam fork: a TDATA in the game dir (every disc ships one) is not
+     * where the title's writes go. */
+    snprintf(want, sizeof want, "%s" SEP_S "TitleData" SEP_S "y", save);
     check_maps("\\Device\\Harddisk0\\Partition1\\TDATA\\y", want,
-               "TDATA only in the game dir stays there");
+               "TDATA goes to the save dir though the game dir has one");
     snprintf(want, sizeof want, "%s" SEP_S "UDATAx" SEP_S "z", game);
     check_maps("\\Device\\Harddisk0\\Partition1\\UDATAx\\z", want,
                "UDATAx is not UDATA");

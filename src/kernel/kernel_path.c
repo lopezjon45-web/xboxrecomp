@@ -58,9 +58,15 @@ static const path_rule s_rules[] = {
      * win over Partition1; no trailing separator, the title opens the bare
      * directories too. RECOMP_SAVE_DIR moves just these (to_save 2), so a
      * scripted run can start from an empty save without touching the rest of
-     * the save dir (partition images, caches). */
-    { "\\Device\\Harddisk0\\Partition1\\UDATA", 2, "\\UDATA",  "/UDATA"      },
-    { "\\Device\\Harddisk0\\Partition1\\TDATA", 2, "\\TDATA",  "/TDATA"      },
+     * the save dir (partition images, caches).
+     *
+     * Def Jam fork: they go to UserData and TitleData, the folders U: and T:
+     * already map to, not to UDATA and TDATA. One title's saves then live in
+     * one place whichever way it names them, the folders match the fork's
+     * builds from before v0.16, and the game dir's own TDATA (every disc
+     * ships one) never takes the title's writes through the probe below. */
+    { "\\Device\\Harddisk0\\Partition1\\UDATA", 2, "\\UserData",  "/UserData"  },
+    { "\\Device\\Harddisk0\\Partition1\\TDATA", 2, "\\TitleData", "/TitleData" },
     /* E:\CACHE is the title's own scratch on the console's hard disk, and it
      * writes there: Burnout 3 opens CACHE\LocalCache00.bin and
      * LocalCache08.bin with FILE_OPEN_IF. Under the Partition1 rule below
@@ -141,8 +147,8 @@ static int s_user_in_game[2];
 /* The root a to_save 2 rule maps under. By the whole name: TitleCache
  * starts with the same letter as TDATA and must not follow its saves. */
 #define USER_RULE_DIR(r)                                                    \
-    ((strcmp((r)->sub_posix, "/UDATA") == 0 && s_user_in_game[0]) ||        \
-     (strcmp((r)->sub_posix, "/TDATA") == 0 && s_user_in_game[1])           \
+    ((strcmp((r)->sub_posix, "/UserData") == 0 && s_user_in_game[0]) ||        \
+     (strcmp((r)->sub_posix, "/TitleData") == 0 && s_user_in_game[1])         \
          ? s_game_dir : s_user_dir)
 
 /*
@@ -482,6 +488,38 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
             swprintf_s(dir, MAX_PATH, L"%s\\%s", s_save_dir, subs[i]);
             SHCreateDirectoryExW(NULL, dir, NULL);
         }
+        /* The dashboard's first-run copy: the disc's UDATA\<title id>\* to
+         * the save area's UserData, without replacing anything already there.
+         * Two levels is all a disc carries (the title's directory and its
+         * TitleMeta.xbx / TitleImage.xbx). */
+        {
+            WCHAR pat[MAX_PATH], sub[MAX_PATH], src[MAX_PATH], dst[MAX_PATH];
+            WIN32_FIND_DATAW t, f;
+            HANDLE ht, hf;
+            swprintf_s(pat, MAX_PATH, L"%s\\UDATA\\*", s_game_dir);
+            ht = FindFirstFileW(pat, &t);
+            if (ht != INVALID_HANDLE_VALUE) {
+                do {
+                    if (!(t.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || t.cFileName[0] == L'.')
+                        continue;
+                    swprintf_s(dir, MAX_PATH, L"%s\\UserData\\%s", s_save_dir, t.cFileName);
+                    SHCreateDirectoryExW(NULL, dir, NULL);
+                    swprintf_s(sub, MAX_PATH, L"%s\\UDATA\\%s\\*", s_game_dir, t.cFileName);
+                    hf = FindFirstFileW(sub, &f);
+                    if (hf == INVALID_HANDLE_VALUE)
+                        continue;
+                    do {
+                        if (f.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                            continue;
+                        swprintf_s(src, MAX_PATH, L"%s\\UDATA\\%s\\%s", s_game_dir, t.cFileName, f.cFileName);
+                        swprintf_s(dst, MAX_PATH, L"%s\\%s", dir, f.cFileName);
+                        CopyFileW(src, dst, TRUE);      /* never over a file already there */
+                    } while (FindNextFileW(hf, &f));
+                    FindClose(hf);
+                } while (FindNextFileW(ht, &t));
+                FindClose(ht);
+            }
+        }
         swprintf_s(image, MAX_PATH, L"%s\\%s", s_save_dir, XBOX_DISK_IMAGE_NAME);
         xbox_write_partition_table(image);
         /* The other partition devices, sized to the same geometry the table
@@ -538,7 +576,7 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
 
         /* Saves still in the game dir stay there (s_user_in_game). */
         for (int k = 0; k < 2; k++) {
-            static const WCHAR *names[2] = { L"UDATA", L"TDATA" };
+            static const WCHAR *names[2] = { L"UserData", L"TitleData" };
             WCHAR in_save[MAX_PATH], in_game[MAX_PATH];
             DWORD fa, fg;
             swprintf_s(in_save, MAX_PATH, L"%s\\%s", s_save_dir, names[k]);
@@ -574,6 +612,7 @@ static void xbox_remember_host_path(const wchar_t *p)
 {
     if (p) wcsncpy_s(s_last_host_path_shared, MAX_PATH, p, _TRUNCATE);
 }
+
 
 
 
@@ -621,6 +660,8 @@ translate:
     if (g_xbox_path_hook)
         g_xbox_path_hook(xbox_path);
     fprintf(stderr, "  [PATH] %s\n", xbox_path);
+    xbox_AnchorNoteOpen(xbox_path);
+    xbox_KernelTrail(8);
     fflush(stderr);
     {
         WCHAR remainder_wide[MAX_PATH];
@@ -669,6 +710,8 @@ translate:
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <errno.h>
+#include <dirent.h>
+#include <strings.h>
 #include <fcntl.h>
 
 static char s_game_dir[MAX_PATH];
@@ -682,6 +725,67 @@ static void strip_trailing_slash(char* s)
     size_t len = strlen(s);
     if (len > 1 && s[len - 1] == '/')
         s[len - 1] = '\0';
+}
+
+/* Match the path below the mapped root without regard to case.
+ *
+ * Xbox file systems ignore case, and titles rely on it: Def Jam opens
+ * D:\GCONFIG.XML and D:\FONTS\FONTS.VIV, and the disc has gconfig.xml and
+ * fonts/fonts.viv. Windows and a default macOS volume ignore case too, so this
+ * only shows on Linux, where the opens failed and the title went on with the
+ * data missing -- the front end then computed a 300 MB allocation, the zero
+ * fill after its failure ran over the kernel thunk table, and the boot ended
+ * in calls through null.
+ *
+ * Only runs when the exact path does not exist, and only below root_len, so a
+ * player's own folders are never touched. Each existing component is replaced
+ * in place by its on-disk spelling (an ASCII case difference keeps the
+ * length); the first component with no match ends the walk, so a file being
+ * created keeps the name the title gave it. */
+static void match_case_below(char* path, size_t root_len)
+{
+    struct stat st;
+    char* comp;
+
+    if (stat(path, &st) == 0 || strlen(path) <= root_len)
+        return;
+    comp = path + root_len;
+    while (*comp == '/')
+        comp++;
+    while (*comp) {
+        char* end = strchr(comp, '/');
+        char saved = 0;
+        DIR* dir;
+        struct dirent* ent;
+        int found = 0;
+
+        if (end) { saved = *end; *end = '\0'; }
+        if (lstat(path, &st) != 0) {
+            /* comp is the last component; its directory is everything before it. */
+            char* sep = comp - 1;
+            *sep = '\0';
+            dir = opendir(sep == path ? "/" : path);
+            *sep = '/';
+            if (dir) {
+                while ((ent = readdir(dir)) != NULL) {
+                    if (strlen(ent->d_name) == strlen(comp) && strcasecmp(ent->d_name, comp) == 0) {
+                        memcpy(comp, ent->d_name, strlen(comp));
+                        found = 1;
+                        break;
+                    }
+                }
+                closedir(dir);
+            }
+        } else {
+            found = 1;
+        }
+        if (end) *end = saved;
+        if (!found || !end)
+            return;
+        comp = end + 1;
+        while (*comp == '/')
+            comp++;
+    }
 }
 
 /* Recursively create a directory and all missing parents. */
@@ -704,6 +808,61 @@ static void mkdir_p(const char* path)
     if (mkdir(tmp, 0755) != 0 && errno != EEXIST)
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH, "mkdir %s: %s", tmp, strerror(errno));
 }
+
+/* The raw disk and partition devices as image files; see the Windows half
+ * for the table and why a directory cannot answer for them. */
+#define XBOX_PART_TABLE_OFFSET 0x800
+#define XBOX_PART_IN_USE       0x80000000u
+
+
+
+/* The dashboard's first-run copy: the disc's UDATA/<title id>/ files to the
+ * save area's UserData, never over a file already there. */
+static void posix_first_run_udata(void)
+{
+    char root[MAX_PATH * 2], src[MAX_PATH * 3], dst[MAX_PATH * 3];
+    DIR *titles, *files;
+    struct dirent *t, *f;
+
+    snprintf(root, sizeof(root), "%s/UDATA", s_game_dir);
+    titles = opendir(root);
+    if (!titles)
+        return;
+    while ((t = readdir(titles)) != NULL) {
+        if (t->d_name[0] == '.')
+            continue;
+        snprintf(src, sizeof(src), "%s/%s", root, t->d_name);
+        files = opendir(src);
+        if (!files)
+            continue;
+        snprintf(dst, sizeof(dst), "%s/UserData/%s", s_save_dir, t->d_name);
+        mkdir_p(dst);
+        while ((f = readdir(files)) != NULL) {
+            struct stat st;
+            char buf[65536];
+            ssize_t n;
+            int in, out;
+
+            snprintf(src, sizeof(src), "%s/%s/%s", root, t->d_name, f->d_name);
+            if (stat(src, &st) != 0 || !S_ISREG(st.st_mode))
+                continue;
+            snprintf(dst, sizeof(dst), "%s/UserData/%s/%s", s_save_dir, t->d_name, f->d_name);
+            out = open(dst, O_WRONLY | O_CREAT | O_EXCL, 0644);
+            if (out < 0)
+                continue;
+            in = open(src, O_RDONLY);
+            while (in >= 0 && (n = read(in, buf, sizeof(buf))) > 0)
+                if (write(out, buf, (size_t)n) != n)
+                    break;
+            if (in >= 0)
+                close(in);
+            close(out);
+        }
+        closedir(files);
+    }
+    closedir(titles);
+}
+
 
 void xbox_path_init(const char* game_dir, const char* save_dir)
 {
@@ -750,6 +909,8 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
             snprintf(path, sizeof(path), "%s/%s", s_save_dir, subs[i]);
             mkdir_p(path);
         }
+        /* The dashboard's first-run copy of the disc's UDATA (Def Jam fork). */
+        posix_first_run_udata();
 
         snprintf(path, sizeof(path), "%s/Partition0.img", s_save_dir);
         fd = open(path, O_WRONLY | O_CREAT, 0644);
@@ -796,7 +957,7 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
 
         /* Saves still in the game dir stay there (s_user_in_game). */
         for (int k = 0; k < 2; k++) {
-            static const char *names[2] = { "UDATA", "TDATA" };
+            static const char *names[2] = { "UserData", "TitleData" };
             char in_save[MAX_PATH], in_game[MAX_PATH];
             struct stat sa, sg;
             snprintf(in_save, sizeof(in_save), "%s/%s", s_save_dir, names[k]);
@@ -865,6 +1026,11 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     return TRUE;
 
 translate:
+    /* The same line and the same notification as the Windows translator: the
+     * unattended-run tooling reads one and times its input by the other. */
+    fprintf(stderr, "  [PATH] %s\n", xbox_path);
+    xbox_AnchorNoteOpen(xbox_path);
+    fflush(stderr);
     {
         char remainder_posix[MAX_PATH];
         snprintf(remainder_posix, sizeof(remainder_posix), "%s", remainder);
@@ -890,6 +1056,8 @@ translate:
             while (n > 1 && host_path_buf[n - 1] == '/')
                 host_path_buf[--n] = '\0';
         }
+        match_case_below(host_path_buf,
+                         strlen(base_dir) + (sub_dir ? strlen(sub_dir) : 0));
 
         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s", xbox_path, host_path_buf);
         /* As the Win32 backend does: the bridge reads back the host path

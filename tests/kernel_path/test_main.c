@@ -220,9 +220,10 @@ static void test_default_root(void)
     }
 }
 
-/* Saves only in the game dir stay there (a build before the UDATA/TDATA
- * rules put them there); the cache never does, even with a CACHE left in
- * the game dir by such a build. */
+/* Def Jam fork: saves go to <save>/UserData and <save>/TitleData even with a
+ * UDATA or TDATA in the game dir. A disc ships its own TDATA stub, so that
+ * folder says nothing about where earlier saves are, and the title's writes
+ * must not land in the user's dump. The cache never stays either. */
 static void test_legacy_saves(void)
 {
     char want[1200], dir[700];
@@ -237,12 +238,12 @@ static void test_legacy_saves(void)
     make_dir(dir);
     xbox_path_init(g_game, g_save);
 
-    snprintf(want, sizeof want, "%s" SEP "UDATA" SEP "4541005b", g_game);
+    snprintf(want, sizeof want, "%s" SEP "UserData" SEP "4541005b", g_save);
     expect("\\Device\\Harddisk0\\Partition1\\UDATA\\4541005b", want,
-           "UDATA only in the game dir stays there");
-    snprintf(want, sizeof want, "%s" SEP "TDATA" SEP "4541005b", g_game);
+           "UDATA goes to <save>/UserData though the game dir has one");
+    snprintf(want, sizeof want, "%s" SEP "TitleData" SEP "4541005b", g_save);
     expect("\\Device\\Harddisk0\\Partition1\\TDATA\\4541005b", want,
-           "TDATA only in the game dir stays there");
+           "TDATA goes to <save>/TitleData though the game dir has one");
     snprintf(want, sizeof want, "%s" SEP "TitleCache" SEP "LocalCache08.bin", g_save);
     expect("\\Device\\Harddisk0\\Partition1\\CACHE\\LocalCache08.bin", want,
            "CACHE still goes to <save>/TitleCache");
@@ -274,12 +275,12 @@ static void test_save_dir_root(void)
     expect("\\Device\\Harddisk0\\Partition1\\CACHE", want, "the bare CACHE directory too");
     expect("\\Device\\Harddisk0\\Partition1\\CACHE\\", want, "and with a trailing separator");
 
-    snprintf(want, sizeof want, "%s" SEP "UDATA" SEP "4541005b" SEP "SaveMeta.xbx", g_user);
+    snprintf(want, sizeof want, "%s" SEP "UserData" SEP "4541005b" SEP "SaveMeta.xbx", g_user);
     expect("\\Device\\Harddisk0\\Partition1\\UDATA\\4541005b\\SaveMeta.xbx", want,
-           "UDATA still goes to <user>/UDATA");
-    snprintf(want, sizeof want, "%s" SEP "TDATA" SEP "4541005b", g_user);
+           "UDATA still goes to <user>/UserData");
+    snprintf(want, sizeof want, "%s" SEP "TitleData" SEP "4541005b", g_user);
     expect("\\Device\\Harddisk0\\Partition1\\TDATA\\4541005b", want,
-           "TDATA still goes to <user>/TDATA");
+           "TDATA still goes to <user>/TitleData");
 
     /* Asset reads through E: stay in the game dir (Wreckless loads every
      * asset through z:, which it links to Partition1\). */
