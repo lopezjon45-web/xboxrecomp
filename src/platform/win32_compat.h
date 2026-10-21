@@ -44,6 +44,8 @@ extern "C" {
 #define THREAD_PRIORITY_ABOVE_NORMAL  1
 #define THREAD_PRIORITY_HIGHEST       2
 #define THREAD_PRIORITY_TIME_CRITICAL 15
+#define THREAD_PRIORITY_ERROR_RETURN  0x7FFFFFFF
+#define STILL_ACTIVE 259u
 
 #define DUPLICATE_CLOSE_SOURCE   0x00000001u
 #define DUPLICATE_SAME_ACCESS    0x00000002u
@@ -94,6 +96,16 @@ LONG InterlockedOr(volatile LONG *Destination, LONG Value);
 LONG InterlockedCompareExchange(volatile LONG *Dest, LONG Exchange, LONG Comparand);
 LONGLONG InterlockedCompareExchange64(volatile LONGLONG *Dest, LONGLONG Exchange, LONGLONG Comparand);
 PVOID InterlockedCompareExchangePointer(PVOID volatile *Dest, PVOID Exchange, PVOID Comparand);
+static inline LONGLONG InterlockedAdd64(volatile LONGLONG *Addend, LONGLONG Value)
+{ return __atomic_add_fetch(Addend, Value, __ATOMIC_SEQ_CST); }
+#define MemoryBarrier() __atomic_thread_fence(__ATOMIC_SEQ_CST)
+#if defined(__x86_64__) || defined(__i386__)
+#define YieldProcessor() __builtin_ia32_pause()
+#elif defined(__aarch64__)
+#define YieldProcessor() __asm__ volatile("yield")
+#else
+#define YieldProcessor() ((void)0)
+#endif
 
 /* ---- Critical sections ------------------------------------------------- */
 VOID InitializeCriticalSection(LPCRITICAL_SECTION cs);
@@ -218,6 +230,11 @@ SIZE_T HeapSize(HANDLE heap, DWORD flags, LPCVOID mem);
 LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD protect);
 BOOL   VirtualFree(LPVOID address, SIZE_T size, DWORD freeType);
 BOOL   VirtualProtect(LPVOID address, SIZE_T size, DWORD newProtect, PDWORD oldProtect);
+/* Hand an existing PROT_NONE reservation to VirtualAlloc/MapViewOfFileEx:
+ * a fixed-address request lying wholly on its unclaimed pages takes them
+ * over, one touching a claimed page fails as on Win32, and releasing a range
+ * restores the placeholder. Releasing the whole range ends the arena. */
+BOOL   win32_reserve_arena(void *base, size_t size);
 
 /* ---- Time ------------------------------------------------------------- */
 VOID  GetSystemTimeAsFileTime(LPFILETIME ft);
@@ -467,6 +484,7 @@ ULONG RemoveVectoredExceptionHandler(PVOID Handle);
 #define EXCEPTION_EXECUTE_HANDLER       1
 #define EXCEPTION_CONTINUE_EXECUTION  (-1)
 #define EXCEPTION_ACCESS_VIOLATION       0xC0000005u
+#define EXCEPTION_SINGLE_STEP            0x80000004u
 #define EXCEPTION_STACK_OVERFLOW         0xC00000FDu
 #define EXCEPTION_ILLEGAL_INSTRUCTION    0xC000001Du
 #define EXCEPTION_INT_DIVIDE_BY_ZERO     0xC0000094u
@@ -591,6 +609,41 @@ static inline MMRESULT waveOutWrite(HWAVEOUT h, WAVEHDR *hdr, UINT sz)
 { (void)h;(void)hdr;(void)sz; return MMSYSERR_NOERROR; }
 static inline MMRESULT waveOutReset(HWAVEOUT h) { (void)h; return MMSYSERR_NOERROR; }
 static inline MMRESULT waveOutClose(HWAVEOUT h) { (void)h; return MMSYSERR_NOERROR; }
+
+/* One guest CPU on a host that cannot pin threads (win32_compat.c): the
+ * calling thread runs guest code from here on, and only while no other
+ * thread that has joined is running. The blocking primitives above give the
+ * CPU up while they block. */
+void guest_turn_join(void);
+/* Where the title's own code is. A thread there can be preempted at any
+ * instruction; anywhere else it finishes what it is doing first. */
+void guest_turn_set_code(const void *start, size_t size);
+/* On the way from host code back to the title: hand over if asked to. */
+void guest_turn_checkpoint(void);
+/* Times the holder was interrupted to hand over, and signals sent to ask. */
+void guest_turn_counts(uint64_t *handoffs, uint64_t *kicks);
+/* The longest a thread that was due to run at once (woken, or time-critical)
+ * has waited for the guest CPU since this was last asked. */
+long guest_turn_longest_wait_ms(void);
+/* For guest_turn_probe(): the calling thread's g_xbox_kernel_caller, the guest
+ * routine it runs (host entry and context), and the runtime's ring of recent
+ * indirect-call targets (16 entries, idx the next to write). */
+void guest_turn_note_caller(const volatile uint32_t *slot);
+void guest_turn_note_start(const void *entry, uint32_t ctx);
+void guest_turn_note_icall_ring(const volatile uint32_t *ring, const volatile uint32_t *idx);
+/* A hitch probe: writes the holder of the guest CPU (its state, how long, the
+ * guest call site, recent indirect calls, native stack) to holder and every
+ * thread's native stack to all, each one JSON object; returns the number of
+ * threads seen, 0 where unsupported (only Darwin has the token). Any thread
+ * except a guest one; costs a millisecond or two. */
+int guest_turn_probe(char *holder, size_t holder_size, char *all, size_t all_size);
+/* Something else for every probe to report, under `key`: fn writes one JSON value. */
+void guest_turn_note_extra(const char *key, int (*fn)(char *out, size_t size));
+/* Around host work that may wait and changes nothing the title can see (a log
+ * line written while the log is busy): give the guest CPU up, then take it back
+ * with what the first returned. */
+int  guest_turn_leave(void);
+void guest_turn_return(int left);
 
 #ifdef __cplusplus
 }

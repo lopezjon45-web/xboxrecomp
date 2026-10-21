@@ -30,14 +30,27 @@
 
 #include <stdint.h>
 
+/* The decoder below reads and writes the register file through a context with
+ * Win32's field names. On Windows that is the vectored handler's CONTEXT.
+ * Off Windows, the trap layer on an x86-64 host (mmio_trap.c) defines
+ * MMIO_X64_CONTEXT as a structure with the same names, filled from the
+ * signal's ucontext, and includes this file for the decoder alone. */
 #if defined(_WIN32)
 #include <windows.h>
+typedef PCONTEXT mmio_ctx_t;
+#define MMIO_HAVE_X64_DECODER 1
+#elif defined(MMIO_X64_CONTEXT)
+typedef MMIO_X64_CONTEXT *mmio_ctx_t;
+#define MMIO_HAVE_X64_DECODER 1
+#endif
+
+#if defined(MMIO_HAVE_X64_DECODER)
 
 /* Service one register access. dev is passed straight back to the callbacks. */
 typedef uint64_t (*mmio_read_fn)(void *dev, uint32_t off, int size);
 typedef void     (*mmio_write_fn)(void *dev, uint32_t off, uint64_t val, int size);
 
-static inline uint64_t *mmio_ctx_reg(PCONTEXT c, int reg)
+static inline uint64_t *mmio_ctx_reg(mmio_ctx_t c, int reg)
 {
     switch (reg & 0xF) {
     case 0:  return (uint64_t *)&c->Rax;   case 1:  return (uint64_t *)&c->Rcx;
@@ -80,7 +93,7 @@ static inline uint64_t mmio_size_mask(int size)
 /* a OP b at the given width, with the flags a following jcc reads: ZF, SF, CF
  * and OF. PF and AF are left alone; nothing branches on them after a register
  * read. The logical operations clear CF and OF, as the hardware does. */
-static inline uint64_t mmio_alu(PCONTEXT ctx, int op, uint64_t a, uint64_t b,
+static inline uint64_t mmio_alu(mmio_ctx_t ctx, int op, uint64_t a, uint64_t b,
                                 int size)
 {
     uint64_t m = mmio_size_mask(size), sign = 1ULL << (size * 8 - 1), r;
@@ -112,7 +125,7 @@ static inline uint64_t mmio_alu(PCONTEXT ctx, int op, uint64_t a, uint64_t b,
 
 /* A general register at an operand width. Without a REX prefix, byte
  * registers 4-7 are AH, CH, DH and BH -- bits 15:8 of registers 0-3. */
-static inline uint64_t mmio_get_reg(PCONTEXT c, int reg, int size, int has_rex)
+static inline uint64_t mmio_get_reg(mmio_ctx_t c, int reg, int size, int has_rex)
 {
     if (size == 1 && !has_rex && reg >= 4 && reg < 8)
         return (*mmio_ctx_reg(c, reg - 4) >> 8) & 0xFF;
@@ -121,7 +134,7 @@ static inline uint64_t mmio_get_reg(PCONTEXT c, int reg, int size, int has_rex)
 
 /* Write with x86-64 width rules: a 32-bit write zeroes bits 63:32, an 8- or
  * 16-bit write merges into what was there. */
-static inline void mmio_set_reg(PCONTEXT c, int reg, uint64_t v, int size,
+static inline void mmio_set_reg(mmio_ctx_t c, int reg, uint64_t v, int size,
                                 int has_rex)
 {
     uint64_t *d;
@@ -159,7 +172,7 @@ static inline uint64_t mmio_imm(const uint8_t *p, int size, int *len)
  * once; a memory-destination form reads, then writes (CMP and TEST only
  * read). ADC/SBB, the rest of F6/F7 (NOT/NEG/MUL/DIV), string moves and
  * anything else return 0. */
-static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
+static inline int mmio_emulate(mmio_ctx_t ctx, uint32_t off, void *dev,
                                mmio_read_fn rd, mmio_write_fn wr)
 {
     const uint8_t *ip = (const uint8_t *)ctx->Rip;
@@ -290,5 +303,21 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
     }
 }
 
-#endif /* _WIN32 */
+#else /* no x86-64 decoder wanted here */
+
+/* Def Jam fork: off Windows the context is the signal handler's ucontext and
+ * the decoding belongs to the trap layer (mmio_trap.c), which knows the
+ * host's instruction set. */
+#include "mmio_trap.h"
+
+typedef mmio_trap_read_fn  mmio_read_fn;
+typedef mmio_trap_write_fn mmio_write_fn;
+
+static inline int mmio_emulate(void *ctx, uint32_t off, void *dev,
+                               mmio_read_fn rd, mmio_write_fn wr)
+{
+    return mmio_trap_emulate(ctx, off, dev, rd, wr);
+}
+
+#endif /* MMIO_HAVE_X64_DECODER */
 #endif /* MMIO_DECODE_H */
