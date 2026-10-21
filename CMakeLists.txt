@@ -29,6 +29,15 @@ add_compile_definitions(
 # Platform: Win32/NT type vocabulary + POSIX implementation of generic
 # Win32 host primitives. Carries no Xbox semantics; provides the foundation
 # the kernel HLE and the graphics/audio/input layers build on.
+# SDL3 for the host side (Def Jam fork). Off by default: the build then needs
+# no extra dependency, pads are read through XInput on Windows, and POSIX
+# hosts use SDL2 as upstream does. On, pads go through SDL3 (DualSense, Switch
+# Pro, DirectInput and XInput under one set of names; fetched and built
+# statically on Windows), and off Windows the audio device, the keyboard and
+# the window are SDL3's too, with none of the SDL2 files built: a process
+# cannot hold SDL2 and SDL3 at once.
+option(XBOXRECOMP_SDL3 "Use SDL3 for pads (and, off Windows, the whole host side)" OFF)
+
 add_subdirectory(src/settings)
 add_subdirectory(src/platform)
 

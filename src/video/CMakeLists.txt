@@ -16,6 +16,10 @@ if(WIN32)
     target_sources(xbox_video PRIVATE gpu_present.c)
     target_link_libraries(xbox_video PUBLIC mfplat mfreadwrite mfuuid mf ole32
                           d3d11 dxgi dxguid d3dcompiler)
+elseif(XBOXRECOMP_SDL3)
+    # Def Jam fork: an SDL3 host side brings its own window, and SDL2 cannot
+    # share the process with it; the framebuffer window's calls are no-ops.
+    target_sources(xbox_video PRIVATE fb_present_stub.c)
 else()
     # The framebuffer window on POSIX hosts: SDL2, on the process main thread
     # (fb_present_sdl.c), which then also pumps the events the game
