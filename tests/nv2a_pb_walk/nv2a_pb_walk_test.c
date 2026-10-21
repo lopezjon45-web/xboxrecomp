@@ -50,6 +50,9 @@ void nv2a_pb_exec_report(void) {}
 void xbox_Nv2aAckBusyBits(void) {}
 void nv2a_pb_exec_walk_begin(void) {}       /* the flip hold's vblank sample */
 
+/* The Def Jam fork's runner pumps fence releases every 256 words. */
+void xbox_Nv2aReleasePump(int at_put);
+void xbox_Nv2aReleasePump(int at_put) { (void)at_put; }
 void nv2a_pb_resync(uint32_t get_phys);
 void nv2a_pb_scan(uint32_t put_phys);
 
