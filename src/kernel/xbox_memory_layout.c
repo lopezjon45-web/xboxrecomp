@@ -4019,8 +4019,9 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      * Reserved before the kernel page below, which lives inside it.
      */
     {
-#ifndef _WIN32
+        /* Also named by the failure report below, on every host. */
         uintptr_t contig_native = XBOX_CONTIG_BASE + g_memory_offset;
+#ifndef _WIN32
         g_contig_mapping = CreateFileMappingW(
             INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
             0, (DWORD)XBOX_CONTIG_SIZE, NULL);
