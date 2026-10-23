@@ -382,6 +382,56 @@ static void __stdcall xbox_unresolved_thunk(void)
 #endif
 }
 
+/* Keep Windows from power-throttling the process when its window is in the
+ * background.
+ *
+ * Windows 11 treats a process whose windows are minimized, fully covered or
+ * otherwise invisible as a background process: it runs it under EcoQoS (on
+ * efficiency cores, at lower clocks) and stops honouring its timeBeginPeriod
+ * request, so a 1 ms wait becomes 15.6 ms. A recompiled title is a console's
+ * real-time workload in either case: the APU thread renders a 5.33 ms period
+ * at a time into a device queue that holds about 43 ms, and the title's own
+ * DirectSound service runs on the kernel timer. Throttled, the queue runs dry
+ * and the title's streams are read before they are written. With that policy
+ * applied to the process (SetProcessInformation from outside), Def Jam: Fight
+ * for NY's opening scene went from 0.02 holes a second in its mix buffer to
+ * 62-65 with the timer flag alone (322 XAudio2 underruns in 330 s, the APU
+ * 64 s behind) and to 0.04-0.5 with EcoQoS alone.
+ *
+ * Setting a ControlMask bit with its StateMask bit clear opts out of that
+ * policy for good, as games and media players do. RECOMP_POWER_THROTTLING=1
+ * leaves Windows' default. Windows before 11 does not know the timer flag, so
+ * that call is retried with EcoQoS alone; before Windows 10 1709 there is no
+ * throttling and the call fails harmlessly. */
+static void xbox_host_power_throttling(void)
+{
+#ifdef _WIN32
+    typedef struct { ULONG Version, ControlMask, StateMask; } throttle_state;
+    typedef BOOL (WINAPI *set_info_fn)(HANDLE, int, LPVOID, DWORD);
+    enum { process_power_throttling = 4 };          /* ProcessPowerThrottling */
+    enum { execution_speed = 0x1, ignore_timer_resolution = 0x4 };
+    const char *e = getenv("RECOMP_POWER_THROTTLING");
+    set_info_fn set_info = (set_info_fn)(void *)GetProcAddress(
+        GetModuleHandleA("kernel32.dll"), "SetProcessInformation");
+    throttle_state s = { 1, execution_speed | ignore_timer_resolution, 0 };
+    BOOL ok;
+
+    if ((e && *e && *e != '0') || !set_info)
+        return;
+    ok = set_info(GetCurrentProcess(), process_power_throttling, &s, sizeof s);
+    if (!ok) {
+        s.ControlMask = execution_speed;
+        ok = set_info(GetCurrentProcess(), process_power_throttling, &s, sizeof s);
+    }
+    fprintf(stderr, "[HOST] power throttling %s (RECOMP_POWER_THROTTLING=1 keeps"
+                    " Windows' default)\n",
+            !ok ? "could not be turned off"
+            : s.ControlMask & ignore_timer_resolution
+                ? "off: EcoQoS and timer resolution"
+                : "off: EcoQoS (this Windows has no timer-resolution policy)");
+#endif
+}
+
 /* ============================================================================
  * xbox_kernel_init - Initialize the kernel replacement layer
  *
@@ -397,6 +447,8 @@ void xbox_kernel_init(void)
     ULONG unresolved = 0;
     uint32_t thunk_base = 0;
     uint32_t thunk_count = 0;
+
+    xbox_host_power_throttling();
 
     /* Initialize logging */
     InitializeCriticalSection(&g_log_cs);
