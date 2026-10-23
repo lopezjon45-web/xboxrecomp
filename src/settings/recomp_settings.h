@@ -36,8 +36,9 @@ typedef enum RecompSettingType {
     RECOMP_SETTING_STRING  /* free text of at most RECOMP_SETTING_TEXT_MAX-1 characters */
 } RecompSettingType;
 
-/* Room for a string setting's text, terminator included. */
-#define RECOMP_SETTING_TEXT_MAX 96
+/* Room for a string setting's text, terminator included: enough for a list of
+ * folder names. A longer value is reported and the setting keeps its default. */
+#define RECOMP_SETTING_TEXT_MAX 1024
 
 /* The change takes effect at the next start, not while running. */
 #define RECOMP_SETTING_RESTART  0x1
@@ -78,7 +79,9 @@ void recomp_settings_register(RecompSetting *table, size_t count);
 /* Read a file over the defaults. A missing file is not an error (returns 0 and
  * leaves the defaults). Returns the number of known keys read, or -1 if the
  * file exists and cannot be read. Malformed and out-of-range values fall back
- * to the default and are reported through recomp_settings_set_log. */
+ * to the default and are reported through recomp_settings_set_log. Text too
+ * long for a string setting is reported too and the setting uses its default,
+ * but a save writes the text back as it was until the setting is changed. */
 int recomp_settings_load(const char *path);
 
 /* Write every setting's stored value, with its help line, plus any unknown

@@ -742,11 +742,21 @@ static volatile int s_ws_side_fill = 1;
 static volatile uint32_t s_ws_hud_flip = 0xFFFFFFF0u;
 static volatile int s_ws_hud_bottom;     /* 3-4 fighters: HUD blocks in the bottom corners too */
 static int s_ws_frame_3d, s_ws_frame_pic;  /* this frame drew 3D / centred a full-screen picture */
+static int s_ws_frame_wide;                /* this frame drew [wide] side slabs (ws_wide_sides) */
+static int s_ws_last_cls;                  /* the last placed batch: its class and extent */
+static float s_ws_x0, s_ws_x1, s_ws_y0, s_ws_y1, s_ws_u0, s_ws_u1, s_ws_v0, s_ws_v1;  /* u, v in texels */
+static int fetch_texcoord(uint32_t index, float out[2]);
+static uint32_t linear_row_texels(const Texture *t);
 static uint32_t s_ws_counts[6];
 
 void nv2a_ws_configure(float k, float hud_reach)
 {
     s_ws_k = (k > 0.0f && k <= 1.0f) ? k : 1.0f;
+    {
+        extern void texture_pack_set_widescreen(int on);
+        const char *e = getenv("RECOMP_WS_WIDE");
+        texture_pack_set_widescreen(s_ws_k < 1.0f && !(e && *e == '0'));
+    }
     s_ws_reach = (hud_reach > 0.0f && hud_reach <= 1.0f) ? hud_reach : 1.0f;
 }
 
@@ -768,14 +778,14 @@ void nv2a_ws_hud_heartbeat(int bottom_rows)
  * present, a frame later at most. */
 static void ws_end_frame(void)
 {
-    if (s_ws_k < 1.0f && s_ws_side_fill && s_ws_frame_pic && !s_ws_frame_3d) {
+    if (s_ws_k < 1.0f && s_ws_side_fill && s_ws_frame_pic && !s_ws_frame_3d && !s_ws_frame_wide) {
         extern void d3d8_RequestSideFill(void);
         d3d8_RequestSideFill();
     }
-    s_ws_frame_3d = s_ws_frame_pic = 0;
+    s_ws_frame_3d = s_ws_frame_pic = s_ws_frame_wide = 0;
 }
 
-static int ws_vertex(int vsh, uint32_t used, uint32_t vi, float out[4])
+static int ws_vertex(int vsh, uint32_t used, uint32_t vi, float out[4], float uv[2])
 {
     if (vsh) {
         float in[16][4];
@@ -792,11 +802,19 @@ static int ws_vertex(int vsh, uint32_t used, uint32_t vi, float out[4])
         if (!nv2a_vsh_run_ready((const float (*)[4])in, &o))
             return 0;
         out[0] = o.pos[0]; out[1] = o.pos[1]; out[2] = o.pos[2]; out[3] = o.pos[3];
+        /* oT0: normalised for swizzled textures, texels for linear ones. */
+        uv[0] = o.t0[0]; uv[1] = o.t0[1];
+        if (tex_size_from_format(s_gpu.texs[0].color)) {
+            uv[0] *= (float)s_gpu.texs[0].width;
+            uv[1] *= (float)s_gpu.texs[0].height;
+        }
         return 1;
     }
     if (!fetch_attr(&s_gpu.attr[0], vi, out))
         return 0;
     out[3] = 1.0f;
+    if (!fetch_texcoord(vi, uv))
+        uv[0] = uv[1] = 0.0f;
     return 1;
 }
 
@@ -805,10 +823,12 @@ static int ws_vertex(int vsh, uint32_t used, uint32_t vi, float out[4])
 static void ws_place_batch(int vsh, uint32_t used, const PgraphReadyVertex *ready, uint32_t n)
 {
     extern void pgraph_d3d11_set_placement(float kx, float bx);
-    float k = s_ws_k, x0 = 1e30f, x1 = -1e30f, y0 = 1e30f, y1 = -1e30f, z = 0.0f, p[4];
+    float k = s_ws_k, x0 = 1e30f, x1 = -1e30f, y0 = 1e30f, y1 = -1e30f, z = 0.0f, p[4], t[2];
+    float u0 = 1e30f, u1 = -1e30f, v0 = 1e30f, v1 = -1e30f;
     uint32_t i, cnt = ready ? n : s_gpu.idx_count;
     int cls;                               /* 0 3D, 1 centre, 2 left, 3 right, 4 stretch */
 
+    s_ws_last_cls = 0;
     if (k >= 1.0f)
         return;
     if (cnt > 512)
@@ -816,10 +836,17 @@ static void ws_place_batch(int vsh, uint32_t used, const PgraphReadyVertex *read
     cls = 1;
     for (i = 0; i < cnt; i++) {
         if (ready) {
+            int lin = s_gpu.texs[0].valid && !tex_size_from_format(s_gpu.texs[0].color);
             p[0] = ready[i].x; p[1] = ready[i].y; p[2] = ready[i].z; p[3] = ready[i].w;
-        } else if (!ws_vertex(vsh, used, s_gpu.idx[i], p)) {
+            t[0] = ready[i].u * (float)(lin ? linear_row_texels(&s_gpu.texs[0]) : s_gpu.texs[0].width);
+            t[1] = ready[i].v * (float)s_gpu.texs[0].height;
+        } else if (!ws_vertex(vsh, used, s_gpu.idx[i], p, t)) {
             break;
         }
+        if (t[0] < u0) u0 = t[0];
+        if (t[0] > u1) u1 = t[0];
+        if (t[1] < v0) v0 = t[1];
+        if (t[1] > v1) v1 = t[1];
         if (i == 0)
             z = p[2];
         if (i < 3 && (fabsf(p[3] - 1.0f) > 1e-4f || fabsf(p[2] - z) > 1e-3f * (fabsf(z) + 1.0f))) {
@@ -831,7 +858,11 @@ static void ws_place_batch(int vsh, uint32_t used, const PgraphReadyVertex *read
         if (p[1] < y0) y0 = p[1];
         if (p[1] > y1) y1 = p[1];
     }
-    if (cls && x0 <= 2.0f && x1 >= 638.0f && y0 <= 2.0f && y1 >= 478.0f) {
+    if (cls && x0 <= 8.0f && x1 >= 632.0f && s_gpu.texs[0].valid && pgraph_d3d11_stage0_stretch()) {
+        /* A pack's [wide] stretch overlay (a vignette over 4:3 art) spanning the 4:3 width covers
+         * the whole picture, also while it is animated vertically off full screen. */
+        cls = 4;
+    } else if (cls && x0 <= 2.0f && x1 >= 638.0f && y0 <= 2.0f && y1 >= 478.0f) {
         /* Full screen: a fill stretches, a picture (movie, poster) is centred. */
         int tex = s_gpu.texs[0].valid && s_gpu.texs[0].width && s_gpu.texs[0].height;
         uint32_t big = tex ? (s_gpu.texs[0].width > s_gpu.texs[0].height ? s_gpu.texs[0].width
@@ -839,6 +870,19 @@ static void ws_place_batch(int vsh, uint32_t used, const PgraphReadyVertex *read
         cls = (!tex || big <= 128) ? 4 : 1;
         if (cls == 1)
             s_ws_frame_pic = 1;
+        {
+            static int trace = -1;
+            static unsigned told;
+            if (trace < 0)
+                trace = getenv("RECOMP_WS_WIDE_TRACE") != NULL;
+            if (trace && cls == 1 && told++ < 400)
+                fprintf(stderr, "[WS-PIC] centred full-screen picture %.12s %ux%u x %.1f..%.1f y %.1f..%.1f%c",
+                        pgraph_d3d11_stage0_id(), s_gpu.texs[0].width, s_gpu.texs[0].height, x0, x1, y0, y1, 10);
+        }
+    } else if (cls && x0 <= 12.0f && x1 >= 628.0f && !s_gpu.texs[0].valid) {
+        /* A full-width untextured band (a letterbox or a bar behind text): a fill, so it
+         * stretches like the full-screen ones instead of stopping at the 4:3 edges. */
+        cls = 4;
     } else if (cls && (uint32_t)(s_gpu.flips - s_ws_hud_flip) <= 30u
                && (y1 <= 130.0f || (s_ws_hud_bottom && y0 >= 350.0f))) {
         /* Only the HUD's own strips: the top one, and the bottom one with 3-4
@@ -848,7 +892,39 @@ static void ws_place_batch(int vsh, uint32_t used, const PgraphReadyVertex *read
         else if (x0 >= 340.0f)
             cls = 3;
     }
+    {
+        static int trace = -1;
+        static unsigned told;
+        if (trace < 0)
+            trace = getenv("RECOMP_WS_WIDE_TRACE") != NULL;
+        /* Centred 2D batches at least a quarter of the picture in size or spanning its width, within the title's own
+         * 640x480 (render-target copies are drawn in surface pixels and are left out). */
+        static char seen[128][13];
+        static unsigned seen_n, seen_hits[128];
+        if (trace && cls == 1 && ((x1 - x0) * (y1 - y0) >= 640.0f * 480.0f / 4.0f || x1 - x0 >= 400.0f
+                                  || (y0 <= 4.0f && y1 <= 100.0f && (x0 <= 4.0f || x1 >= 636.0f)))
+            && !(s_gpu.texs[0].width == 1280 && s_gpu.texs[0].height == 480)
+            && told++ < 20000) {
+            const char *sid = s_gpu.texs[0].valid ? pgraph_d3d11_stage0_id() : "untextured";
+            unsigned q;
+            for (q = 0; q < seen_n && strncmp(seen[q], sid, 12); q++)
+                ;
+            if (q == seen_n && seen_n < 128)
+                snprintf(seen[seen_n++], 13, "%.12s", sid);
+            if (q < 128 && seen_hits[q]++ >= 2)
+                sid = NULL;
+            if (sid)
+            fprintf(stderr, "[WS-WIDEBATCH] %.12s %ux%u x %.1f..%.1f y %.1f..%.1f%c", s_gpu.texs[0].valid ? pgraph_d3d11_stage0_id() : "untextured",
+                    s_gpu.texs[0].width, s_gpu.texs[0].height, x0, x1, y0, y1, 10);
+        }
+    }
     s_ws_counts[cls]++;
+    s_ws_last_cls = cls;
+    s_ws_x0 = x0;
+    s_ws_x1 = x1;
+    s_ws_y0 = y0;
+    s_ws_y1 = y1;
+    s_ws_u0 = u0; s_ws_u1 = u1; s_ws_v0 = v0; s_ws_v1 = v1;
     if (cls == 0)
         s_ws_frame_3d = 1;
     {
@@ -3074,6 +3150,73 @@ static void bind_texture_ready(const Texture *t)
     }
 }
 
+/* Widescreen side extensions: [wide] slabs in a texture pack (texture_pack.c). A centred 2D
+ * batch whose stage-0 source has slabs is drawn again once per slab -- the same vertices,
+ * colours, combiners and blend, shifted dt source texels sideways and clipped to the side areas
+ * beyond the 4:3 picture -- so a menu background's extension moves, scales and fades with the
+ * layer it extends. Assumes an unrotated layer. RECOMP_WS_WIDE=0 turns it off;
+ * RECOMP_WS_WIDE_TRACE=1 logs the geometry it measured. */
+static void ws_wide_sides(int gpu, const float *gv, uint32_t gnv, uint32_t used,
+                          const uint16_t *gtri, uint32_t gnt, float gsu, float gsv,
+                          const PgraphReadyVertex *ready, uint32_t n)
+{
+    static int off = -1, trace = -1;
+    static unsigned traced;
+    int dt[16], count, i, drew = 0;
+    float k = s_ws_k, u0 = 1e30f, u1 = -1e30f, v0 = 1e30f, v1 = -1e30f, per;
+    float left = 320.0f * (1.0f - k), right = 320.0f * (1.0f + k);
+    uint32_t w = s_gpu.texs[0].width;
+
+    if (off < 0) {
+        const char *e = getenv("RECOMP_WS_WIDE");
+        off = e && *e == '0';
+        trace = getenv("RECOMP_WS_WIDE_TRACE") != NULL;
+    }
+    if (off || k >= 1.0f || s_ws_last_cls != 1 || !s_gpu.texs[0].valid || !w)
+        return;
+    count = pgraph_d3d11_wide_slabs(dt, 16);
+    if (count <= 0)
+        return;
+    /* Title pixels per source texel, from the batch's extent and its stage-0 coordinates. */
+    u0 = s_ws_u0; u1 = s_ws_u1; v0 = s_ws_v0; v1 = s_ws_v1;
+    if (!(u1 > u0 + 0.5f)) {
+        u0 = 0.0f;
+        u1 = (float)w;
+    }
+    per = (s_ws_x1 - s_ws_x0) / (u1 - u0);
+    for (i = 0; i < count; i++) {
+        float d = (float)dt[i] * per;
+        float p0 = (s_ws_x0 + d) * k + left, p1 = (s_ws_x1 + d) * k + left;
+        int side;
+        for (side = 0; side < 2; side++) {
+            float c0 = side ? (p0 > right ? p0 : right) : (p0 > 0.0f ? p0 : 0.0f);
+            float c1 = side ? (p1 < 640.0f ? p1 : 640.0f) : (p1 < left ? p1 : left);
+            uint32_t cx, cw;
+            if (c1 - c0 < 0.25f)
+                continue;
+            if (!pgraph_d3d11_wide_bind((unsigned)i))
+                break;
+            cx = (uint32_t)c0;
+            cw = (uint32_t)(c1 + 0.999f) - cx;
+            pgraph_d3d11_set_placement(k, d * k / 320.0f);
+            pgraph_d3d11_set_surface_clip(cx, s_gpu.clip_y, cw ? cw : 1, s_gpu.clip_h);
+            if (gpu)
+                (void)pgraph_d3d11_draw_program(gv, gnv, used, gtri, gnt, gsu, gsv);
+            else
+                pgraph_d3d11_draw_ready(s_gpu.prim, ready, n);
+            drew++;
+        }
+    }
+    pgraph_d3d11_wide_end();
+    pgraph_d3d11_set_placement(k, 0.0f);
+    if (drew)
+        s_ws_frame_wide = 1;
+    if (trace && (traced++ < 64 || (s_gpu.flips % 300u) == 0u))
+        fprintf(stderr, "[WS-WIDE] %.12s %ux%u x %.2f..%.2f y %.2f..%.2f u %.2f..%.2f v %.2f..%.2f (%.4f px/texel) k %.4f: %d slabs, %d draws%c",
+                pgraph_d3d11_stage0_id(), w, s_gpu.texs[0].height, s_ws_x0, s_ws_x1, s_ws_y0, s_ws_y1,
+                u0, u1, v0, v1, per, k, count, drew, 10);
+}
+
 /* Bind the canonical stages without mutating another stage's state. */
 static void bind_extra_stages(int with_coords)
 {
@@ -3628,6 +3771,8 @@ static void draw_primitive(void)
                 }
                 else if (n >= 3)
                     pgraph_d3d11_draw_ready(s_gpu.prim, ready, n);
+                if (n >= 3)
+                    ws_wide_sides(gpu, gv, gnv, used, gtri, gnt, gsu, gsv, ready, n);
             }
             {
                 /* Which attribute slots the title actually populated. Texture

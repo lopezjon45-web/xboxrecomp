@@ -17,6 +17,17 @@ int texture_pack_hash(const RecompTextureSource *source, char out[65]);
 int texture_pack_bind(IDirect3DDevice8 *device, unsigned stage,
                       const RecompTextureSource *source, RecompTextureSample sample, void *user);
 void texture_pack_shutdown(IDirect3DDevice8 *device);
+/* Widescreen side slabs ([wide] in a manifest) of the source texture_pack_bind last saw on
+ * `stage`: their shifts in source texels (up to max), 0 when it has none. wide_bind sets slab
+ * `slab` on the stage; 0 while it is still loading or was rejected. */
+int texture_pack_wide_slabs(unsigned stage, int *dt, unsigned max);
+int texture_pack_wide_bind(IDirect3DDevice8 *device, unsigned stage, unsigned slab);
+/* With a widescreen picture, an anchor's inner: slab is bound in place of its replacement. */
+void texture_pack_set_widescreen(int on);
+/* 1 when the source last bound on `stage` is a [wide] stretch overlay. */
+int texture_pack_wide_stretch(unsigned stage);
+/* The source id texture_pack_bind last saw on a stage ("" when none), for diagnostics. */
+const char *texture_pack_stage_id(unsigned stage);
 /* Replacements resident now and the budget they share (cache_mb), in bytes; 0 without a pack. */
 void texture_pack_stats(uint64_t *resident_bytes, uint64_t *budget_bytes);
 #endif
