@@ -75,6 +75,11 @@ static int pb_walk_enabled(void)
  * (about 40% of its thread in X-Men Legends' levels). */
 static uint16_t s_seen_slot[8][0x2000 / 4];
 
+/* The inventory is printed only for RECOMP_PB_SCAN; counting every parameter
+ * word of every frame for nobody was several percent of the executor thread. */
+static int s_survey = -1;
+#define SURVEY_ON() (s_survey > 0 || (s_survey < 0 && (s_survey = getenv("RECOMP_PB_SCAN") != NULL)))
+
 static void note(uint32_t subch, uint32_t method)
 {
     uint16_t *slot = &s_seen_slot[subch & 7][(method & 0x1FFC) / 4];
@@ -605,7 +610,8 @@ static uint32_t pb_segment(uint32_t va, uint32_t end_va, uint32_t *jump_va)
             s_pend.count = 0;                   /* the walk moved elsewhere */
         } else {
             while (s_pend.count && va != end_va) {
-                note(s_pend.subch, s_pend.method);
+                if (SURVEY_ON())
+                    note(s_pend.subch, s_pend.method);
                 if (s_exec_enabled)
                     nv2a_pb_exec_method(s_pend.subch, s_pend.method, nv2a_pb_read(va));
                 if (!s_pend.noninc)
@@ -692,7 +698,8 @@ static uint32_t pb_segment(uint32_t va, uint32_t end_va, uint32_t *jump_va)
             uint32_t i;
             for (i = 0; i < count && va != end_va; i++) {
                 uint32_t m = noninc ? method : method + i * 4;
-                note(subch, m);
+                if (SURVEY_ON())
+                    note(subch, m);
                 /* Same walk, two consumers: the survey counts, the executor
                  * acts. Keeping them on one decode means they can never
                  * disagree about what the stream said. */
