@@ -126,6 +126,121 @@ const DWORD *d3d8_GetPalette(DWORD stage)
 static const IDirect3DDevice8Vtbl g_device_vtbl;
 static void up_ring_shutdown(void);
 
+/* RECOMP_PRESENT_PACING=1: the GPU's view of each frame, from timestamp
+ * queries. A frame runs from just after one present to just before the next;
+ * each is read back a few frames later. Every 2 s: how long the GPU was busy
+ * with a frame, how long it sat idle before starting one, and how evenly frames
+ * finished on the GPU's clock. With variable refresh a frame is shown when the
+ * GPU finishes it, so uneven finishes are uneven motion. phase 0 = frame start,
+ * 1 = frame end (before Present). */
+#define GPU_RING 8
+static void d3d8_gpu_trace(int phase)
+{
+    static int on = -1;
+    static ID3D11Query *disjoint[GPU_RING], *t_begin[GPU_RING], *t_end[GPU_RING];
+    static int open[GPU_RING];
+    static unsigned cur, frames;
+    static UINT64 last_end;
+    static double busy[256], idle[256], gap[256], sorted[256];
+    static unsigned n;
+    static LARGE_INTEGER window, freq;
+    ID3D11Device *dev = g_device_state.d3d11_device;
+    ID3D11DeviceContext *ctx = g_device_state.d3d11_context;
+    unsigned i;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_PRESENT_PACING");
+        on = e && *e == '1' && dev;
+        for (i = 0; on && i < GPU_RING; i++) {
+            D3D11_QUERY_DESC qd;
+            memset(&qd, 0, sizeof qd);
+            qd.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
+            if (FAILED(ID3D11Device_CreateQuery(dev, &qd, &disjoint[i]))) on = 0;
+            qd.Query = D3D11_QUERY_TIMESTAMP;
+            if (FAILED(ID3D11Device_CreateQuery(dev, &qd, &t_begin[i])) ||
+                FAILED(ID3D11Device_CreateQuery(dev, &qd, &t_end[i]))) on = 0;
+        }
+        QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&window);
+    }
+    if (!on || !ctx)
+        return;
+    if (phase == 0) {
+        unsigned slot = cur % GPU_RING;
+        if (open[slot])     /* not read back yet: skip this frame */
+            return;
+        ID3D11DeviceContext_Begin(ctx, (ID3D11Asynchronous *)disjoint[slot]);
+        ID3D11DeviceContext_End(ctx, (ID3D11Asynchronous *)t_begin[slot]);
+        open[slot] = 1;
+        return;
+    }
+    {
+        unsigned slot = cur % GPU_RING;
+        if (open[slot] == 1) {
+            ID3D11DeviceContext_End(ctx, (ID3D11Asynchronous *)t_end[slot]);
+            ID3D11DeviceContext_End(ctx, (ID3D11Asynchronous *)disjoint[slot]);
+            open[slot] = 2;
+            cur++;
+        }
+    }
+    /* Read back every finished frame, oldest first. */
+    for (i = 0; i < GPU_RING; i++) {
+        unsigned slot = (cur + i) % GPU_RING;
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj;
+        UINT64 b, e;
+        if (open[slot] != 2)
+            continue;
+        if (ID3D11DeviceContext_GetData(ctx, (ID3D11Asynchronous *)disjoint[slot], &dj, sizeof dj,
+                                        D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
+            break;
+        if (ID3D11DeviceContext_GetData(ctx, (ID3D11Asynchronous *)t_begin[slot], &b, sizeof b,
+                                        D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK ||
+            ID3D11DeviceContext_GetData(ctx, (ID3D11Asynchronous *)t_end[slot], &e, sizeof e,
+                                        D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
+            break;
+        open[slot] = 0;
+        frames++;
+        if (!dj.Disjoint && dj.Frequency && n < 256) {
+            double ms = 1000.0 / (double)dj.Frequency;
+            busy[n] = (double)(e - b) * ms;
+            idle[n] = last_end && b > last_end ? (double)(b - last_end) * ms : 0.0;
+            gap[n] = last_end ? (double)(e - last_end) * ms : 0.0;
+            if (last_end) n++;
+        }
+        last_end = dj.Disjoint ? 0 : e;
+    }
+    {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        if (now.QuadPart - window.QuadPart >= 2 * freq.QuadPart) {
+            if (n) {
+                double *sets[3] = { busy, idle, gap };
+                double p[3][4];
+                unsigned k, j, off = 0;
+                for (k = 0; k < 3; k++) {
+                    for (i = 0; i < n; i++) {
+                        for (j = i; j > 0 && sorted[j - 1] > sets[k][i]; j--) sorted[j] = sorted[j - 1];
+                        sorted[j] = sets[k][i];
+                    }
+                    p[k][0] = sorted[0]; p[k][1] = sorted[n / 2];
+                    p[k][2] = sorted[n * 9 / 10]; p[k][3] = sorted[n - 1];
+                    if (k == 2)
+                        for (i = 0; i < n; i++)
+                            if (gap[i] < p[2][1] - 2.0 || gap[i] > p[2][1] + 2.0) off++;
+                }
+                fprintf(stderr, "[GPUTIME] %u frames: busy %.2f / %.2f / %.2f / %.2f ms, idle before %.2f / %.2f / %.2f / %.2f ms, "
+                                "finish-to-finish %.2f / %.2f / %.2f / %.2f ms (min/median/90%%/max), %u more than 2 ms off\n",
+                        n, p[0][0], p[0][1], p[0][2], p[0][3], p[1][0], p[1][1], p[1][2], p[1][3],
+                        p[2][0], p[2][1], p[2][2], p[2][3], off);
+            } else {
+                fprintf(stderr, "[GPUTIME] no frames read back (%u)\n", frames);
+            }
+            n = 0;
+            window = now;
+        }
+    }
+}
+
 static HRESULT d3d8_present(void)
 {
     HRESULT hr = d3d8_gamma_begin(g_device_state.default_rtv);
@@ -155,8 +270,18 @@ static HRESULT d3d8_present(void)
         hr = d3d8_present_blit();
         if (FAILED(hr))
             fprintf(stderr, "D3D8: Scaled presentation failed: 0x%08lX\n", hr);
-        hr = IDXGISwapChain_Present(g_device_state.swap_chain, (UINT)vsync, 0);
+        d3d8_gpu_trace(1);
+        {
+            LARGE_INTEGER t0, t1, f;
+            QueryPerformanceCounter(&t0);
+            hr = IDXGISwapChain_Present(g_device_state.swap_chain, (UINT)vsync, 0);
+            QueryPerformanceCounter(&t1);
+            QueryPerformanceFrequency(&f);
+            d3d8_present_note_block((double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart);
+        }
         d3d8_present_trace_pacing();
+        d3d8_present_trace_display(g_device_state.swap_chain);
+        d3d8_gpu_trace(0);
     }
     d3d8_gamma_end(g_device_state.default_rtv);
     return hr;
