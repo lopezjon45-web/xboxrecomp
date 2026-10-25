@@ -256,18 +256,20 @@ static struct {
  * Monitor - Audio output (XAudio2 primary, waveOut fallback)
  * ============================================================ */
 
-#if defined(_WIN32)
+#if defined(_WIN32) && !XBOXRECOMP_UWP
 #include <mmsystem.h>
 #pragma comment(lib, "winmm.lib")
 #endif
 /* On Linux, waveOut* are inert stubs from win32_compat.h: the APU's
- * waveOut fallback path stays inactive and never produces audio. */
+ * waveOut fallback path stays inactive and never produces audio. The app
+ * partition has no waveOut at all: XAudio2 is its only output. */
 
 /* Ring of waveOut buffers for double-buffering */
 #define WAVEOUT_NUM_BUFS 4
 #define WAVEOUT_BUF_SAMPLES 2048  /* ~42.7ms at 48kHz, matches 8-frame delivery rate */
 #define MIXER_FRAME_SAMPLES 256  /* Internal mixing frame size (matches frame_buf) */
 
+#if !XBOXRECOMP_UWP
 typedef struct {
     HWAVEOUT hwo;
     WAVEHDR  hdrs[WAVEOUT_NUM_BUFS];
@@ -278,6 +280,7 @@ typedef struct {
 } WaveOutState;
 
 static WaveOutState g_waveout = { 0 };
+#endif
 
 void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
 {
@@ -291,6 +294,9 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
         fprintf(stderr, "[APU] Using XAudio2 audio backend\n");
         return;
     }
+#if XBOXRECOMP_UWP
+    fprintf(stderr, "[APU] XAudio2 unavailable; no audio output\n");
+#else
     fprintf(stderr, "[APU] XAudio2 unavailable, falling back to waveOut\n");
 
     WAVEFORMATEX wfx = { 0 };
@@ -323,6 +329,7 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
 
     fprintf(stderr, "[APU] waveOut audio output initialized (48kHz stereo 16-bit, %d buffers)\n",
             WAVEOUT_NUM_BUFS);
+#endif
 }
 
 void mcpx_apu_monitor_finalize(MCPXAPUState *d)
@@ -332,6 +339,7 @@ void mcpx_apu_monitor_finalize(MCPXAPUState *d)
         xa2_shutdown();
         return;
     }
+#if !XBOXRECOMP_UWP
     if (!g_waveout.initialized) return;
 
     waveOutReset(g_waveout.hwo);
@@ -342,6 +350,7 @@ void mcpx_apu_monitor_finalize(MCPXAPUState *d)
     g_waveout.initialized = false;
     fprintf(stderr, "[APU] waveOut audio output shut down (%d frames written)\n",
             g_waveout.frames_written);
+#endif
 }
 
 extern unsigned g_apu_trap_stalls, g_apu_trap_expired;
@@ -456,6 +465,7 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         return;
     }
 
+#if !XBOXRECOMP_UWP
     if (!g_waveout.initialized) return;
 
     int idx = g_waveout.next_buf;
@@ -508,6 +518,7 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
 
     g_waveout.next_buf = (idx + 1) % WAVEOUT_NUM_BUFS;
     g_waveout.frames_written++;
+#endif
 }
 
 /* ============================================================

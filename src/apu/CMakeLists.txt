@@ -33,7 +33,10 @@ if(MSVC)
     )
 endif()
 
-if(WIN32)
+if(WIN32 AND XBOXRECOMP_UWP)
+    # XAudio2 2.9 (xaudio2.lib) is the only output; waveOut is not built.
+    target_link_libraries(xbox_apu PRIVATE platform xaudio2)
+elseif(WIN32)
     # xaudio2_8 for XAudio2Create, which apu_xaudio2.c calls directly.
     # It was missing: nothing had ever referenced this library from a linked
     # target, so the archive was built and never pulled in, and the first
