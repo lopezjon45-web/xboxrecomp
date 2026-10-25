@@ -66,6 +66,9 @@ void d3d8_present_trace_pacing(void);     /* RECOMP_PRESENT_PACING=1 */
 HRESULT d3d8_present_create_game_target(UINT width, UINT height, ID3D11RenderTargetView **rtv);
 ID3D11Texture2D *d3d8_present_game_texture(void);
 HRESULT d3d8_present_blit(void);
+/* Present what the blit drew, with this sync interval: the swap chain's
+ * Present on desktop, the shell's frame on the app partition. */
+HRESULT d3d8_present_swap(int sync_interval);
 void d3d8_present_shutdown(void);
 
 /* Current render state array accessor */

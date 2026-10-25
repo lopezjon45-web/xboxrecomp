@@ -6,6 +6,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if XBOXRECOMP_UWP
+#include "xbox/xbox_shell.h"
+#endif
 
 static BOOL g_scaling;
 static UINT g_scale_override;
@@ -22,6 +25,12 @@ static ID3D11ShaderResourceView *g_game_srv;
 static ID3D11RenderTargetView *g_window_rtv;
 static UINT g_window_width, g_window_height;
 static ID3D11DeviceContext *g_deferred;
+#if XBOXRECOMP_UWP
+/* This frame's window target, borrowed from the shell between frame_begin and
+ * frame_present. g_window_rtv points into it while acquired and is NULL
+ * otherwise, so d3d8_present_shutdown never Releases a borrowed view. */
+static XboxShellFrame g_frame;
+#endif
 static ID3D11VertexShader *g_vs;
 static ID3D11PixelShader *g_ps;
 static ID3D11SamplerState *g_sampler_linear, *g_sampler_nearest;
@@ -68,6 +77,9 @@ void d3d8_present_canvas_aspect(UINT *num, UINT *den)
  * be dragged to another monitor and the mode can change. */
 static unsigned present_refresh_hz(void)
 {
+#if XBOXRECOMP_UWP
+    return xbox_shell_display_hz();
+#else
     static unsigned hz, countdown;
     IDXGIOutput *output = NULL;
     if (countdown) { countdown--; return hz; }
@@ -83,6 +95,7 @@ static unsigned present_refresh_hz(void)
         IDXGIOutput_Release(output);
     }
     return hz;
+#endif
 }
 
 int d3d8_present_sync_interval(void)
@@ -94,7 +107,13 @@ int d3d8_present_sync_interval(void)
 
 int d3d8_present_display_paced(void)
 {
+#if XBOXRECOMP_UWP
+    /* Asked after the present, when the frame is already given back; a frame
+     * that has begun once leaves its size behind. */
+    return g_scaling && g_frame.width && d3d8_present_sync_interval() > 0;
+#else
     return g_scaling && g_window_rtv && d3d8_present_sync_interval() > 0;
+#endif
 }
 
 /* RECOMP_PRESENT_PACING=1: every two seconds, how evenly frames reached the
@@ -184,6 +203,7 @@ HRESULT d3d8_present_create_game_target(UINT width, UINT height, ID3D11RenderTar
         d3d8_present_shutdown();
         return hr;
     }
+#if !XBOXRECOMP_UWP
     /* Alt+Enter is the host's to handle: DXGI's own handler would switch this
      * swap chain to exclusive full screen behind the host's back. */
     {
@@ -194,6 +214,7 @@ HRESULT d3d8_present_create_game_target(UINT width, UINT height, ID3D11RenderTar
             IDXGIFactory_Release(factory);
         }
     }
+#endif
     return S_OK;
 }
 
@@ -254,6 +275,16 @@ static HRESULT present_create_pipeline(void)
  * S_FALSE while there is nothing to draw into (a minimised window). */
 static HRESULT present_follow_window(void)
 {
+#if XBOXRECOMP_UWP
+    /* The shell's back buffer changes every present and its swap chain never
+     * resizes, so there is nothing to cache: acquire this frame's target. */
+    if (!xbox_shell_frame_begin(&g_frame))
+        return S_FALSE;
+    g_window_rtv = g_frame.rtv;
+    g_window_width = g_frame.width;
+    g_window_height = g_frame.height;
+    return S_OK;
+#else
     IDXGISwapChain *swap_chain = d3d8_GetSwapChain();
     ID3D11Texture2D *buffer = NULL;
     RECT client;
@@ -292,6 +323,20 @@ static HRESULT present_follow_window(void)
                                              NULL, &g_window_rtv);
     ID3D11Texture2D_Release(buffer);
     return hr;
+#endif
+}
+
+HRESULT d3d8_present_swap(int sync_interval)
+{
+#if XBOXRECOMP_UWP
+    /* Releases the wrapped buffer only if the blit acquired it, then flushes
+     * and presents on the shell's queue. The view was borrowed: forget it. */
+    HRESULT hr = xbox_shell_frame_present(&g_frame, sync_interval);
+    g_window_rtv = NULL;
+    return hr;
+#else
+    return IDXGISwapChain_Present(d3d8_GetSwapChain(), (UINT)sync_interval, 0);
+#endif
 }
 
 static D3D8PresentOverlay g_overlay;

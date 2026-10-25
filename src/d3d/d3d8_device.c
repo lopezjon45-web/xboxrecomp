@@ -20,6 +20,9 @@
 #include "d3d8_readback.h"
 #include <stdio.h>
 #include <string.h>
+#if XBOXRECOMP_UWP
+#include "xbox/xbox_shell.h"
+#endif
 
 /* ================================================================
  * Internal device state
@@ -154,7 +157,7 @@ static HRESULT d3d8_present(void)
         hr = d3d8_present_blit();
         if (FAILED(hr))
             fprintf(stderr, "D3D8: Scaled presentation failed: 0x%08lX\n", hr);
-        hr = IDXGISwapChain_Present(g_device_state.swap_chain, (UINT)vsync, 0);
+        hr = d3d8_present_swap(vsync);
         d3d8_present_trace_pacing();
     }
     d3d8_gamma_end(g_device_state.default_rtv);
@@ -166,6 +169,7 @@ static HRESULT d3d8_present(void)
  * ================================================================ */
 void d3d8_PresentFrame(void)
 {
+#if !XBOXRECOMP_UWP
     /* Pump Windows messages */
     MSG msg;
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
@@ -173,6 +177,7 @@ void d3d8_PresentFrame(void)
         TranslateMessage(&msg);
         DispatchMessageA(&msg);
     }
+#endif
 
     /* Present the backbuffer (VSync = 1) */
     if (g_device_state.swap_chain)
@@ -277,12 +282,14 @@ static HRESULT d3d11_create_device_and_swap_chain(
     D3D8DeviceState *state,
     D3DPRESENT_PARAMETERS *pp)
 {
+#if !XBOXRECOMP_UWP
     DXGI_SWAP_CHAIN_DESC scd;
     D3D_FEATURE_LEVEL feature_level;
     UINT create_flags = 0;
+#endif
     HRESULT hr;
 
-#ifdef _DEBUG
+#if defined(_DEBUG) && !XBOXRECOMP_UWP
     create_flags |= D3D11_CREATE_DEVICE_DEBUG;
 #endif
 
@@ -303,6 +310,17 @@ static HRESULT d3d11_create_device_and_swap_chain(
     }
     state->logical_width = pp->BackBufferWidth ? pp->BackBufferWidth : 640;
     state->logical_height = pp->BackBufferHeight ? pp->BackBufferHeight : 480;
+#if XBOXRECOMP_UWP
+    /* The shell made the device before the game thread existed; the window
+     * target is d3d8_present.c's business. pp->hDeviceWindow is ignored. */
+    hr = xbox_shell_gfx_device(&state->d3d11_device, &state->d3d11_context);
+    if (FAILED(hr)) {
+        fprintf(stderr, "D3D8: the shell has no device: 0x%08lX\n", hr);
+        return hr;
+    }
+    state->swap_chain = NULL;
+    state->hwnd = NULL;
+#else
     memset(&scd, 0, sizeof(scd));
     scd.BufferCount = pp->BackBufferCount ? pp->BackBufferCount : 1;
     scd.BufferDesc.Width = state->logical_width * state->render_scale;
@@ -359,13 +377,14 @@ static HRESULT d3d11_create_device_and_swap_chain(
         return hr;
     }
 
+    state->hwnd = pp->hDeviceWindow;
+#endif
+
 #ifdef _DEBUG
     if (SUCCEEDED(ID3D11Device_QueryInterface(state->d3d11_device, &IID_ID3D11InfoQueue,
                                               (void **)&g_info_queue)))
         AddVectoredExceptionHandler(1, d3d11_debug_break_handler);
 #endif
-
-    state->hwnd = pp->hDeviceWindow;
     {
         /* A widescreen canvas widens only the title's own target (scaling mode);
          * the title's coordinates keep their range and spread over it. */
@@ -397,6 +416,7 @@ static HRESULT d3d11_create_render_targets(D3D8DeviceState *state)
         if (FAILED(hr)) return hr;
     } else {
         /* Create render target view from swap chain back buffer */
+        if (!state->swap_chain) return E_FAIL;
         hr = IDXGISwapChain_GetBuffer(state->swap_chain, 0,
                                        &IID_ID3D11Texture2D,
                                        (void **)&back_buffer);
@@ -598,6 +618,7 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *self, const RECT *src, co
         last_tick = now;
     }
 
+#if !XBOXRECOMP_UWP
     /* Pump Windows messages: the game's internal main loop drives rendering,
      * so our external message pump never runs. Process messages here to keep
      * the window responsive and handle input. */
@@ -609,6 +630,7 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *self, const RECT *src, co
         TranslateMessage(&msg);
         DispatchMessageA(&msg);
     }
+#endif
 
     return d3d8_present();
 }
@@ -626,6 +648,8 @@ static HRESULT __stdcall dev_GetBackBuffer(IDirect3DDevice8 *self, INT iBackBuff
         back_buffer = d3d8_present_game_texture();
         ID3D11Texture2D_AddRef(back_buffer);
         hr = S_OK;
+    } else if (!g_device_state.swap_chain) {
+        hr = E_FAIL;
     } else {
         hr = IDXGISwapChain_GetBuffer(g_device_state.swap_chain, 0,
                                        &IID_ID3D11Texture2D,
@@ -1675,6 +1699,7 @@ static HRESULT __stdcall dev_Swap(IDirect3DDevice8 *self, DWORD Flags)
 {
     (void)self; (void)Flags;
 
+#if !XBOXRECOMP_UWP
     /* Pump Windows messages (same as dev_Present) */
     MSG msg;
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
@@ -1684,6 +1709,7 @@ static HRESULT __stdcall dev_Swap(IDirect3DDevice8 *self, DWORD Flags)
         TranslateMessage(&msg);
         DispatchMessageA(&msg);
     }
+#endif
 
     return d3d8_present();
 }

@@ -18,9 +18,12 @@ if(WIN32)
     )
     target_link_libraries(xbox_d3d8 PUBLIC platform d3d11 dxgi dxguid d3dcompiler)
 
-    # Offline smoke test for the pure format layer (no D3D11 device needed).
-    add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d8_smoke
-                     ${CMAKE_CURRENT_BINARY_DIR}/d3d8_smoke)
+    if(NOT XBOXRECOMP_UWP)
+        # Offline smoke test for the pure format layer (no D3D11 device needed).
+        # Its gamma test opens a window, which the app partition has none of.
+        add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d8_smoke
+                         ${CMAKE_CURRENT_BINARY_DIR}/d3d8_smoke)
+    endif()
 else()
     # Off Windows the device is Vulkan (MoltenVK on macOS) when the Vulkan
     # loader and shaderc are installed, and the older OpenGL one otherwise.
