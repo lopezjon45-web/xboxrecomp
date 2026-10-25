@@ -311,6 +311,17 @@ void d3d8_PresentFrame(void)
 IDirect3DDevice8    *d3d8_GetDevice(void) { return &g_device; }
 ID3D11Device        *d3d8_GetD3D11Device(void) { return g_device_state.d3d11_device; }
 ID3D11DeviceContext *d3d8_GetD3D11Context(void) { return g_device_state.d3d11_context; }
+
+/* Send the commands recorded so far to the GPU without waiting for them.
+ * The push-buffer executor calls this before it sleeps for the title's flip:
+ * otherwise the frame's work sits in the driver's buffer through the sleep
+ * and only starts at Present, and the frame then finishes -- and, on a
+ * variable-refresh display, is shown -- a varying time later. */
+void d3d8_FlushGPU(void)
+{
+    if (g_device_state.d3d11_context)
+        ID3D11DeviceContext_Flush(g_device_state.d3d11_context);
+}
 IDXGISwapChain      *d3d8_GetSwapChain(void) { return g_device_state.swap_chain; }
 ID3D11RenderTargetView *d3d8_GetDefaultRTV(void) { return g_device_state.default_rtv; }
 HWND                 d3d8_GetHWND(void) { return g_device_state.hwnd; }

@@ -4490,6 +4490,24 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * the title's frame clock with it -- an optimised build ran a fight's
          * round clock 1.3 times real time. Paced to RECOMP_FLIP_HZ (60; 0 = no
          * wait) on the host's performance counter. */
+#if defined(_WIN32)
+        {
+            /* Hand the frame to the GPU before the pacing sleep, so it renders
+             * during the sleep and is finished when the frame is presented:
+             * with the work still queued at Present, a frame finished 3-5 ms
+             * after it on average but unevenly, which a variable-refresh display
+             * shows as judder. RECOMP_FLIP_KICK=0 turns this off. */
+            static int kick = -1;
+            if (kick < 0) {
+                const char *e = getenv("RECOMP_FLIP_KICK");
+                kick = !(e && *e == '0') && getenv("RECOMP_PB_D3D11") != NULL;
+            }
+            if (kick) {
+                extern void d3d8_FlushGPU(void);
+                d3d8_FlushGPU();
+            }
+        }
+#endif
         flip_pace();
         s_gpu.flip_read = s_gpu.flip_write;
         /* And this is a completed swap, which is what a title's own swap
