@@ -110,6 +110,7 @@ extern int fe_menu_get_pb_state(void);
 
 static int detect_menu_state(void)
 {
+#if !XBOXRECOMP_UWP
     /* Number key overrides for direct access */
     if (GetAsyncKeyState('1') & 0x8000) return MENU_MAIN;
     if (GetAsyncKeyState('2') & 0x8000) return MENU_WORLD_TOUR;
@@ -119,6 +120,7 @@ static int detect_menu_state(void)
     if (GetAsyncKeyState('6') & 0x8000) return MENU_ROAD_RAGE;
     if (GetAsyncKeyState('7') & 0x8000) return MENU_CRASH_SELECT;
     if (GetAsyncKeyState('8') & 0x8000) return MENU_DRIVER_DETAILS;
+#endif
 
     /* Auto-detect from fe_menu state machine */
     int pb_state = fe_menu_get_pb_state();
@@ -190,6 +192,7 @@ static void replay_pushbuffer(const uint32_t *data, uint32_t num_dwords)
 
 extern int fe_menu_get_pb_state(void);
 
+#if !XBOXRECOMP_UWP
 /* Menu item labels for window title display */
 static const char *main_items[] = { "WORLD TOUR", "SINGLE EVENT", "MULTIPLAYER", "XBOX LIVE", "DRIVER DETAILS" };
 static const char *single_items[] = { "RACE", "TIME ATTACK", "ROAD RAGE", "CRASH" };
@@ -219,9 +222,13 @@ static HWND find_recomp_window_hwnd(void)
     EnumWindows(find_recomp_window, (LPARAM)&hwnd);
     return hwnd;
 }
+#endif
 
 static void update_menu_title(int menu, int cursor)
 {
+#if XBOXRECOMP_UWP
+    (void)menu; (void)cursor;
+#else
     char title[256];
     const char *name = (menu >= 0 && menu < MENU_COUNT) ? menu_names[menu] : "Unknown";
     const char *sel = "";
@@ -245,6 +252,7 @@ static void update_menu_title(int menu, int cursor)
     HWND hwnd = find_recomp_window_hwnd();
     if (!hwnd) hwnd = GetActiveWindow();
     if (hwnd) SetWindowTextA(hwnd, title);
+#endif
 }
 
 /*

@@ -31,6 +31,10 @@ else()
 endif()
 
 target_link_libraries(xbox_nv2a PRIVATE platform)
-if(WIN32)
+if(WIN32 AND XBOXRECOMP_UWP)
+    # WIC, COM and shell32's names are in WindowsApp.lib or app_partition.c;
+    # windowscodecs holds the WIC GUIDs and bcrypt is in WindowsApp.lib too.
+    target_link_libraries(xbox_nv2a PRIVATE windowscodecs bcrypt)
+elseif(WIN32)
     target_link_libraries(xbox_nv2a PRIVATE kernel32 windowscodecs ole32 bcrypt shell32)
 endif()
