@@ -20,7 +20,16 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # declares its own project().
 get_filename_component(XBOXRECOMP_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
 
-if(WIN32)
+if(WIN32 AND XBOXRECOMP_UWP)
+    # The app partition hides names WindowsApp.lib still exports and lacks a
+    # few others; app_partition.h declares the former and app_partition.c
+    # supplies the latter. include/ carries the shell contract.
+    add_library(platform STATIC app_partition.c)
+    target_include_directories(platform PUBLIC
+        ${XBOXRECOMP_SRC_DIR}
+        ${XBOXRECOMP_SRC_DIR}/../include
+    )
+elseif(WIN32)
     add_library(platform INTERFACE)
     target_include_directories(platform INTERFACE ${XBOXRECOMP_SRC_DIR})
 else()

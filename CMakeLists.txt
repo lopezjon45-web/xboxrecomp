@@ -22,7 +22,17 @@ add_compile_definitions(
     NOMINMAX
 )
 
-# Option to build examples
+# The Windows app partition (Xbox One S): a host shell implements
+# include/xbox/xbox_shell.h in place of the runtime's own window, device,
+# swap chain and XInput. The program's single WindowsApp.lib supplies the
+# system libraries, so no library below names a desktop import library.
+option(XBOXRECOMP_UWP "Build the runtime for the Windows app partition" OFF)
+if(XBOXRECOMP_UWP)
+    if(NOT WIN32)
+        message(FATAL_ERROR "XBOXRECOMP_UWP needs a Windows target")
+    endif()
+    add_compile_definitions(XBOXRECOMP_UWP=1)
+endif()
 
 # ── Runtime Libraries ─────────────────────────────────────────
 
