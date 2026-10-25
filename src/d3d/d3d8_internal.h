@@ -63,6 +63,8 @@ UINT d3d8_present_render_scale(void);     /* 0 = no host override */
 void d3d8_present_canvas_aspect(UINT *num, UINT *den); /* 0, 0 = the title's own shape */
 int  d3d8_present_sync_interval(void);    /* -1 = no host choice; else Present's interval */
 void d3d8_present_trace_pacing(void);     /* RECOMP_PRESENT_PACING=1 */
+void d3d8_present_trace_display(void *swap_chain);  /* the same: time on screen per frame */
+void d3d8_present_note_block(double ms);            /* how long the last Present call took */
 HRESULT d3d8_present_create_game_target(UINT width, UINT height, ID3D11RenderTargetView **rtv);
 ID3D11Texture2D *d3d8_present_game_texture(void);
 HRESULT d3d8_present_blit(void);

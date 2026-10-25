@@ -97,6 +97,83 @@ int d3d8_present_display_paced(void)
     return g_scaling && g_window_rtv && d3d8_present_sync_interval() > 0;
 }
 
+/* RECOMP_PRESENT_PACING=1, after each present: how long each frame actually
+ * stayed on screen, from DXGI's frame statistics (the vertical blank at which
+ * each present was first shown). A frame that stays up the same time as the
+ * others is even motion; 2 then 3 refreshes of a 144 Hz display is judder. With
+ * variable refresh working, a 60 fps title's frames each stay up about 16.7 ms. */
+static double g_block_ms[512];
+static unsigned g_nblock;
+void d3d8_present_note_block(double ms)
+{
+    if (g_nblock < 512)
+        g_block_ms[g_nblock++] = ms;
+}
+
+void d3d8_present_trace_display(void *swap_chain)
+{
+    static int on = -1;
+    static LARGE_INTEGER freq, window_start;
+    static UINT last_present, last_refresh;
+    static LONGLONG last_qpc;
+    static double ms[512], sorted[512];
+    static unsigned refreshes[5], n, misses;
+    DXGI_FRAME_STATISTICS st;
+    LARGE_INTEGER now;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_PRESENT_PACING");
+        on = e && *e == '1';
+        QueryPerformanceFrequency(&freq);
+    }
+    if (!on || !swap_chain) return;
+    QueryPerformanceCounter(&now);
+    if (FAILED(IDXGISwapChain_GetFrameStatistics((IDXGISwapChain *)swap_chain, &st))) {
+        misses++;
+    } else if (st.PresentCount != last_present) {
+        if (last_qpc && st.PresentCount == last_present + 1 && n < 512) {
+            UINT r = st.SyncRefreshCount - last_refresh;
+            refreshes[r >= 4 ? 4 : r]++;
+            ms[n++] = (double)(st.SyncQPCTime.QuadPart - last_qpc) * 1000.0 / (double)freq.QuadPart;
+        }
+        last_present = st.PresentCount;
+        last_refresh = st.SyncRefreshCount;
+        last_qpc = st.SyncQPCTime.QuadPart;
+    }
+    if (!window_start.QuadPart) window_start = now;
+    if (now.QuadPart - window_start.QuadPart >= 2 * freq.QuadPart) {
+        if (g_nblock) {
+            unsigned i, j, over = 0;
+            for (i = 0; i < g_nblock; i++) {
+                for (j = i; j > 0 && sorted[j - 1] > g_block_ms[i]; j--) sorted[j] = sorted[j - 1];
+                sorted[j] = g_block_ms[i];
+                if (g_block_ms[i] > 2.0) over++;
+            }
+            fprintf(stderr, "[ONSCREEN] Present call %.2f / %.2f / %.2f / %.2f ms (min/median/90%%/max), %u of %u over 2 ms\n",
+                    sorted[0], sorted[g_nblock / 2], sorted[g_nblock * 9 / 10], sorted[g_nblock - 1], over, g_nblock);
+            g_nblock = 0;
+        }
+        if (n) {
+            unsigned i, j, off = 0;
+            double median;
+            for (i = 0; i < n; i++) {
+                for (j = i; j > 0 && sorted[j - 1] > ms[i]; j--) sorted[j] = sorted[j - 1];
+                sorted[j] = ms[i];
+            }
+            median = sorted[n / 2];
+            for (i = 0; i < n; i++) if (ms[i] < median - 2.0 || ms[i] > median + 2.0) off++;
+            fprintf(stderr, "[ONSCREEN] %u frames: refreshes each 1:%u 2:%u 3:%u 4+:%u; on screen "
+                            "%.2f / %.2f / %.2f ms (min/median/max), %u more than 2 ms off the median\n",
+                    n, refreshes[1], refreshes[2], refreshes[3], refreshes[4],
+                    sorted[0], median, sorted[n - 1], off);
+        } else {
+            fprintf(stderr, "[ONSCREEN] no frame statistics (%u calls failed)\n", misses);
+        }
+        memset(refreshes, 0, sizeof refreshes);
+        n = misses = 0;
+        window_start = now;
+    }
+}
+
 /* RECOMP_PRESENT_PACING=1: every two seconds, how evenly frames reached the
  * display -- the count, the shortest, mean and longest interval, and how many
  * were more than half as long again as the median. */
