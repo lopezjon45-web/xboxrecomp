@@ -16,7 +16,7 @@
  */
 #include <stdint.h>
 
-#if defined(_WIN32)
+#if defined(_WIN32) && !XBOXRECOMP_UWP
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>

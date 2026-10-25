@@ -9,6 +9,9 @@ target_include_directories(xbox_video PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/..
 )
 target_link_libraries(xbox_video PUBLIC xbox_d3d8)
-if(WIN32)
+if(WIN32 AND XBOXRECOMP_UWP)
+    # Media Foundation and COM are in WindowsApp.lib; mfuuid holds the GUIDs.
+    target_link_libraries(xbox_video PUBLIC mfuuid)
+elseif(WIN32)
     target_link_libraries(xbox_video PUBLIC mfplat mfreadwrite mfuuid mf ole32)
 endif()
