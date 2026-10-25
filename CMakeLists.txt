@@ -31,7 +31,13 @@ if(XBOXRECOMP_UWP)
     if(NOT WIN32)
         message(FATAL_ERROR "XBOXRECOMP_UWP needs a Windows target")
     endif()
+    # Directory scope: every library below. app_partition.h declares the
+    # names the partition's headers hide; force-included so it reaches a
+    # file whichever header gives it <windows.h>. A program that links the
+    # runtime gets the macro from the platform target and includes the
+    # header itself where it uses those names.
     add_compile_definitions(XBOXRECOMP_UWP=1)
+    add_compile_options("/FI${CMAKE_CURRENT_SOURCE_DIR}/src/platform/app_partition.h")
 endif()
 
 # ── Runtime Libraries ─────────────────────────────────────────

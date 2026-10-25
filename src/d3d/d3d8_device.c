@@ -180,8 +180,14 @@ void d3d8_PresentFrame(void)
 #endif
 
     /* Present the backbuffer (VSync = 1) */
+#if XBOXRECOMP_UWP
+    /* The shell owns the swap chain; the device's own field stays NULL. */
+    if (g_device_initialized)
+        d3d8_present();
+#else
     if (g_device_state.swap_chain)
         d3d8_present();
+#endif
 }
 
 /* ================================================================

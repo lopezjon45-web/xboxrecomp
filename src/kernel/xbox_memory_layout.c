@@ -160,6 +160,123 @@ static size_t xbox_TiledApertureSize(void)
 static XboxWindowsLayout g_windows_layout;
 #endif
 
+#if XBOXRECOMP_UWP
+int xbox_HostInGuestSpan(const void *host)
+{
+    const char *base = (const char *)g_memory_base, *p = (const char *)host;
+    return base && p >= base && p < base + xbox_windows_layout_span(g_memory_size);
+}
+
+static int probe_fail(const char *what)
+{
+    fprintf(stderr, "xbox_MemoryLayoutProbe: %s failed (error %lu)\n", what, GetLastError());
+    return 0;
+}
+
+/* The production placement on throwaway sections of the real sizes, before
+ * the guest exists: the shell's selftest calls this and refuses to start the
+ * game when it returns 0. Everything it maps is released, holes included
+ * (layout_release leaves those to process exit). */
+int xbox_MemoryLayoutProbe(void)
+{
+    size_t bytes = g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram;
+    /* xbox_TiledApertureSize and the clamp in xbox_MemoryLayoutInit, which
+     * read g_memory_size and so cannot run before init. */
+    size_t tiled = (size_t)(XBOX_NV2A_BASE - XBOX_TILED_BASE);
+    XboxWindowsLayout l;
+    XboxRegion r[XBOX_LAYOUT_MAX_REGIONS];
+    HANDLE ram, contig;
+    MEMORY_BASIC_INFORMATION mbi;
+    volatile unsigned char *lo, *mirror;
+    unsigned char seen;
+    size_t n, i, hole;
+    char *base;
+    int created, ok = 0;
+
+    if (bytes < tiled) tiled = bytes;
+    if (tiled > XBOX_CONTIG_SIZE) tiled = XBOX_CONTIG_SIZE;
+    n = xbox_windows_layout_plan(&l, xbox_windows_layout_span(bytes), bytes, tiled, r);
+    if (!n) {
+        fprintf(stderr, "xbox_MemoryLayoutProbe: no plan for %zu MB RAM\n", bytes >> 20);
+        return 0;
+    }
+    hole = n;
+    ram = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, (DWORD)bytes, NULL);
+    if (!ram) return probe_fail("CreateFileMappingA (RAM section)");
+    contig = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, (DWORD)XBOX_CONTIG_SIZE, NULL);
+    if (!contig) {
+        CloseHandle(ram);
+        return probe_fail("CreateFileMappingW (contig section)");
+    }
+    created = xbox_windows_layout_create(&l, ram, contig, bytes, tiled);
+    base = (char *)l.base;
+    if (!created) {
+        probe_fail("xbox_windows_layout_create");
+        goto done;
+    }
+    for (i = 0; i < n; ++i) {
+        if (r[i].backing == XBOX_BACKING_HOLE) {
+            if (hole == n) hole = i;
+            continue;
+        }
+        if (*r[i].out != base + r[i].va) {
+            fprintf(stderr, "xbox_MemoryLayoutProbe: region %u (guest 0x%08llX) is at %p, not %p\n",
+                    (unsigned)i, (unsigned long long)r[i].va, *r[i].out, base + r[i].va);
+            goto done;
+        }
+    }
+    for (i = 0; i < XBOX_NUM_MIRRORS && !l.mirrors[i]; ++i) {}
+    if (i == XBOX_NUM_MIRRORS) {
+        fprintf(stderr, "xbox_MemoryLayoutProbe: no mirror mapped\n");
+        goto done;
+    }
+    lo = (volatile unsigned char *)base;
+    mirror = (volatile unsigned char *)l.mirrors[i];
+    *lo = 0x5A;
+    seen = *mirror;
+    if (seen != 0x5A) {
+        fprintf(stderr, "xbox_MemoryLayoutProbe: wrote 0x5A through RAM, mirror %u reads 0x%02X\n",
+                (unsigned)i, seen);
+        goto done;
+    }
+    *mirror = 0xA5;
+    seen = *lo;
+    if (seen != 0xA5) {
+        fprintf(stderr, "xbox_MemoryLayoutProbe: wrote 0xA5 through mirror %u, RAM reads 0x%02X\n",
+                (unsigned)i, seen);
+        goto done;
+    }
+    if (hole == n) {
+        fprintf(stderr, "xbox_MemoryLayoutProbe: the plan has no hole\n");
+        goto done;
+    }
+    if (!VirtualQuery(base + r[hole].va, &mbi, sizeof mbi)) {
+        probe_fail("VirtualQuery (hole)");
+        goto done;
+    }
+    if (mbi.State != MEM_RESERVE || mbi.Protect != PAGE_NOACCESS) {
+        fprintf(stderr, "xbox_MemoryLayoutProbe: hole at guest 0x%08llX is state 0x%lX protect 0x%lX, "
+                        "not a reserved placeholder\n",
+                (unsigned long long)r[hole].va, mbi.State, mbi.Protect);
+        goto done;
+    }
+    ok = 1;
+done:
+    xbox_windows_layout_release(&l);
+    for (i = 0; ok && i < n; ++i) {
+        if (r[i].backing != XBOX_BACKING_HOLE) continue;
+        if (!VirtualFree(base + r[i].va, 0, MEM_RELEASE)) {
+            fprintf(stderr, "xbox_MemoryLayoutProbe: releasing the hole at guest 0x%08llX failed (error %lu)\n",
+                    (unsigned long long)r[i].va, GetLastError());
+            ok = 0;
+        }
+    }
+    CloseHandle(contig);
+    CloseHandle(ram);
+    return ok;
+}
+#endif /* XBOXRECOMP_UWP */
+
 static HANDLE g_nv2a_ack_thread = NULL;
 static volatile LONG g_nv2a_ack_stop = 0;
 

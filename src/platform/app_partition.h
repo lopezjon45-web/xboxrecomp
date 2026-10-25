@@ -83,8 +83,10 @@ BOOL WINAPI PulseEvent(HANDLE hEvent);
 #endif
 HRESULT WINAPI SHGetFolderPathW(HWND hwnd, int csidl, HANDLE hToken, DWORD dwFlags, LPWSTR pszPath);
 
-/* Create every missing folder on the path with CreateDirectoryW/A. Returns ERROR_SUCCESS, ERROR_ALREADY_EXISTS
- * or the first failure, like the originals. kernel_path.c, texture_pack.c. */
+/* Create the missing folders on the path with CreateDirectoryW. A folder that exists is never passed to it
+ * (GetFileAttributesW first), so an ancestor the package may only read is not asked for a create. Returns
+ * ERROR_SUCCESS when the leaf was created, ERROR_ALREADY_EXISTS when it existed, otherwise the first other
+ * error, like the originals. kernel_path.c, texture_pack.c. */
 int WINAPI SHCreateDirectoryExW(HWND hwnd, LPCWSTR pszPath, const SECURITY_ATTRIBUTES *psa);
 int WINAPI SHCreateDirectoryExA(HWND hwnd, LPCSTR pszPath, const SECURITY_ATTRIBUTES *psa);
 

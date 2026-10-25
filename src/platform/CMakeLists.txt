@@ -29,6 +29,7 @@ if(WIN32 AND XBOXRECOMP_UWP)
         ${XBOXRECOMP_SRC_DIR}
         ${XBOXRECOMP_SRC_DIR}/../include
     )
+    target_compile_definitions(platform INTERFACE XBOXRECOMP_UWP=1)
 elseif(WIN32)
     add_library(platform INTERFACE)
     target_include_directories(platform INTERFACE ${XBOXRECOMP_SRC_DIR})

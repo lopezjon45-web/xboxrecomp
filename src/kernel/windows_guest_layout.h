@@ -55,6 +55,8 @@ static int xbox_windows_overlap(uint64_t lo, uint64_t hi,
  * touch as it does on desktop. Nothing here is executable, so the FromApp
  * restriction on executable pages never applies. */
 
+#include <stdio.h>
+
 typedef enum {
     XBOX_BACKING_HOLE,
     XBOX_BACKING_RAM,
@@ -176,6 +178,14 @@ static int xbox_windows_layout_create(XboxWindowsLayout *p, HANDLE ram,
             break;
         }
         if (!got) return 0;
+        if (got != at) {
+            /* The placeholder was replaced somewhere else: the console would
+             * run the guest against the wrong addresses. */
+            fprintf(stderr, "xbox_windows_layout_create: region %u (guest 0x%08llX) wanted %p, got %p\n",
+                    (unsigned)i, (unsigned long long)r[i].va, at, got);
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return 0;
+        }
         *r[i].out = got;
     }
     return 1;

@@ -230,6 +230,17 @@ ptrdiff_t xbox_GetMemoryOffset(void);
 size_t xbox_GetMappedSize(void);
 void xbox_ProtectMirrorsForDebug(void);
 
+#if XBOXRECOMP_UWP
+/* Place the production guest layout on throwaway sections of the real sizes,
+ * check every view landed at base + VA, that RAM and its first mirror alias,
+ * and that a hole is a reserved placeholder; then release it all. Returns 1,
+ * or 0 after one "xbox_MemoryLayoutProbe: ..." line on stderr. For the
+ * shell's selftest, before the game starts. */
+int xbox_MemoryLayoutProbe(void);
+/* True for a host address inside the live layout's span, holes included. */
+int xbox_HostInGuestSpan(const void *host);
+#endif
+
 /* Dump the guest call stack and abort if the title has not exited within
  * RECOMP_WATCHDOG_SECS seconds. Call from the thread that runs guest code;
  * does nothing unless that variable is set. */

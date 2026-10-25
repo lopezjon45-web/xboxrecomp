@@ -424,6 +424,15 @@ NTSTATUS __stdcall xbox_NtAllocateVirtualMemory(
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_MEM,
             "NtAllocateVirtualMemory failed: base=%p size=%u type=0x%X err=%u",
             *BaseAddress, (ULONG)*RegionSize, AllocationType, GetLastError());
+#if XBOXRECOMP_UWP
+        /* A hole in the guest span is a placeholder, which a plain
+         * fixed-address VirtualAlloc cannot take; desktop would have handed
+         * the address over. Named so a console run can say which one. */
+        if (*BaseAddress && xbox_HostInGuestSpan(*BaseAddress))
+            xbox_log(XBOX_LOG_WARN, XBOX_LOG_MEM,
+                "NtAllocateVirtualMemory: guest 0x%08X inside the span: placeholder",
+                (uint32_t)((const char *)*BaseAddress - (const char *)xbox_GetMemoryBase()));
+#endif
         return STATUS_NO_MEMORY;
     }
 

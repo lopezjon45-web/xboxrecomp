@@ -166,7 +166,11 @@ void d3d8_present_shutdown(void)
     if (g_fill_cb) { ID3D11Buffer_Release(g_fill_cb); g_fill_cb = NULL; }
     if (g_vs) { ID3D11VertexShader_Release(g_vs); g_vs = NULL; }
     if (g_deferred) { ID3D11DeviceContext_Release(g_deferred); g_deferred = NULL; }
+#if XBOXRECOMP_UWP
+    g_window_rtv = NULL;
+#else
     if (g_window_rtv) { ID3D11RenderTargetView_Release(g_window_rtv); g_window_rtv = NULL; }
+#endif
     if (g_game_srv) { ID3D11ShaderResourceView_Release(g_game_srv); g_game_srv = NULL; }
     if (g_game_texture) { ID3D11Texture2D_Release(g_game_texture); g_game_texture = NULL; }
     g_window_width = g_window_height = 0;

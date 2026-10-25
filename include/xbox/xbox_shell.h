@@ -14,7 +14,9 @@
  *   game thread        created by the shell; runs xbox_shell_app_main.
  *   presenting thread  the first thread to call xbox_shell_frame_begin after the game starts (in Def Jam the
  *                      runtime's nv2a_ack_thread: flip -> d3d11_translator_frame_end -> dev_Present).
- *                      frame_begin and frame_present are only ever called from it.
+ *                      frame_begin and frame_present are only ever called from it. Before the game starts the
+ *                      UI thread draws the boot screen through the same two calls; the shell drops that claim
+ *                      at the handoff, so the game's first caller takes the role.
  *   pad thread         the first thread to call xbox_shell_pad_read (input_host.c reader_thread). pad_read and
  *                      pad_rumble are only ever called from it.
  *   any thread         xbox_shell_display_hz, xbox_shell_data_root, xbox_shell_fatal.
