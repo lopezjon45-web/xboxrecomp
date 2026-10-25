@@ -42,7 +42,11 @@ target_include_directories(xbox_kernel PUBLIC
     ${XBOXRECOMP_SRC_DIR}
 )
 
-if(WIN32)
+if(WIN32 AND XBOXRECOMP_UWP)
+    # The program's WindowsApp.lib supplies kernel32's names; bcrypt is in
+    # it too (BCryptGenRandom), and the library is on the app allowlist.
+    target_link_libraries(xbox_kernel PUBLIC platform bcrypt)
+elseif(WIN32)
     # platform is an INTERFACE target on Windows: it contributes the src/
     # include path that "platform/xbox_winnt.h" resolves against.
     target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt)
