@@ -15,7 +15,7 @@
 #include <string.h>
 
 /* ======================================================================== */
-#if defined(_WIN32)
+#if defined(_WIN32) && !XBOXRECOMP_UWP
 /* ====================  XInput backend  ================================== */
 /* ======================================================================== */
 
@@ -259,13 +259,14 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
 }
 
 /* ======================================================================== */
-#elif defined(XBOXRECOMP_HAVE_SDL3)
+#elif defined(XBOXRECOMP_HAVE_SDL3) || XBOXRECOMP_UWP
 /* ====================  Host input layer only (SDL3)  ==================== */
 /* ======================================================================== */
 
-/* Off Windows with SDL3 every pad goes through the host input layer
- * (input_host.c), as on Windows when that layer is running. Until the
- * program starts it there is no pad. */
+/* Off Windows with SDL3, and on the app partition (pads come from the
+ * shell), every pad goes through the host input layer (input_host.c), as on
+ * Windows when that layer is running. Until the program starts it there is
+ * no pad. */
 #include "input_host.h"
 #include "../platform/win32_compat.h"
 

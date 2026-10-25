@@ -8,8 +8,12 @@
 #include <windows.h>
 #include <mmsystem.h>
 #include <xinput.h>
-
+#if XBOXRECOMP_UWP
+/* Pads come from the shell (Windows.Gaming.Input), in XInput's shape. */
+#include "xbox/xbox_shell.h"
+#else
 #pragma comment(lib, "winmm.lib")
+#endif
 #else
 /* Off Windows there is no XInput: pads are SDL3's or there are none. The
  * threads, events and clocks are the POSIX layer's. */
@@ -117,7 +121,11 @@ static int read_xinput(DWORD index, InputRaw *r)
 {
     XINPUT_STATE s;
     WORD b;
+#if XBOXRECOMP_UWP
+    if (!xbox_shell_pad_read(index, &s.Gamepad)) return 0;
+#else
     if (XInputGetState(index, &s) != ERROR_SUCCESS) return 0;
+#endif
     b = s.Gamepad.wButtons;
     memset(r, 0, sizeof(*r));
 #define BTN(mask, source) if (b & (mask)) r->src[source] = 32767
@@ -453,10 +461,14 @@ static void apply_rumble(int s, int focused, const InputHostConfig *cfg)
 #endif
 #if defined(_WIN32)
     if (dv->backend == 2) {
+#if XBOXRECOMP_UWP
+        xbox_shell_pad_rumble(dv->xi_index, (WORD)low, (WORD)high);
+#else
         XINPUT_VIBRATION v;
         v.wLeftMotorSpeed = (WORD)low;
         v.wRightMotorSpeed = (WORD)high;
         XInputSetState(dv->xi_index, &v);
+#endif
     }
 #endif
 }

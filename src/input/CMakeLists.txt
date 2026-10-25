@@ -14,7 +14,12 @@ target_include_directories(xbox_input PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 if(WIN32)
     target_sources(xbox_input PRIVATE input_host.c)
-    target_link_libraries(xbox_input PUBLIC platform xinput winmm)
+    if(XBOXRECOMP_UWP)
+        # Pads come from the shell; timeBeginPeriod is in WindowsApp.lib.
+        target_link_libraries(xbox_input PUBLIC platform)
+    else()
+        target_link_libraries(xbox_input PUBLIC platform xinput winmm)
+    endif()
     if(XBOXRECOMP_SDL3)
         list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/../../cmake)
         include(xbox_sdl3)
