@@ -512,6 +512,17 @@ ULONG_PTR xbox_resolve_ordinal(ULONG ordinal);
 /* Kernel bridge (kernel_bridge.c) - resolve kernel thunks in Xbox memory */
 void xbox_kernel_bridge_init(void);
 
+/* For a front end that keeps no thunk slots (xbox/xbox_frontend.h, direct).
+ * xbox_kernel_bridge_call runs the bridge for `ordinal` on the register file
+ * (g_esp at the guest return address, g_ecx, g_edx): pops the return address
+ * into g_xbox_kernel_caller, then the stdcall arguments. Returns 0, touching
+ * nothing, when the ordinal has no bridge. xbox_kernel_data_init fills the
+ * data exports' page; xbox_kernel_data_export is a data export's VA, or 0
+ * for a function. */
+int xbox_kernel_bridge_call(uint16_t ordinal);
+void xbox_kernel_data_init(void);
+uint32_t xbox_kernel_data_export(uint16_t ordinal);
+
 /**
  * Per-title kernel ordinal remap.
  *

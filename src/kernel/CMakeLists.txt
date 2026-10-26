@@ -29,7 +29,17 @@ set(KERNEL_SOURCES
     nv2a_vsh_interp.c
     nv2a_combiner.c
     nv2a_vsh_cpu.c
+    frontend_lifted.c
 )
+
+# XBOXRECOMP_FRONTEND=direct: the program runs guest code itself and defines
+# xbox/xbox_frontend.h and the symbols of the files in lifted-only.txt (one
+# file name per line), which are left out here. Programs that build these
+# sources without CMake read the same list.
+file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/lifted-only.txt KERNEL_LIFTED_ONLY)
+if(XBOXRECOMP_FRONTEND STREQUAL "direct")
+    list(REMOVE_ITEM KERNEL_SOURCES ${KERNEL_LIFTED_ONLY})
+endif()
 
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
 
@@ -40,6 +50,7 @@ get_filename_component(XBOXRECOMP_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOL
 target_include_directories(xbox_kernel PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${XBOXRECOMP_SRC_DIR}
+    ${XBOXRECOMP_SRC_DIR}/../include
 )
 
 if(WIN32 AND XBOXRECOMP_UWP)

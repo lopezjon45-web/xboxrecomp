@@ -6,7 +6,7 @@ add_library(xbox_usb STATIC
     usb_hub.c
 )
 
-target_include_directories(xbox_usb PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(xbox_usb PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
 target_link_libraries(xbox_usb PUBLIC platform xbox_input)
 
 if(MSVC)

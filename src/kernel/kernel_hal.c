@@ -12,7 +12,8 @@
  */
 
 #include "kernel.h"
-#include "xbox_memory_layout.h"   /* RECOMP_TLS, g_fs_base */
+#include "xbox_memory_layout.h"   /* RECOMP_TLS */
+#include "xbox/xbox_frontend.h"
 #include <stdio.h>
 #include <stdlib.h>
 #if defined(_WIN32)
@@ -49,15 +50,16 @@ static XBOX_THREAD_LOCAL KIRQL g_current_irql = PASSIVE_LEVEL;
  * critical section, blocked against the thread that held it, and the title
  * froze with IRQL raised on the blocked thread. Every change of
  * g_current_irql is published here. */
-extern RECOMP_TLS uint32_t g_fs_base;
 /* The offset lifted code adds to every guest address; host code that reads
  * guest memory on its behalf uses the same one. */
 extern ptrdiff_t g_xbox_mem_offset;
 
 static void irql_publish(void)
 {
-    if (g_fs_base)
-        *(volatile uint8_t *)((uintptr_t)g_xbox_mem_offset + g_fs_base
+    uint32_t kpcr = xbox_frontend_kpcr();
+
+    if (kpcr)
+        *(volatile uint8_t *)((uintptr_t)g_xbox_mem_offset + kpcr
                               + 0x24) = (uint8_t)g_current_irql;
 }
 

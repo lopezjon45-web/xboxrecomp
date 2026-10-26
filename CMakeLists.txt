@@ -40,6 +40,17 @@ if(XBOXRECOMP_UWP)
     add_compile_options("/FI${CMAKE_CURRENT_SOURCE_DIR}/src/platform/app_partition.h")
 endif()
 
+# The CPU front end the kernel bridges call (include/xbox/xbox_frontend.h):
+# lifted runs statically recompiled titles; direct leaves the front end to
+# the program (xbrt), which runs guest code natively.
+set(XBOXRECOMP_FRONTEND "lifted" CACHE STRING "CPU front end: lifted or direct")
+set_property(CACHE XBOXRECOMP_FRONTEND PROPERTY STRINGS lifted direct)
+if(XBOXRECOMP_FRONTEND STREQUAL "direct")
+    add_compile_definitions(XBOXRECOMP_FRONTEND_DIRECT=1)
+elseif(NOT XBOXRECOMP_FRONTEND STREQUAL "lifted")
+    message(FATAL_ERROR "XBOXRECOMP_FRONTEND must be lifted or direct, not ${XBOXRECOMP_FRONTEND}")
+endif()
+
 # ── Runtime Libraries ─────────────────────────────────────────
 
 # Platform: Win32/NT type vocabulary + POSIX implementation of generic

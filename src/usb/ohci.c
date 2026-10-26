@@ -10,6 +10,7 @@
 #include "../platform/mmio_decode.h"
 #include "../kernel/xbox_memory_layout.h"
 #include "../kernel/kernel.h"
+#include "xbox/xbox_frontend.h"
 #include "usb_gamepad.h"
 #include "usb_hub.h"
 
@@ -31,31 +32,17 @@
 /* The runtime maps guest memory at a fixed host offset. */
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
-/* Calling the title's interrupt service routine.
- *
- * A recompiled function reads its arguments off the guest stack and keeps its
- * registers in thread-local storage, so it can only be called from a thread
- * that has both. xbox_worker_stack_alloc hands out a guest stack slice for
- * exactly this -- a host thread calling recompiled code -- and recomp_lookup
- * turns a guest address into something callable.
- */
-typedef void (*recomp_func_t)(void);
-extern recomp_func_t recomp_lookup(uint32_t xbox_va);
-extern int  xbox_worker_stack_alloc(void);
-extern void xbox_worker_stack_free(int slot);
 extern uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
 
-/* Declared in the generated runtime; thread-local, so the values below are
- * this thread's and not the guest thread's. */
+#if !XBOXRECOMP_FRONTEND_DIRECT
 #if defined(_MSC_VER)
 #  define OHCI_TLS __declspec(thread)
 #else
 #  define OHCI_TLS __thread
 #endif
-extern OHCI_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
-extern OHCI_TLS uint32_t g_ebx, g_esi, g_edi;
 extern OHCI_TLS uint32_t g_fs_base;
 extern uint32_t xbox_AllocThreadTib(void);
+#endif
 
 /* The vector XPP takes for USB0. HalGetInterruptVector(1) returns 1 here, and
  * the bus interrupt level is what the XDK passes. */
@@ -1077,13 +1064,9 @@ static int ohci_run_periodic(OhciController *hc, uint32_t *done_head)
 
 /* ---- raising an interrupt --------------------------------------------- */
 
-/* Call the title's ISR on this thread, with a guest stack under it.
+/* Call the title's ISR on this thread.
  *
- * BOOLEAN ServiceRoutine(PKINTERRUPT Interrupt, PVOID ServiceContext), stdcall,
- * so the two arguments go on the stack right to left with a return address on
- * top. The sentinel is what the routine pops on the way out; nothing jumps to
- * it, and a recognisable value beats a real address if it ever shows up in a
- * report.
+ * BOOLEAN ServiceRoutine(PKINTERRUPT Interrupt, PVOID ServiceContext), stdcall.
  *
  * Returns what the routine returned: an ISR that does not claim the interrupt
  * returns FALSE, and that is worth seeing rather than assuming.
@@ -1091,49 +1074,27 @@ static int ohci_run_periodic(OhciController *hc, uint32_t *done_head)
 static int ohci_call_isr(OhciController *hc)
 {
     uint32_t kinterrupt = xbox_GetConnectedInterrupt(OHCI_VECTOR);
-    uint32_t routine, context;
-    recomp_func_t fn;
+    uint32_t routine, args[2];
     uint8_t *mem;
-    int slot;
+    uint64_t claimed;
 
+    (void)hc;
     if (!kinterrupt)
         return -1;                      /* nothing connected yet            */
 
     mem     = (uint8_t *)xbox_GetMemoryOffset();
     routine = *(uint32_t *)(mem + kinterrupt + 0);
-    context = *(uint32_t *)(mem + kinterrupt + 4);
     if (!routine)
         return -1;
+    args[0] = kinterrupt;
+    args[1] = *(uint32_t *)(mem + kinterrupt + 4);
 
-    fn = recomp_lookup(routine);
-    if (!fn) {
-        fprintf(stderr, "  [OHCI%d] ISR 0x%08X has no translation\n",
-                hc->index, routine);
-        fflush(stderr);
-        return -1;
+    {
+        int irql = xbox_IrqlEnterInterrupt(16);
+        claimed = xbox_frontend_guest_call(routine, 2, args, XBOX_CALL_STDCALL);
+        xbox_IrqlLeaveInterrupt(irql);
     }
-
-    /* One slice for the life of the raise. Sixteen exist and this takes one
-     * only while the routine runs, so a title using them for its own workers
-     * is not starved by a controller that interrupts. */
-    slot = xbox_worker_stack_alloc();
-    if (slot < 0) {
-        fprintf(stderr, "  [OHCI%d] no worker stack for the ISR\n", hc->index);
-        fflush(stderr);
-        return -1;
-    }
-
-    g_esp = XBOX_WORKER_STACK_TOP(slot);
-    g_eax = g_ecx = g_edx = g_ebx = g_esi = g_edi = 0;
-
-    g_esp -= 4; *(uint32_t *)(mem + g_esp) = context;      /* arg 2 */
-    g_esp -= 4; *(uint32_t *)(mem + g_esp) = kinterrupt;   /* arg 1 */
-    g_esp -= 4; *(uint32_t *)(mem + g_esp) = 0xDEADBEEFu;  /* return address */
-
-    { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
-
-    xbox_worker_stack_free(slot);
-    return (int)(g_eax & 1u);
+    return (int)(claimed & 1u);
 }
 
 /* Set the status bits and, if the driver has unmasked them, call the ISR.
@@ -1232,14 +1193,6 @@ static void ohci_reset(OhciController *hc, uint32_t base, int index)
  */
 static DWORD WINAPI ohci_thread(LPVOID unused)
 {
-    /* This thread calls recompiled code, so it needs what any thread running
-     * recompiled code needs: its own TIB. The guest register set is already
-     * thread-local and the ISR gets a worker stack, but fs:[0] is the SEH
-     * chain head and fs:[4] reaches the CRT's per-thread data -- and a guest
-     * function with an SEH prologue on a thread whose g_fs_base is zero
-     * dereferences null before it executes a line of its own body. That is
-     * what killed the process here, two interrupts in, with no fault report
-     * because the fault was in the runtime rather than in the title. */
     int plugged = 0;
     uint32_t last_status = 0, uncleared = 0;
     unsigned repeats = 0;
@@ -1248,6 +1201,12 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
     unsigned first_port = 0;
 
     (void)unused;
+#if !XBOXRECOMP_FRONTEND_DIRECT
+    /* A lifted thread that calls guest code needs its own TIB: fs:[0] is the
+     * SEH chain head, and a guest function with an SEH prologue on a thread
+     * whose g_fs_base is zero dereferences null before its first line. A
+     * direct front end gives the thread its guest identity on its first
+     * guest call. */
     {
         uint32_t tib = xbox_AllocThreadTib();
         if (!tib) {
@@ -1258,6 +1217,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
         }
         g_fs_base = tib;
     }
+#endif
     {
         /* It runs the controller's ISR: above DISPATCH_LEVEL (kernel_hal.c). */
         extern void xbox_IrqlInterruptThread(void);

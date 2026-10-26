@@ -35,9 +35,10 @@
 #include "guest_vmem.h"
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
+#include "xbox/xbox_frontend.h"
 #include <stdio.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
- * makes malloc return `int`, so bridge_spawn_thread truncated its heap pointer
+ * makes malloc return `int`, so the thread spawn truncated its heap pointer
  * to 32 bits and sign-extended it into a `struct bridge_thread_start *`. Every
  * subsequent s->field wrote to an address that had nothing to do with the
  * allocation. MSVC says so (C4013 + C4047 "differs in levels of indirection")
@@ -50,23 +51,18 @@
 #include <ctype.h>
 #include <wctype.h>
 
-/* Access to recompiled code registers. Per-thread: RECOMP_TLS comes from
- * xbox_memory_layout.h and must match the definitions there -- a plain extern
- * here binds to the TLS template rather than the calling thread's copy, which
- * reads as every register being zero. */
-extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
-extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
+/* The bridges' register file: in, g_esp at the guest return address plus
+ * g_ecx/g_edx for fastcall; out, g_eax/g_edx and the popped g_esp. Defined
+ * here because both front ends share it: lifted code runs on it, and a direct
+ * front end copies the guest's registers in and out around each call. Per
+ * thread (RECOMP_TLS). */
+RECOMP_TLS uint32_t g_eax = 0, g_ecx = 0, g_edx = 0, g_esp = 0;
+RECOMP_TLS uint32_t g_ebx = 0, g_esi = 0, g_edi = 0;
 extern uint32_t g_xbox_code_lo, g_xbox_code_hi;
-extern RECOMP_TLS uint32_t g_seh_ebp;
 extern ptrdiff_t g_xbox_mem_offset;
 
-/* Dispatch table lookup (for function pointer args) */
+/* Dispatch table lookup (for kernel thunk VAs) */
 typedef void (*recomp_func_t)(void);
-recomp_func_t recomp_lookup(uint32_t xbox_va);
-/* Timer DPCs run on a host thread, which needs a guest stack under it. */
-int  xbox_worker_stack_alloc(void);
-
-recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 
 /* Memory access - same as recomp_types.h MEM32 but without the #define guard */
 #define BRIDGE_MEM32(addr) (*(volatile uint32_t *)((uintptr_t)(addr) + g_xbox_mem_offset))
@@ -89,18 +85,6 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
  * layer can catch it, because xbox_NtReadFile receives a host pointer and a
  * count and cannot know where the mapping ends.
  */
-static int bridge_va_mapped(uint32_t va, uint32_t bytes)
-{
-    uint64_t end = (uint64_t)va + bytes;
-    uint64_t mapped = g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram;
-
-    if (va < 0x1000)            /* page zero is deliberately unmapped */
-        return 0;
-    if (end <= mapped)
-        return 1;
-    return va >= XBOX_CONTIG_BASE
-        && end <= (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
-}
 
 /* STATUS_ACCESS_VIOLATION is what NT answers for a user buffer it cannot
  * touch, and it is far more useful to a title than a host crash: the call
@@ -115,7 +99,7 @@ static int bridge_buf_ok(uint32_t va, uint32_t bytes, const char *export_name)
 
     if (!bytes)                                   /* nothing is accessed */
         return 1;
-    if (va && bridge_va_mapped(va, bytes))
+    if (va && xbox_frontend_va_mapped(va, bytes))
         return 1;
 
     for (i = 0; i < distinct; ++i)
@@ -147,6 +131,10 @@ static int bridge_buf_ok(uint32_t va, uint32_t bytes, const char *export_name)
  * We allocate a "kernel data area" at XBOX_KERNEL_DATA_BASE and populate
  * it with the expected structures.
  */
+
+/* The front end places the page (xbox_frontend.h). */
+#undef XBOX_KERNEL_DATA_BASE
+#define XBOX_KERNEL_DATA_BASE xbox_frontend_kernel_data_base()
 
 #define BRIDGE_MEM16(addr) (*(volatile uint16_t *)((uintptr_t)(addr) + g_xbox_mem_offset))
 #define BRIDGE_MEM8(addr)  (*(volatile uint8_t  *)((uintptr_t)(addr) + g_xbox_mem_offset))
@@ -203,7 +191,7 @@ static uint32_t kernel_data_va_for_ordinal(ULONG ordinal)
  * Initialize kernel data export values at the kernel data area.
  * Called during bridge init, after Xbox memory is mapped.
  */
-static void kernel_data_init(void)
+void xbox_kernel_data_init(void)
 {
     /* XboxHardwareInfo (ordinal 322) - XBOX_HARDWARE_INFO
      *   +0: ULONG Flags (0 = retail, 0x20 = devkit)
@@ -427,57 +415,6 @@ RECOMP_TLS uint32_t g_xbox_kernel_caller;
  * translated code's own stack adjustment.
  */
 
-/* ── PsCreateSystemThreadEx (ordinal 255) ────────────────
- * NTSTATUS PsCreateSystemThreadEx(
- *   PHANDLE ThreadHandle,      // arg0: Xbox VA → pointer
- *   ULONG ThreadExtraSize,     // arg1: value
- *   ULONG KernelStackSize,     // arg2: value
- *   ULONG TlsDataSize,         // arg3: value
- *   PULONG ThreadId,           // arg4: Xbox VA → pointer (can be NULL)
- *   PVOID StartContext1,       // arg5: Xbox VA → opaque
- *   PVOID StartContext2,       // arg6: Xbox VA → opaque
- *   BOOLEAN CreateSuspended,   // arg7: value
- *   BOOLEAN DebugStack,        // arg8: value
- *   PXBOX_SYSTEM_ROUTINE StartRoutine  // arg9: Xbox function pointer
- * )
- *
- * For static recompilation, we don't create a real thread.
- * Instead we call the StartRoutine synchronously via RECOMP_ICALL.
- * This is correct because on Xbox, the entry point creates a system
- * thread and returns, and the thread runs the actual game.
- */
-static int g_thread_call_count = 0;
-
-/* Thread entry shim. Sets up the new thread's own simulated stack, pushes the
- * two Xbox start-context arguments plus the dummy return address the callee's
- * `ret` consumes, and runs. */
-/* Set on threads this bridge spawned; see PsTerminateSystemThread. */
-static RECOMP_TLS int g_is_spawned_thread = 0;
-
-/* This thread's simulated stack, so both exits can give it back. Thread-local
- * for the obvious reason, and needed at all because the common exit is
- * ExitThread from PsTerminateSystemThread -- bridge_thread_main's own return
- * path is the rare one. */
-static RECOMP_TLS uint32_t g_thread_stack_top = 0;
-
-struct bridge_thread_start {
-    recomp_func_t fn;
-    uint32_t ctx1, ctx2, stack_top;
-};
-
-static void bridge_write_handle(uint32_t handle_va, HANDLE h);
-
-static void bridge_run_thread_inline(recomp_func_t fn, uint32_t ctx1,
-                                     uint32_t ctx2)
-{
-    g_esp -= 4; BRIDGE_MEM32(g_esp) = ctx2;
-    g_esp -= 4; BRIDGE_MEM32(g_esp) = ctx1;
-    g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    g_seh_ebp = g_esp;
-    fn();
-    g_esp += 12;
-}
-
 void guest_cpu_join(void);
 void guest_cpu_part(void);
 
@@ -578,186 +515,56 @@ void xbox_PinToGuestCore(void)
 #endif
 }
 
-static DWORD WINAPI bridge_thread_main(LPVOID param)
+static void bridge_write_handle(uint32_t handle_va, HANDLE h);
+
+/* ── PsCreateSystemThreadEx (ordinal 255) ────────────────
+ * NTSTATUS PsCreateSystemThreadEx(
+ *   PHANDLE ThreadHandle,      // arg0: Xbox VA → pointer
+ *   ULONG ThreadExtraSize,     // arg1: value
+ *   ULONG KernelStackSize,     // arg2: value
+ *   ULONG TlsDataSize,         // arg3: value
+ *   PULONG ThreadId,           // arg4: Xbox VA → pointer (can be NULL)
+ *   PVOID StartContext1,       // arg5: Xbox VA → opaque
+ *   PVOID StartContext2,       // arg6: Xbox VA → opaque
+ *   BOOLEAN CreateSuspended,   // arg7: value
+ *   BOOLEAN DebugStack,        // arg8: value
+ *   PXBOX_SYSTEM_ROUTINE StartRoutine  // arg9: Xbox function pointer
+ * )
+ *
+ * The front end makes the thread (xbox_frontend_spawn_thread); the guest's
+ * handle is a token for the host thread it returns. A front end may run the
+ * routine on the calling thread instead (the lifted main thread), and then
+ * there is no thread to name, so the handle keeps a placeholder value.
+ */
+static void bridge_create_thread(uint32_t handle_va, uint32_t placeholder,
+                                 uint32_t stack_size, uint32_t ctx1,
+                                 uint32_t ctx2, int suspended,
+                                 uint32_t routine)
 {
-    struct bridge_thread_start *s = (struct bridge_thread_start *)param;
-    recomp_func_t fn = s->fn;
-    uint32_t ctx1 = s->ctx1, ctx2 = s->ctx2;
-
-    xbox_PinToGuestCore();
-#if !defined(_WIN32)
-    guest_turn_note_start((const void *)fn, ctx1);
-#endif
-
-    /* Own register set (RECOMP_TLS), own simulated stack -- and own TIB.
-     *
-     * The TIB carries the SEH chain head and, through fs:[4], the CRT's
-     * per-thread data. Sharing one made "which thread am I" a single answer
-     * for every thread, which is how two of them ended up inside _lock() each
-     * holding the lock the other wanted. */
-    g_is_spawned_thread = 1;
-    g_esp = s->stack_top;
-    g_thread_stack_top = s->stack_top;
-    {
-        uint32_t tib = xbox_AllocThreadTib();
-        if (tib)
-            g_fs_base = tib;
-        else
-            fprintf(stderr, "  [KERNEL] worker thread has no TIB of its own;"
-                            " it shares the main thread's\n");
-    }
-    free(s);
-
-    guest_cpu_join();
-    bridge_run_thread_inline(fn, ctx1, ctx2);
-    guest_cpu_part();
-
-    fprintf(stderr, "  [KERNEL] worker thread returned (eax=0x%08X)\n", g_eax);
-    fflush(stderr);
-    /* The routine returned instead of calling PsTerminateSystemThread; the
-     * stack is still ours to give back. */
-    xbox_FreeThreadStack(g_thread_stack_top);
-    g_thread_stack_top = 0;
-    return 0;
-}
-
-static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
-                                  uint32_t ctx2, uint32_t stack_top)
-{
-    struct bridge_thread_start *s = malloc(sizeof(*s));
+    uint32_t args[2] = { ctx1, ctx2 };
+    uint32_t status = 0;
     HANDLE th;
 
-    if (!s) return NULL;
-    s->fn = fn; s->ctx1 = ctx1; s->ctx2 = ctx2; s->stack_top = stack_top;
+    fprintf(stderr, "  [KERNEL] PsCreateSystemThread: routine=0x%08X ctx1=0x%08X ctx2=0x%08X\n",
+            routine, ctx1, ctx2);
+    fflush(stderr);
 
-    th = CreateThread(NULL, 0, bridge_thread_main, s, 0, NULL);
-    if (!th) free(s);
-    /* Record the game thread so a host-tick-driven title's watchdog can sample
-     * it via xbox_thread_debug_handle. Harmless for default-model titles: they
-     * spawn workers too, but never read it back. See kernel_thread.c. */
-    else xbox_set_game_thread(th);
-    return th;
+    if (handle_va)
+        BRIDGE_MEM32(handle_va) = placeholder;
+    if (!routine) {
+        g_eax = 0;
+        return;
+    }
+    th = xbox_frontend_spawn_thread(routine, 2, args, stack_size, 0, suspended, &status);
+    if (th && handle_va)
+        bridge_write_handle(handle_va, th);
+    g_eax = status;
 }
-
-/* Two ways a title expects its first PsCreateSystemThreadEx to behave.
- *
- * INLINE (default): the first call IS the game starting -- run the routine
- * inline, inheriting register state, and it drives its own main loop forever.
- * This is what Halo and Crimson Skies need and the historical behavior.
- *
- * SPAWN: the title's entry spawns an init thread and RETURNS, expecting the host
- * to drive the per-frame tick afterwards (Burnout 3 is tick-driven). Here the
- * first call must spawn a real thread and return, so control comes back to the
- * host. Opt in with xbox_SetThreadMode before the game starts. See
- * docs/technical/burnout3-reunification.md. */
-/* XBOX_THREAD_MODE_* and xbox_SetThreadMode are declared in xbox_memory_layout.h. */
-static int g_thread_mode = XBOX_THREAD_MODE_INLINE;
-void xbox_SetThreadMode(int mode) { g_thread_mode = mode; }
 
 static void bridge_PsCreateSystemThreadEx(void)
 {
-    uint32_t xbox_handle_ptr = STACK_ARG(0);
-    uint32_t start_context1  = STACK_ARG(5);
-    uint32_t start_context2  = STACK_ARG(6);
-    uint32_t start_routine   = STACK_ARG(9);
-    /* In SPAWN mode there is no privileged "first call": every thread is real,
-     * so the entry can return. In INLINE mode the first call runs the game. */
-    int is_first_call = (g_thread_mode == XBOX_THREAD_MODE_INLINE)
-                        && (g_thread_call_count == 0);
-    g_thread_call_count++;
-
-    fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx #%d: routine=0x%08X ctx1=0x%08X ctx2=0x%08X\n",
-            g_thread_call_count, start_routine, start_context1, start_context2);
-    fflush(stderr);
-
-    /* Write a fake handle to the output pointer */
-    if (xbox_handle_ptr) {
-        BRIDGE_MEM32(xbox_handle_ptr) = 0xBEEF0001;  /* fake handle */
-    }
-
-    /* Call the start routine synchronously through the recomp dispatch.
-     * Xbox thread start routines receive two parameters:
-     *   void ThreadRoutine(PVOID StartContext1, PVOID StartContext2)
-     * We push both onto the simulated stack (right-to-left).
-     *
-     * First call: the game's main thread entry point. Must run synchronously
-     * and inherit the current register state (this IS the game starting).
-     *
-     * Subsequent calls: worker threads. Must save/restore ALL global registers
-     * because on real Xbox each thread has its own register set. Without this,
-     * the worker clobbers the caller's g_esi, g_ebx, etc. */
-    if (start_routine) {
-        recomp_func_t fn = recomp_lookup(start_routine);
-        if (!fn) fn = recomp_lookup_manual(start_routine);
-        if (fn) {
-            if (is_first_call) {
-                /* Main game thread: run directly, inheriting register state */
-                g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
-                g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
-                g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-                fn();
-                g_esp += 12;
-                fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: main thread returned (g_eax=0x%08X)\n", g_eax);
-                fflush(stderr);
-            } else {
-                /* Worker thread: a real one.
-                 *
-                 * This used to run the routine synchronously and restore the
-                 * caller's registers afterwards, which is fine only for a
-                 * worker that finishes. Halo's cache/file worker does not -- it
-                 * blocks on an event waiting for requests, so CreateThread
-                 * never returned and startup deadlocked before the main loop.
-                 *
-                 * Now that the register set is thread-local (RECOMP_TLS), a
-                 * spawned thread gets its own, and the caller's is untouched by
-                 * construction rather than by save/restore. */
-                /* RECOMP_WORKERS=inline runs a title's worker routines on
-                 * the calling thread instead of spawning one.
-                 *
-                 * Not a mode to ship a title in -- a worker that blocks
-                 * waiting for requests never returns, and the caller never
-                 * gets control back. It is a bisecting tool: when something
-                 * only goes wrong with two guest threads running, this says so
-                 * in one run, and the answer separates a concurrency bug from
-                 * everything else it might have been. */
-                const char *inline_workers = getenv("RECOMP_WORKERS");
-                uint32_t stack_top;
-
-                if (inline_workers && !strcmp(inline_workers, "inline")) {
-                    fprintf(stderr, "  [KERNEL] RECOMP_WORKERS=inline: running "
-                            "worker 0x%08X on this thread\n", start_routine);
-                    fflush(stderr);
-                    bridge_run_thread_inline(fn, start_context1, start_context2);
-                    return;
-                }
-
-                stack_top = xbox_AllocThreadStack();
-
-                if (!stack_top) {
-                    fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: out of "
-                            "thread stacks, running worker 0x%08X inline\n",
-                            start_routine);
-                    fflush(stderr);
-                    bridge_run_thread_inline(fn, start_context1, start_context2);
-                } else {
-                    HANDLE th = bridge_spawn_thread(fn, start_context1,
-                                                    start_context2, stack_top);
-                    fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: spawned "
-                            "worker 0x%08X (ctx=0x%08X, stack top 0x%08X)\n",
-                            start_routine, start_context1, stack_top);
-                    fflush(stderr);
-                    if (xbox_handle_ptr && th) {
-                        bridge_write_handle(xbox_handle_ptr, th);
-                    }
-                }
-            }
-        } else {
-            fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: start routine 0x%08X not found in dispatch!\n",
-                    start_routine);
-        }
-    }
-
-    g_eax = 0; /* STATUS_SUCCESS */
+    bridge_create_thread(STACK_ARG(0), 0xBEEF0001, STACK_ARG(2), STACK_ARG(5),
+                         STACK_ARG(6), (int)(STACK_ARG(7) & 0xFF), STACK_ARG(9));
 }
 
 /* ── NtClose (ordinal 187) ───────────────────────────────
@@ -1480,7 +1287,7 @@ static void bridge_HalReturnToFirmware(void)
                     waited);
     }
 
-    xbox_HalReturnToFirmware(routine);
+    xbox_frontend_return_to_hub(routine);
 }
 
 static void bridge_ExAllocatePool(void)
@@ -1907,26 +1714,9 @@ static void bridge_NtUserIoApcDispatcher(void)
     uint32_t iostatus    = STACK_ARG(1);
     uint32_t status      = iostatus ? BRIDGE_MEM32(iostatus) : 0;
     uint32_t information = iostatus ? BRIDGE_MEM32(iostatus + 4) : 0;
-    recomp_func_t fn;
+    uint32_t args[3] = { status, information, iostatus };
 
-    fn = recomp_lookup(apc_context);
-    if (!fn) fn = recomp_lookup_manual(apc_context);
-    if (!fn) {
-        fprintf(stderr, "  [KERNEL] NtUserIoApcDispatcher: completion routine "
-                "0x%08X not in dispatch\n", apc_context);
-        fflush(stderr);
-        g_eax = 0;
-        return;
-    }
-
-    /* __stdcall, right-to-left. The callee's `ret 12` consumes the dummy
-     * return address and all three arguments, so g_esp needs no fixup here. */
-    g_esp -= 4; BRIDGE_MEM32(g_esp) = iostatus;
-    g_esp -= 4; BRIDGE_MEM32(g_esp) = information;
-    g_esp -= 4; BRIDGE_MEM32(g_esp) = (status == 0) ? 0 : status;
-    g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    fn();
-
+    xbox_frontend_guest_call(apc_context, 3, args, XBOX_CALL_STDCALL);
     g_eax = 0;
 }
 
@@ -2050,39 +1840,21 @@ static void bridge_AvSetDisplayMode(void)
 /* ── PsTerminateSystemThread (ordinal 258) ───────────────
  * VOID PsTerminateSystemThread(NTSTATUS ExitStatus)
  *
- * On real Xbox, this terminates the calling thread (never returns).
- * In our recompiled version, threads run synchronously, so we just
- * return. The caller (sub_001D1818) handles this gracefully.
+ * Does not return on hardware. A spawned worker that returned here would
+ * fall off the end of its start routine into whatever bytes follow (Halo's
+ * input worker landed on an int 3), so the front end ends the thread; only a
+ * thread it does not end comes back (the lifted main thread).
  */
 static void bridge_PsTerminateSystemThread(void)
 {
     uint32_t exit_status = STACK_ARG(0);
 
-    fprintf(stderr, "  [KERNEL] PsTerminateSystemThread: status=0x%08X%s\n",
-            exit_status, g_is_spawned_thread ? " (worker)" : " (main)");
+    fprintf(stderr, "  [KERNEL] PsTerminateSystemThread: status=0x%08X\n",
+            exit_status);
     fflush(stderr);
 
     g_eax = exit_status;
-
-    /*
-     * This does not return on hardware. Returning was survivable while every
-     * thread ran on the host's main thread, but a spawned worker that returns
-     * here falls off the end of its start routine and into whatever bytes
-     * follow -- Halo's input worker landed on an int 3, and the resulting
-     * breakpoint took down the whole process while the main thread was still
-     * inside input_initialize.
-     *
-     * The main thread still returns: it is the host's thread and unwinding
-     * back to main() is how the process shuts down cleanly.
-     */
-    if (g_is_spawned_thread) {
-        /* The normal exit for a worker, and therefore the one that has to
-         * return the stack -- ExitThread never comes back to bridge_thread_main
-         * to do it. */
-        xbox_FreeThreadStack(g_thread_stack_top);
-        g_thread_stack_top = 0;
-        ExitThread(exit_status);
-    }
+    xbox_frontend_exit_thread(exit_status);
 }
 
 /* ── HalReadSMCTrayState (ordinal 47) ─────────────────────
@@ -2122,17 +1894,14 @@ static void bridge_HalReadSMCTrayState(void)
 /* Run a DPC's deferred routine on the calling thread.
  *
  * VOID DeferredRoutine(PKDPC, PVOID Context, PVOID Arg1, PVOID Arg2),
- * __stdcall: its `ret 16` consumes the dummy return address and all four
- * arguments, so g_esp needs no fixup afterwards. The caller must already have
- * a guest stack -- true on a guest thread, and true on a host thread that has
- * taken a worker slice.
+ * __stdcall.
  *
- * Returns 1 if the routine was found and called.
+ * Returns 1 if the DPC named a routine and it was called.
  */
 static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
 {
     uint32_t routine, context;
-    recomp_func_t fn;
+    uint32_t args[4];
 
     if (!dpc_va)
         return 0;
@@ -2141,23 +1910,9 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
     if (!routine)
         return 0;
 
-    fn = recomp_lookup(routine);
-    if (!fn) fn = recomp_lookup_manual(routine);
-    if (!fn) {
-        fprintf(stderr, "  [KERNEL] DPC routine 0x%08X not in dispatch\n",
-                routine);
-        fflush(stderr);
-        return 0;
-    }
-
     BRIDGE_MEM32(dpc_va + 20) = arg1;
     BRIDGE_MEM32(dpc_va + 24) = arg2;
-
-    g_esp -= 4; BRIDGE_MEM32(g_esp) = arg2;
-    g_esp -= 4; BRIDGE_MEM32(g_esp) = arg1;
-    g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
-    g_esp -= 4; BRIDGE_MEM32(g_esp) = dpc_va;
-    g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+    args[0] = dpc_va; args[1] = context; args[2] = arg1; args[3] = arg2;
     {
         static unsigned n;
         if (n++ < 8)
@@ -2171,7 +1926,7 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
         extern void xbox_DispatchLockLeave(void);
         int held = xbox_DispatchLockEnter();
         int saved_irql = xbox_IrqlEnterInterrupt(2);
-        fn();
+        xbox_frontend_guest_call(routine, 4, args, XBOX_CALL_STDCALL);
         xbox_IrqlLeaveInterrupt(saved_irql);
         if (held)
             xbox_DispatchLockLeave();
@@ -2199,24 +1954,13 @@ static void bridge_KeSynchronizeExecution(void)
 {
     uint32_t routine = STACK_ARG(1);
     uint32_t context = STACK_ARG(2);
-    recomp_func_t fn;
 
-    fn = routine ? recomp_lookup(routine) : NULL;
-    if (!fn && routine) fn = recomp_lookup_manual(routine);
-    if (!fn) {
-        fprintf(stderr, "  [KERNEL] KeSynchronizeExecution: routine 0x%08X "
-                        "not in dispatch\n", routine);
-        fflush(stderr);
+    if (!routine) {
         g_eax = 0;
         return;
     }
-
-    /* BOOLEAN SynchronizeRoutine(PVOID Context), __stdcall. Its `ret 4` takes
-     * the dummy return address and the argument, so g_esp needs no fixup. */
-    g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
-    g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    fn();
-    /* g_eax is whatever the routine returned, which is this call's result. */
+    /* BOOLEAN SynchronizeRoutine(PVOID Context): its result is this call's. */
+    g_eax = (uint32_t)xbox_frontend_guest_call(routine, 1, &context, XBOX_CALL_STDCALL);
 }
 
 /* -- KeRemoveQueueDpc (ordinal 137) ------------------------
@@ -2370,10 +2114,7 @@ static void bridge_KeRemoveQueueDpc(void)
 
 /* Call a connected interrupt service routine.
  *
- * BOOLEAN ServiceRoutine(PKINTERRUPT, PVOID ServiceContext), __stdcall: its
- * `ret 8` takes the dummy return address and both arguments, so g_esp needs no
- * fixup. The caller must already have a guest stack and a TIB, which the timer
- * thread has.
+ * BOOLEAN ServiceRoutine(PKINTERRUPT, PVOID ServiceContext), __stdcall.
  *
  * Returns what the routine returned -- an ISR that does not recognise the
  * interrupt returns FALSE, and that is worth seeing rather than assuming.
@@ -2383,25 +2124,22 @@ uint32_t xbox_GetConnectedInterrupt(uint32_t vector);   /* defined below */
 static int kernel_raise_interrupt(uint32_t vector)
 {
     uint32_t kint = xbox_GetConnectedInterrupt(vector);
-    uint32_t routine, context;
-    recomp_func_t fn;
+    uint32_t routine, args[2];
+    uint64_t claimed;
 
     if (!kint)
         return -1;
     routine = BRIDGE_MEM32(kint + 0);
-    context = BRIDGE_MEM32(kint + 4);
     if (!routine)
         return -1;
-    fn = recomp_lookup(routine);
-    if (!fn) fn = recomp_lookup_manual(routine);
-    if (!fn)
-        return -1;
-
-    g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
-    g_esp -= 4; BRIDGE_MEM32(g_esp) = kint;
-    g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
-    return (int)(g_eax & 1u);
+    args[0] = kint;
+    args[1] = BRIDGE_MEM32(kint + 4);
+    {
+        int irql = xbox_IrqlEnterInterrupt(16);
+        claimed = xbox_frontend_guest_call(routine, 2, args, XBOX_CALL_STDCALL);
+        xbox_IrqlLeaveInterrupt(irql);
+    }
+    return (int)(claimed & 1u);
 }
 
 /* ── NV2A interrupts, as the hardware raises them ─────────────────────────
@@ -3145,8 +2883,6 @@ static int g_timer_started;
 
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 {
-    int slot = xbox_worker_stack_alloc();
-
     (void)unused;
     /* It runs interrupt and deferred routines, which on the console preempt
      * the title on its one CPU rather than running beside it. */
@@ -3160,13 +2896,19 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         extern void xbox_IrqlInterruptThread(void);
         xbox_IrqlInterruptThread();
     }
-    if (slot < 0) {
-        fprintf(stderr, "  [KERNEL] timer thread has no worker stack; "
-                        "timer DPCs will not run\n");
-        fflush(stderr);
-        return 0;
+#if !XBOXRECOMP_FRONTEND_DIRECT
+    /* A lifted guest stack and TIB for the thread's life; a direct front end
+     * gives the thread its guest identity on its first guest call. */
+    {
+        int slot = xbox_worker_stack_alloc();
+        if (slot < 0) {
+            fprintf(stderr, "  [KERNEL] timer thread has no worker stack; "
+                            "timer DPCs will not run\n");
+            fflush(stderr);
+            return 0;
+        }
+        g_esp = XBOX_WORKER_STACK_TOP(slot);
     }
-    g_esp = XBOX_WORKER_STACK_TOP(slot);
     {
         /* Its own TIB, for the same reason bridge_thread_main gives one to
          * every worker: a DPC routine with an SEH prologue reads fs:[0],
@@ -3181,6 +2923,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         }
         g_fs_base = tib;
     }
+#endif
 
     for (;;) {
         long long now;
@@ -3474,7 +3217,7 @@ static const char* bridge_get_xbox_path(uint32_t obj_attrs_va)
     /* Length <= MaximumLength says the string is self-consistent; it does not
      * say the buffer it names is inside the mapping. Without this, a string
      * near the top of guest memory reads up to 64 KB off the end. */
-    if (length && !bridge_va_mapped(buf_va, length)) return NULL;
+    if (length && !xbox_frontend_va_mapped(buf_va, length)) return NULL;
     memcpy(path,XBOX_TO_NATIVE(buf_va),length);
     path[length]='\0';
     return path;
@@ -3850,35 +3593,15 @@ static void bridge_NtOpenFile(void)
  * and made no difference (it still issues one 14 KB batch and stops), so it was
  * dropped rather than risk changing this shared path for the other titles.
  */
-recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);
-
+/* The APC can be game code or a kernel export: Halo's XAPI passes one of the
+ * kernel's own thunk targets. VOID ApcRoutine(PVOID ApcContext,
+ * PIO_STATUS_BLOCK, ULONG), __stdcall. */
 static void deliver_one_apc(uint32_t apc_routine, uint32_t apc_context,
                             uint32_t iostatus)
 {
-    /* The APC can be game code or a kernel export. Halo's XAPI passes the
-     * latter -- 0xFE0000FC, one of our own synthetic thunk VAs -- so the recomp
-     * dispatch correctly fails to find it and the kernel fallback is the one
-     * that matters. Checking only recomp_lookup left it undelivered. */
-    recomp_func_t fn = recomp_lookup(apc_routine);
-    if (!fn) fn = recomp_lookup_manual(apc_routine);
-    if (!fn) fn = recomp_lookup_kernel(apc_routine);
-    if (fn) {
-        /* VOID ApcRoutine(PVOID ApcContext, PIO_STATUS_BLOCK, ULONG) */
-        g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-        g_esp -= 4; BRIDGE_MEM32(g_esp) = iostatus;
-        g_esp -= 4; BRIDGE_MEM32(g_esp) = apc_context;
-        g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;   /* dummy return address */
-        fn();
-        g_esp += 12;
-    } else {
-        uint32_t ord = 0;
-        if (apc_routine >= KERNEL_VA_BASE && apc_routine < KERNEL_VA_END) {
-            ord = g_slot_ordinals[(apc_routine - KERNEL_VA_BASE) / 4];
-        }
-        fprintf(stderr, "  [KERNEL] file I/O APC 0x%08X unresolved"
-                " (kernel ordinal %u)\n", apc_routine, ord);
-        fflush(stderr);
-    }
+    uint32_t args[3] = { apc_context, iostatus, 0 };
+
+    xbox_frontend_guest_call(apc_routine, 3, args, XBOX_CALL_STDCALL);
 }
 
 /* Per-thread pending-APC ring. An APC is delivered on the thread that issued
@@ -3968,10 +3691,17 @@ static void bridge_RtlUnwind(void)
 {
     uint32_t target_frame = STACK_ARG(0);
     uint32_t exc_record   = STACK_ARG(2);
-    uint32_t reg          = BRIDGE_MEM32(XBOX_FS_BASE);
+    uint32_t kpcr         = xbox_frontend_kpcr();
+    uint32_t reg          = BRIDGE_MEM32(kpcr);
     uint32_t prev_reg     = 0;
     uint32_t scratch      = 0;
     int      guard;
+#if XBOXRECOMP_FRONTEND_DIRECT
+    /* NT_TIB: StackBase at +4, StackLimit at +8. */
+    uint32_t stack_lo = BRIDGE_MEM32(kpcr + 8), stack_hi = BRIDGE_MEM32(kpcr + 4);
+#else
+    uint32_t stack_lo = XBOX_STACK_BASE, stack_hi = XBOX_STACK_TOP;
+#endif
 
     /* An unwind with no record of its own still has to tell the handlers it
      * is an unwind, so synthesise one below the stack pointer. */
@@ -3990,7 +3720,7 @@ static void bridge_RtlUnwind(void)
 
         if (reg == XBOX_SEH_END_OF_CHAIN || reg == 0 || reg == target_frame)
             break;
-        if ((reg & 3u) || reg < XBOX_STACK_BASE || reg >= XBOX_STACK_TOP)
+        if ((reg & 3u) || reg < stack_lo || reg >= stack_hi)
             break;                       /* not a stack frame: chain is broken */
         if (prev_reg && reg <= prev_reg)
             break;                       /* not climbing: cycle or corruption */
@@ -4000,28 +3730,13 @@ static void bridge_RtlUnwind(void)
 
         /* Pop before dispatching. The handler may raise, and it must not see
          * its own frame still on the chain. */
-        BRIDGE_MEM32(XBOX_FS_BASE) = next;
+        BRIDGE_MEM32(kpcr) = next;
 
         if (handler) {
-            recomp_func_t fn = recomp_lookup(handler);
-            if (!fn) fn = recomp_lookup_manual(handler);
-            if (!fn) fn = recomp_lookup_kernel(handler);
-            if (fn) {
-                /* EXCEPTION_DISPOSITION handler(record, frame, context,
-                 * dispatcher) -- cdecl, so the caller pops. */
-                g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-                g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-                g_esp -= 4; BRIDGE_MEM32(g_esp) = reg;
-                g_esp -= 4; BRIDGE_MEM32(g_esp) = exc_record;
-                g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;  /* return address */
-                fn();
-                /* 16, not 20: the handler's own `ret` has already taken the
-                 * return address off, leaving just the four arguments for the
-                 * caller to drop. Cleaning 20 leaves esp four bytes high, and
-                 * every argument the unwound-into frame reads after that comes
-                 * from one slot over. */
-                g_esp += 16;
-            }
+            /* EXCEPTION_DISPOSITION handler(record, frame, context,
+             * dispatcher), cdecl. */
+            uint32_t args[4] = { exc_record, reg, 0, 0 };
+            xbox_frontend_guest_call(handler, 4, args, XBOX_CALL_CDECL);
         }
 
         prev_reg = reg;
@@ -4031,7 +3746,7 @@ static void bridge_RtlUnwind(void)
     /* Land on the target even if the walk stopped early: leaving fs:[0] on a
      * discarded frame is worse than losing a __finally. */
     if (target_frame && target_frame != XBOX_SEH_END_OF_CHAIN)
-        BRIDGE_MEM32(XBOX_FS_BASE) = target_frame;
+        BRIDGE_MEM32(kpcr) = target_frame;
 
     if (scratch)
         g_esp += 0x50;
@@ -8779,60 +8494,11 @@ static void bridge_ObReferenceObjectByPointer(void)
  *                               PVOID StartContext1, PVOID StartContext2,
  *                               PXBOX_SYSTEM_ROUTINE StartRoutine);
  * Mirror of PsCreateSystemThreadEx (ordinal 255) with the ThreadExtraSize
- * argument dropped: same first-call-inline / worker-spawn behaviour.
- * Requires bridge_spawn_thread/bridge_run_thread_inline/g_thread_mode from
- * Section A of kernel_bridge.c. */
+ * argument dropped. */
 static void bridge_PsCreateSystemThread(void)
 {
-    uint32_t xbox_handle_ptr = STACK_ARG(0);
-    uint32_t start_context1  = STACK_ARG(4);
-    uint32_t start_context2  = STACK_ARG(5);
-    uint32_t start_routine   = STACK_ARG(6);
-    int is_first_call = (g_thread_mode == XBOX_THREAD_MODE_INLINE)
-                        && (g_thread_call_count == 0);
-
-    g_thread_call_count++;
-
-    /* Fake handle until the worker path can write a real one. */
-    if (xbox_handle_ptr)
-        BRIDGE_MEM32(xbox_handle_ptr) = 0xBEEF0002;
-
-    if (start_routine) {
-        recomp_func_t fn = recomp_lookup(start_routine);
-        if (!fn)
-            fn = recomp_lookup_manual(start_routine);
-        if (fn) {
-            if (is_first_call) {
-                g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
-                g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
-                g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-                fn();
-                g_esp += 12;
-            } else {
-                const char *inline_workers = getenv("RECOMP_WORKERS");
-                uint32_t stack_top;
-
-                if (inline_workers && !strcmp(inline_workers, "inline")) {
-                    bridge_run_thread_inline(fn, start_context1, start_context2);
-                    g_eax = 0;
-                    return;
-                }
-                stack_top = xbox_AllocThreadStack();
-                if (!stack_top) {
-                    bridge_run_thread_inline(fn, start_context1, start_context2);
-                } else {
-                    HANDLE th = bridge_spawn_thread(fn, start_context1,
-                                                    start_context2, stack_top);
-                    if (xbox_handle_ptr && th)
-                        bridge_write_handle(xbox_handle_ptr, th);
-                }
-            }
-        } else {
-            fprintf(stderr, "  [KERNEL] PsCreateSystemThread: start routine 0x%08X not found in dispatch!\n",
-                    start_routine);
-        }
-    }
-    g_eax = 0;  /* STATUS_SUCCESS */
+    bridge_create_thread(STACK_ARG(0), 0xBEEF0002, STACK_ARG(1), STACK_ARG(4),
+                         STACK_ARG(5), 0, STACK_ARG(6));
 }
 
 /* --- PsQueryStatistics (ordinal 256, 1 arg = 4 bytes)
@@ -10701,6 +10367,33 @@ static void kernel_thunk_dispatch_body(void)
 #endif
 }
 
+/* A kernel call from a front end that keeps no thunk slots: the guest's
+ * registers are already in g_esp (at the return address), g_ecx and g_edx.
+ * Pops the return address into g_xbox_kernel_caller, runs the bridge, pops the
+ * stdcall arguments. */
+int xbox_kernel_bridge_call(uint16_t ordinal)
+{
+    bridge_func_t bridge = bridge_for_ordinal(ordinal);
+    int arg_bytes;
+
+    if (!bridge)
+        return 0;
+    arg_bytes = stdcall_args_for_ordinal(ordinal);
+    if (ordinal < XBOX_KERNEL_THUNK_TABLE_SIZE)
+        g_ordinal_calls[ordinal]++;
+    g_kernel_call_count++;
+    g_xbox_kernel_caller = BRIDGE_MEM32(g_esp);
+    g_esp += 4;
+    bridge();
+    g_esp += arg_bytes < 0 ? 0 : (uint32_t)arg_bytes;
+    return 1;
+}
+
+uint32_t xbox_kernel_data_export(uint16_t ordinal)
+{
+    return kernel_data_va_for_ordinal(ordinal);
+}
+
 /* ── Dispatch lookup ────────────────────────────────────── */
 
 /**
@@ -10807,7 +10500,7 @@ void xbox_kernel_bridge_init(void)
     );
 
     /* Initialize kernel data export values first */
-    kernel_data_init();
+    xbox_kernel_data_init();
 
     for (i = 0; i < g_thunk_table_count; i++) {
         uint32_t va = g_thunk_table_base + i * 4;

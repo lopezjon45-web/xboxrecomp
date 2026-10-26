@@ -1,0 +1,8 @@
+frontend_lifted.c
+guest_vmem.c
+icall_feedback.c
+kernel_memory.c
+kernel_thread.c
+kernel_thunks.c
+recomp_trace.c
+xbox_memory_layout.c
