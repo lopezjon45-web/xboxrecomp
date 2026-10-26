@@ -197,12 +197,49 @@ static uint32_t kernel_data_va_for_ordinal(ULONG ordinal)
     }
 }
 
+/* KSYSTEM_TIME is LowPart, High1Time, High2Time. Written High2Time first and
+ * High1Time last, so a reader that finds the two high parts unequal knows it
+ * read across an update and reads again. */
+static void kernel_write_system_time(uint32_t va, ULONGLONG t)
+{
+    BRIDGE_MEM32(va + 8) = (uint32_t)(t >> 32);
+    BRIDGE_MEM32(va + 0) = (uint32_t)t;
+    BRIDGE_MEM32(va + 4) = (uint32_t)(t >> 32);
+}
+
+static void kernel_clocks_update(void)
+{
+    ULONGLONG ms = xbox_GuestUptimeMs();
+    FILETIME ft;
+
+    GetSystemTimeAsFileTime(&ft);
+    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT) = (uint32_t)ms;
+    kernel_write_system_time(XBOX_KERNEL_DATA_BASE + KDATA_INTERRUPT_TIME, ms * 10000ull);
+    kernel_write_system_time(XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME,
+                             ((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime);
+}
+
+/* KeTickCount, KeInterruptTime and KeSystemTime are variables a title reads,
+ * and the console's clock interrupt moves them whether or not anyone asks.
+ * Nothing else here would: the lifted front end's tick thread lives in a file
+ * the direct front end does not build. */
+static DWORD WINAPI kernel_clock_thread(LPVOID unused)
+{
+    (void)unused;
+    for (;;) {
+        kernel_clocks_update();
+        Sleep(1);
+    }
+}
+
 /**
  * Initialize kernel data export values at the kernel data area.
  * Called during bridge init, after Xbox memory is mapped.
  */
 void xbox_kernel_data_init(void)
 {
+    static volatile LONG clock_started;
+
     /* XboxHardwareInfo (ordinal 322) - XBOX_HARDWARE_INFO
      *   +0: ULONG Flags (0 = retail, 0x20 = devkit)
      *   +4: UCHAR GpuRevision
@@ -223,9 +260,9 @@ void xbox_kernel_data_init(void)
     BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 4) = 5849;
     BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 6) = 0;
 
-    /* KeTickCount (ordinal 156) - initialized to current tick count.
-     * A background thread in main.c updates this every ~1ms. */
-    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT) = (uint32_t)xbox_GuestUptimeMs();
+    kernel_clocks_update();
+    if (!InterlockedCompareExchange(&clock_started, 1, 0))
+        CloseHandle(CreateThread(NULL, 0, kernel_clock_thread, NULL, 0, NULL));
 
     /* LaunchDataPage (ordinal 164).
      *
@@ -289,21 +326,10 @@ void xbox_kernel_data_init(void)
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_DIRECTORY_OBJ_TYPE) = XBOX_KERNEL_DATA_BASE + KDATA_DIRECTORY_OBJ_TYPE;
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SYMLINK_OBJ_TYPE)   = XBOX_KERNEL_DATA_BASE + KDATA_SYMLINK_OBJ_TYPE;
 
-    /* KeInterruptTime and KeSystemTime (ordinals 120, 154) are KSYSTEM_TIME:
-     * LowPart, High1Time, High2Time, in 100 ns units since boot and since
-     * 1601. MmGlobalData, KiBugCheckData, ObpObjectHandleTable and
-     * XboxEEPROMKey are zero, as on a console that has not bugchecked and
-     * whose key the runtime does not have. */
+    /* MmGlobalData, KiBugCheckData, ObpObjectHandleTable and XboxEEPROMKey
+     * are zero, as on a console that has not bugchecked and whose key the
+     * runtime does not have. */
     {
-        ULONGLONG it = xbox_GuestUptimeMs() * 10000ull;
-        FILETIME ft;
-        GetSystemTimeAsFileTime(&ft);
-        BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_INTERRUPT_TIME + 0) = (uint32_t)it;
-        BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_INTERRUPT_TIME + 4) = (uint32_t)(it >> 32);
-        BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_INTERRUPT_TIME + 8) = (uint32_t)(it >> 32);
-        BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME + 0) = ft.dwLowDateTime;
-        BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME + 4) = ft.dwHighDateTime;
-        BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME + 8) = ft.dwHighDateTime;
         memset(XBOX_TO_NATIVE(XBOX_KERNEL_DATA_BASE + KDATA_MM_GLOBAL_DATA), 0, 0x20);
         memset(XBOX_TO_NATIVE(XBOX_KERNEL_DATA_BASE + KDATA_BUG_CHECK_DATA), 0, 0x20);
         memset(XBOX_TO_NATIVE(XBOX_KERNEL_DATA_BASE + KDATA_OBJECT_HANDLE_TABLE), 0, 0x20);
