@@ -4566,9 +4566,8 @@ static void bridge_ObReferenceObjectByHandle(void)
 /* ── RtlRaiseException (ordinal 302) ─────────────────────
  * VOID RtlRaiseException(PEXCEPTION_RECORD ExceptionRecord)
  *
- * Called by CRT / SEH code to raise structured exceptions.
- * On Xbox this triggers the kernel exception dispatcher.
- * For recompilation, we log and continue (no real SEH dispatch yet).
+ * Called by CRT / SEH code to raise structured exceptions. On Xbox this
+ * dispatches through the fs:[0] handler chain.
  */
 static void bridge_RtlRaiseException(void)
 {
@@ -4593,8 +4592,16 @@ static void bridge_RtlRaiseException(void)
      *
      * _clearfp() clears both x87 and SSE exception flags on Windows x64.
      */
+    /* Dispatch to the title's handlers is not implemented. A float code is
+     * answered as the CRT's handler would answer it; any other is refused,
+     * since returning would tell the raiser a handler had taken it. */
     if (code >= 0xC0000090u && code <= 0xC0000096u) {
         _clearfp();
+    } else {
+        char what[96];
+        snprintf(what, sizeof what, "RtlRaiseException(0x%08X): no dispatch to the title's exception handlers",
+                 code);
+        xbox_frontend_refuse(what);
     }
 
     g_eax = 0;

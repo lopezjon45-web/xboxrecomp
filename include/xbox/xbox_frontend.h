@@ -52,6 +52,11 @@ __attribute__((noreturn))
 #endif
 void xbox_frontend_return_to_hub(uint32_t reason);
 
+/* A kernel call the runtime cannot carry out as asked. A front end that stops on a missing feature stops the guest
+ * here, naming `what` and the call site, and does not return; one that does not logs it and returns, and the bridge
+ * answers as it did before. */
+void xbox_frontend_refuse(const char *what);
+
 /* Whether an NV2A model holds the GPU's registers; the timer thread's GPU work needs one. */
 int xbox_frontend_nv2a_attached(void);
 

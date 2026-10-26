@@ -271,6 +271,12 @@ void xbox_frontend_return_to_hub(uint32_t reason)
     ExitProcess(0);
 }
 
+void xbox_frontend_refuse(const char *what)
+{
+    fprintf(stderr, "  [KERNEL] refused: %s\n", what);
+    fflush(stderr);
+}
+
 int xbox_frontend_nv2a_attached(void)
 {
     return 1;
