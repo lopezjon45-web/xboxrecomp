@@ -8087,17 +8087,20 @@ static void bridge_KiUnlockDispatcherDatabase(void)
 }
 
 /* --- KeGetCurrentIrql (ordinal 103, 0 args = 0 bytes)
- * Stack-based with 0 args (not the Kf* fastcall form). IRQL is unmounted, so
- * report PASSIVE_LEVEL. */
+ * Stack-based with 0 args (not the Kf* fastcall form). The calling thread's
+ * IRQL is its KPCR's byte at 0x24, which KfRaiseIrql and KfLowerIrql keep. */
 static void bridge_KeGetCurrentIrql(void)
 {
-    g_eax = 0;  /* PASSIVE_LEVEL */
+    g_eax = BRIDGE_MEM8(xbox_frontend_kpcr() + 0x24);
 }
 
-/* --- KeGetCurrentThread (ordinal 104, 0 args = 0 bytes) --- */
+/* --- KeGetCurrentThread (ordinal 104, 0 args = 0 bytes)
+ * The KTHREAD in the calling thread's KPRCB (KPCR + 0x28), which the front end
+ * fills for every guest thread: nxdk's TLS and thread-id helpers read
+ * TlsData and UniqueThread through it. */
 static void bridge_KeGetCurrentThread(void)
 {
-    g_eax = 0;
+    g_eax = BRIDGE_MEM32(xbox_frontend_kpcr() + 0x28);
 }
 
 /* --- KeSetDisableBoostThread (ordinal 144, 2 args = 8 bytes) --- */
