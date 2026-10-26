@@ -1261,13 +1261,12 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
         enable  = hc->reg[HcInterruptEnable / 4];
 
         /* Operational is HCFS == 10b in bits 7:6. Interrupting a controller
-         * the driver has not started yet is not a test of anything. */
+         * the driver has not started yet is not a test of anything. The loop
+         * waits however long that takes: a title may bring USB up long after
+         * the controller is attached, and then needs the pad all the same. */
         if ((control & 0xC0u) != 0x80u) {
             held_since = 0;
             operational_since = 0;
-            if (!plugged && GetTickCount64() - start_ms > 30000) {
-                bus_unlock(); break;
-            }
             bus_unlock(); continue;
         }
         if (!operational_since)
