@@ -52,6 +52,14 @@ int WINAPI SHCreateDirectoryExW(HWND hwnd, LPCWSTR pszPath, const SECURITY_ATTRI
     return ERROR_SUCCESS;
 }
 
+DWORD WINAPI xbox_app_GetFileAttributesW(LPCWSTR lpFileName)
+{
+    WIN32_FILE_ATTRIBUTE_DATA data;
+    if (!GetFileAttributesExFromAppW(lpFileName, GetFileExInfoStandard, &data))
+        return INVALID_FILE_ATTRIBUTES;
+    return data.dwFileAttributes;
+}
+
 int WINAPI SHCreateDirectoryExA(HWND hwnd, LPCSTR pszPath, const SECURITY_ATTRIBUTES *psa)
 {
     wchar_t wide[MAX_PATH];

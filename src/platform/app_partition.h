@@ -104,6 +104,26 @@ HRESULT WINAPI SHGetFolderPathW(HWND hwnd, int csidl, HANDLE hToken, DWORD dwFla
 int WINAPI SHCreateDirectoryExW(HWND hwnd, LPCWSTR pszPath, const SECURITY_ATTRIBUTES *psa);
 int WINAPI SHCreateDirectoryExA(HWND hwnd, LPCSTR pszPath, const SECURITY_ATTRIBUTES *psa);
 
+/* ---- BROKERED ---------------------------------------------------------------------------------------------- */
+
+/* Declared, but on E: (removable storage) the plain call fails with error 5 (vault-one-s/probe/FINDINGS.md). The
+ * FromApp call has the same contract, goes through the broker only when the plain one is refused, and so costs
+ * nothing extra in LocalState. Saves on the drive (kernel_path.c's saves root) and kernel_file.c's opens reach E:
+ * through these. Redirected by function-like macro, so those files read as upstream wrote them and a field of the same
+ * name (FILE_DISPOSITION_INFO.DeleteFile) is left alone. */
+#include <fileapifromapp.h>
+#define CreateFileW(name, access, share, security, disposition, flags, template) \
+    CreateFileFromAppW((name), (access), (share), (security), (disposition), (flags), (template))
+#define CreateDirectoryW(name, security) CreateDirectoryFromAppW((name), (security))
+#define DeleteFileW(name) DeleteFileFromAppW(name)
+#define RemoveDirectoryW(name) RemoveDirectoryFromAppW(name)
+#define CopyFileW(from, to, fail_if_exists) CopyFileFromAppW((from), (to), (fail_if_exists))
+#define GetFileAttributesExW(name, level, data) GetFileAttributesExFromAppW((name), (level), (data))
+#define FindFirstFileW(pattern, found) \
+    FindFirstFileExFromAppW((pattern), FindExInfoStandard, (found), FindExSearchNameMatch, NULL, 0)
+DWORD WINAPI xbox_app_GetFileAttributesW(LPCWSTR lpFileName);
+#define GetFileAttributesW(name) xbox_app_GetFileAttributesW(name)
+
 #ifdef __cplusplus
 }
 #endif
