@@ -271,6 +271,12 @@ void xbox_frontend_return_to_hub(uint32_t reason)
     ExitProcess(0);
 }
 
+int xbox_frontend_raise(uint32_t record)
+{
+    (void)record;
+    return 0;
+}
+
 void xbox_frontend_refuse(const char *what)
 {
     fprintf(stderr, "  [KERNEL] refused: %s\n", what);

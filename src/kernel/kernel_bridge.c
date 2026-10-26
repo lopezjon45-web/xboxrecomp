@@ -4593,7 +4593,8 @@ static void bridge_ObReferenceObjectByHandle(void)
  * VOID RtlRaiseException(PEXCEPTION_RECORD ExceptionRecord)
  *
  * Called by CRT / SEH code to raise structured exceptions. On Xbox this
- * dispatches through the fs:[0] handler chain.
+ * dispatches through the fs:[0] handler chain; a front end that can does
+ * that, and the call does not return here.
  */
 static void bridge_RtlRaiseException(void)
 {
@@ -4618,9 +4619,12 @@ static void bridge_RtlRaiseException(void)
      *
      * _clearfp() clears both x87 and SSE exception flags on Windows x64.
      */
-    /* Dispatch to the title's handlers is not implemented. A float code is
-     * answered as the CRT's handler would answer it; any other is refused,
-     * since returning would tell the raiser a handler had taken it. */
+    if (record_ptr && xbox_frontend_raise(record_ptr))
+        return;
+
+    /* A front end without a dispatcher: a float code is answered as the CRT's
+     * handler would answer it; any other is refused, since returning would
+     * tell the raiser a handler had taken it. */
     if (code >= 0xC0000090u && code <= 0xC0000096u) {
         _clearfp();
     } else {

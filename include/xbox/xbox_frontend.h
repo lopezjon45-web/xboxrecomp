@@ -52,6 +52,10 @@ __attribute__((noreturn))
 #endif
 void xbox_frontend_return_to_hub(uint32_t reason);
 
+/* RtlRaiseException: deliver the guest's EXCEPTION_RECORD at `record` to the title's fs:[0] handlers. Returns 1 when
+ * the front end will resume the guest in its dispatcher instead of returning from the call, 0 when it cannot. */
+int xbox_frontend_raise(uint32_t record);
+
 /* A kernel call the runtime cannot carry out as asked. A front end that stops on a missing feature stops the guest
  * here, naming `what` and the call site, and does not return; one that does not logs it and returns, and the bridge
  * answers as it did before. */
