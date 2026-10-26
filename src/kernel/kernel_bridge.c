@@ -551,11 +551,12 @@ static void bridge_create_thread(uint32_t handle_va, uint32_t placeholder,
 
     if (handle_va)
         BRIDGE_MEM32(handle_va) = placeholder;
-    if (!routine) {
-        g_eax = 0;
-        return;
-    }
-    th = xbox_frontend_spawn_thread(routine, 2, args, stack_size, 0, suspended, &status);
+    /* With no system routine the kernel's own start-up calls the start
+     * routine with the start context, the one argument it takes. */
+    if (routine)
+        th = xbox_frontend_spawn_thread(routine, 2, args, stack_size, 0, suspended, &status);
+    else
+        th = xbox_frontend_spawn_thread(ctx1, 1, &args[1], stack_size, 0, suspended, &status);
     if (th && handle_va)
         bridge_write_handle(handle_va, th);
     g_eax = status;
@@ -2939,22 +2940,24 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
          * cadence lands up to ten late, which is most of a frame. Everything
          * else here self-limits, so the extra wake-ups cost a check. */
         WaitForSingleObject(g_timer_wake, 1);
-        kernel_vblank_tick();  /* the GPU's frame clock latches */
-        kernel_ptimer_tick();  /* and its programmable alarm */
-        /* Present software methods one at a time and deliver while the
-         * line is up; a frame raises dozens, so keep going until neither
-         * has anything to do. */
-        /* The deferred routine is what acknowledges a software method, so it
-         * runs inside the loop: draining only after it held the GPU to one
-         * software method per tick, and since the executor stops at each,
-         * push-buffer execution fell hundreds of kilobytes behind. */
-        for (int k = 0; k < PGRAPH_SWM_QUEUE; k++) {
-            int presented = kernel_pgraph_present();
-            int delivered = kernel_nv2a_deliver();
-            if (!presented && !delivered)
-                break;
-            if (delivered)
-                kernel_drain_dpcs();
+        if (xbox_frontend_nv2a_attached()) {
+            kernel_vblank_tick();  /* the GPU's frame clock latches */
+            kernel_ptimer_tick();  /* and its programmable alarm */
+            /* Present software methods one at a time and deliver while the
+             * line is up; a frame raises dozens, so keep going until neither
+             * has anything to do. */
+            /* The deferred routine is what acknowledges a software method, so
+             * it runs inside the loop: draining only after it held the GPU to
+             * one software method per tick, and since the executor stops at
+             * each, push-buffer execution fell hundreds of kilobytes behind. */
+            for (int k = 0; k < PGRAPH_SWM_QUEUE; k++) {
+                int presented = kernel_pgraph_present();
+                int delivered = kernel_nv2a_deliver();
+                if (!presented && !delivered)
+                    break;
+                if (delivered)
+                    kernel_drain_dpcs();
+            }
         }
         kernel_drain_dpcs();   /* deferred work, before due timers */
         {

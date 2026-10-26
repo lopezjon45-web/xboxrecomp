@@ -271,6 +271,11 @@ void xbox_frontend_return_to_hub(uint32_t reason)
     ExitProcess(0);
 }
 
+int xbox_frontend_nv2a_attached(void)
+{
+    return 1;
+}
+
 const XboxDiscVolume *xbox_frontend_disc(void)
 {
     return NULL;
