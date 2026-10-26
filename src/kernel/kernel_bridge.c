@@ -524,11 +524,11 @@ static void bridge_write_handle(uint32_t handle_va, HANDLE h);
  *   ULONG KernelStackSize,     // arg2: value
  *   ULONG TlsDataSize,         // arg3: value
  *   PULONG ThreadId,           // arg4: Xbox VA → pointer (can be NULL)
- *   PVOID StartContext1,       // arg5: Xbox VA → opaque
- *   PVOID StartContext2,       // arg6: Xbox VA → opaque
+ *   PKSTART_ROUTINE StartRoutine, // arg5: Xbox function pointer
+ *   PVOID StartContext,        // arg6: Xbox VA → opaque
  *   BOOLEAN CreateSuspended,   // arg7: value
  *   BOOLEAN DebugStack,        // arg8: value
- *   PXBOX_SYSTEM_ROUTINE StartRoutine  // arg9: Xbox function pointer
+ *   PKSYSTEM_ROUTINE SystemRoutine     // arg9: Xbox function pointer or NULL
  * )
  *
  * The front end makes the thread (xbox_frontend_spawn_thread); the guest's
@@ -537,26 +537,24 @@ static void bridge_write_handle(uint32_t handle_va, HANDLE h);
  * there is no thread to name, so the handle keeps a placeholder value.
  */
 static void bridge_create_thread(uint32_t handle_va, uint32_t placeholder,
-                                 uint32_t stack_size, uint32_t ctx1,
-                                 uint32_t ctx2, int suspended,
-                                 uint32_t routine)
+                                 uint32_t stack_size, uint32_t start_routine,
+                                 uint32_t start_context, int suspended,
+                                 uint32_t system_routine)
 {
-    uint32_t args[2] = { ctx1, ctx2 };
+    uint32_t args[2] = { start_routine, start_context };
     uint32_t status = 0;
     HANDLE th;
 
-    fprintf(stderr, "  [KERNEL] PsCreateSystemThread: routine=0x%08X ctx1=0x%08X ctx2=0x%08X\n",
-            routine, ctx1, ctx2);
+    fprintf(stderr, "  [KERNEL] PsCreateSystemThread: system routine=0x%08X start routine=0x%08X context=0x%08X\n",
+            system_routine, start_routine, start_context);
     fflush(stderr);
 
     if (handle_va)
         BRIDGE_MEM32(handle_va) = placeholder;
-    /* With no system routine the kernel's own start-up calls the start
-     * routine with the start context, the one argument it takes. */
-    if (routine)
-        th = xbox_frontend_spawn_thread(routine, 2, args, stack_size, 0, suspended, &status);
+    if (system_routine)
+        th = xbox_frontend_spawn_thread(system_routine, 2, args, stack_size, 0, suspended, &status);
     else
-        th = xbox_frontend_spawn_thread(ctx1, 1, &args[1], stack_size, 0, suspended, &status);
+        th = xbox_frontend_spawn_thread(start_routine, 1, &args[1], stack_size, 0, suspended, &status);
     if (th && handle_va)
         bridge_write_handle(handle_va, th);
     g_eax = status;

@@ -52,8 +52,7 @@ __attribute__((noreturn))
 #endif
 void xbox_frontend_return_to_hub(uint32_t reason);
 
-/* Whether an NV2A model is attached. Without one the timer thread latches no vertical blank, runs no PTIMER and
- * delivers no GPU interrupt: those read and write NV2A registers that nothing holds. */
+/* Whether an NV2A model holds the GPU's registers; the timer thread's GPU work needs one. */
 int xbox_frontend_nv2a_attached(void);
 
 /* The disc volume behind \Device\CdRom0, or NULL when D:\ is a host folder (xbox_path_init's game_dir). */
