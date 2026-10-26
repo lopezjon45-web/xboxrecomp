@@ -72,9 +72,12 @@ __declspec(dllimport) MMRESULT WINAPI timeEndPeriod(UINT uPeriod);
 
 /* ---- ABSENT (app_partition.c) ------------------------------------------------------------------------------- */
 
-/* Signal then reset. Releases the threads already waiting on a manual-reset event, or one waiter of an
+/* Signal then reset. Defined under its own name and reached through a macro: kernel32.lib, linked ahead of
+ * WindowsApp.lib (see the shell's CMake), carries a PulseEvent thunk that would clash with the stand-in; the
+ * shell-folder names below are in no linked library. Releases the threads already waiting on a manual-reset event, or one waiter of an
  * auto-reset event, and leaves the event clear. kernel_bridge.c NtPulseEvent/KePulseEvent. */
-BOOL WINAPI PulseEvent(HANDLE hEvent);
+BOOL WINAPI xbox_app_PulseEvent(HANDLE hEvent);
+#define PulseEvent xbox_app_PulseEvent
 
 /* CSIDL_LOCAL_APPDATA answers xbox_shell_data_root() (LocalState); any other folder is E_INVALIDARG.
  * kernel_path.c, reached only when the program passes no save folder (Def Jam always passes one). */
