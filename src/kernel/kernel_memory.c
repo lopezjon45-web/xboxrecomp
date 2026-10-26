@@ -442,6 +442,18 @@ NTSTATUS __stdcall xbox_NtAllocateVirtualMemory(
     return STATUS_SUCCESS;
 }
 
+/* The host's protection is the guest's: guest memory is a host mapping at
+ * xbox_GetMemoryOffset(). */
+uint32_t xbox_NtProtectVirtualMemory(uint32_t *base, uint32_t *size, uint32_t protect, uint32_t *old_protect)
+{
+    DWORD old = 0;
+
+    if (!VirtualProtect((LPVOID)((uintptr_t)*base + xbox_GetMemoryOffset()), *size, (DWORD)protect, &old))
+        return 0xC0000005u;  /* STATUS_ACCESS_VIOLATION */
+    *old_protect = (uint32_t)old;
+    return 0;
+}
+
 NTSTATUS __stdcall xbox_NtFreeVirtualMemory(
     PVOID* BaseAddress,
     PSIZE_T RegionSize,

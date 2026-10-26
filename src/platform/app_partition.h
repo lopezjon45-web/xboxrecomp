@@ -22,6 +22,17 @@
 
 #if XBOXRECOMP_UWP
 
+/* The app family's memoryapi.h makes VirtualProtect a FORCEINLINE wrapper over
+ * VirtualProtectFromApp. cl.exe compiling C emits that wrapper as an external
+ * definition, and the static CRT pulls WindowsApp.lib's VirtualProtect import
+ * into the same link: LNK2005 (xbrt CI run 40283843558). Under its own name
+ * the wrapper collides with nothing. clang-cl does not emit it. */
+#include <winapifamily.h>
+#if defined(_MSC_VER) && !defined(__clang__) && !defined(__cplusplus) && \
+    WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_APP) && !WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
+#define VirtualProtect xbox_app_VirtualProtect
+#endif
+
 #include <windows.h>
 
 #ifdef __cplusplus

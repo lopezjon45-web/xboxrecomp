@@ -522,6 +522,10 @@ void xbox_kernel_bridge_init(void);
 int xbox_kernel_bridge_call(uint16_t ordinal);
 void xbox_kernel_data_init(void);
 uint32_t xbox_kernel_data_export(uint16_t ordinal);
+/* MmAllocateContiguousMemoryEx in a direct build: the front end's memory
+ * owner places it, zeroed; 0 when it cannot. */
+uint32_t xbox_ContiguousAllocRange(uint32_t size, uint32_t lowest, uint32_t highest,
+                                   uint32_t alignment, uint32_t protect);
 
 /**
  * Per-title kernel ordinal remap.
@@ -657,6 +661,8 @@ VOID    __stdcall xbox_MmDeleteKernelStack(PVOID StackBase, PVOID StackLimit);
 
 NTSTATUS __stdcall xbox_NtAllocateVirtualMemory(PVOID* BaseAddress, ULONG_PTR ZeroBits, PSIZE_T RegionSize, ULONG AllocationType, ULONG Protect);
 NTSTATUS __stdcall xbox_NtFreeVirtualMemory(PVOID* BaseAddress, PSIZE_T RegionSize, ULONG FreeType);
+/* Guest VAs in and out; the memory owner keeps the protection. */
+uint32_t xbox_NtProtectVirtualMemory(uint32_t *base, uint32_t *size, uint32_t protect, uint32_t *old_protect);
 NTSTATUS __stdcall xbox_NtQueryVirtualMemory(PVOID BaseAddress, PVOID MemoryInformation, ULONG MemoryInformationLength, PULONG ReturnLength);
 
 /* ============================================================================

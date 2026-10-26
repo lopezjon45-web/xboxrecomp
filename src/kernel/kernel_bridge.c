@@ -683,6 +683,11 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
     uint32_t prot = STACK_ARG(4);
     uint32_t xbox_va;
 
+#if XBOXRECOMP_FRONTEND_DIRECT
+    /* One owner of physical pages: the range, pinned or not, is its call. */
+    g_eax = xbox_ContiguousAllocRange(size, low, high, align, prot);
+    return;
+#endif
     (void)prot;
 
     /*
@@ -8244,8 +8249,7 @@ static void bridge_NtOpenDirectoryObject(void)
 /* --- NtProtectVirtualMemory (ordinal 204, 4 args = 16 bytes)
  * NTSTATUS NtProtectVirtualMemory(PVOID* BaseAddress, PSIZE_T RegionSize,
  *                                 ULONG NewProtect, PULONG OldProtect);
- * Both pointers live in guest memory; translate and let VirtualProtect do the
- * work. (No xbox_NtProtectVirtualMemory() exists in kernel.h; done inline.) */
+ * Both pointers live in guest memory. */
 static void bridge_NtProtectVirtualMemory(void)
 {
     uint32_t base_ptr = STACK_ARG(0);
@@ -8254,15 +8258,11 @@ static void bridge_NtProtectVirtualMemory(void)
     uint32_t old_ptr  = STACK_ARG(3);
     uint32_t base_va = base_ptr ? BRIDGE_MEM32(base_ptr) : 0;
     uint32_t size    = size_ptr ? BRIDGE_MEM32(size_ptr) : 0;
-    DWORD old = 0;
+    uint32_t old = 0;
 
-    if (VirtualProtect(XBOX_TO_NATIVE(base_va), size, (DWORD)new_prot, &old)) {
-        if (old_ptr)
-            BRIDGE_MEM32(old_ptr) = (uint32_t)old;
-        g_eax = 0;  /* STATUS_SUCCESS */
-    } else {
-        g_eax = 0xC0000005u;  /* STATUS_ACCESS_VIOLATION */
-    }
+    g_eax = xbox_NtProtectVirtualMemory(&base_va, &size, new_prot, &old);
+    if (g_eax == 0 && old_ptr)
+        BRIDGE_MEM32(old_ptr) = old;
 }
 
 /* --- NtQueueApcThread (ordinal 206, 5 args = 20 bytes) --- */
