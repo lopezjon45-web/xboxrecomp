@@ -1224,7 +1224,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
         xbox_IrqlInterruptThread();
     }
 
-    ULONGLONG held_since = 0, start_ms = GetTickCount64(), settle_ms = 0;
+    ULONGLONG held_since = 0, start_ms = GetTickCount64(), settle_ms = 0, operational_since = 0;
     for (;;) {
         OhciController *hc = &s_hc[s_device_hc];
         uint32_t control, enable, status;
@@ -1264,11 +1264,14 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * the driver has not started yet is not a test of anything. */
         if ((control & 0xC0u) != 0x80u) {
             held_since = 0;
+            operational_since = 0;
             if (!plugged && GetTickCount64() - start_ms > 30000) {
                 bus_unlock(); break;
             }
             bus_unlock(); continue;
         }
+        if (!operational_since)
+            operational_since = GetTickCount64();
         s_loop_passes++;
         if (!(enable & INTR_MIE)) {
             held_since = 0;
@@ -1295,8 +1298,10 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * Presenting it earlier does not work: the driver clears the connect
          * change during its own bring-up scan, and a reset clears interrupt
          * status, so a device that was always there is one that never
-         * arrives. */
-        if (!plugged && (enable & INTR_RHSC)) {
+         * arrives. XAPI's driver listens for root hub changes (RHSC); a driver
+         * that polls the root ports instead (nxdk's) never enables RHSC, so
+         * a second of operation with the master enable on stands for it. */
+        if (!plugged && ((enable & INTR_RHSC) || GetTickCount64() - operational_since > 1000)) {
             unsigned port = pad_root_port();
             hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
             hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
