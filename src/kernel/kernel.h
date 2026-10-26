@@ -553,6 +553,40 @@ void xbox_kernel_set_ordinal_remap(const unsigned short *map, int count);
 /* Initialize path translation with base directories */
 void xbox_path_init(const char* game_dir, const char* save_dir);
 
+/* The running title and where saves live: T:\ and U:\ (and the TDATA\<id> and
+ * UDATA\<id> folders XAPI links them to) are <saves_root>\<id>\TDATA and
+ * <saves_root>\<id>\UDATA. Creates the running title's two folders and makes
+ * the dashboard's first-run copy of the disc's UDATA files. Until it is called
+ * the saves root is save_dir and the title id 0. */
+void xbox_path_set_title(uint32_t title_id, const char* saves_root);
+
+/* Whether `xbox_path` names a file on the mounted disc volume (\Device\CdRom0\,
+ * D:\, or a drive the title linked to either); if so, writes the path below
+ * the disc root to `below` (backslash-separated, no leading or trailing
+ * separator, "" for the root). 0 when no disc volume is mounted. */
+int xbox_disc_path(const char* xbox_path, char* below, size_t size);
+
+/* The disc volume's files (kernel_disc.c). xbox_disc_owns says whether a
+ * handle is one of its files; each Nt*File call on such a handle goes to the
+ * matching xbox_disc_* call instead of the host file system. */
+NTSTATUS xbox_disc_create(const char* below, ACCESS_MASK access, ULONG disposition,
+                          ULONG options, PHANDLE handle, PXBOX_IO_STATUS_BLOCK iosb);
+int      xbox_disc_owns(HANDLE handle);
+const char* xbox_disc_handle_path(HANDLE handle);
+NTSTATUS xbox_disc_read(HANDLE handle, PXBOX_IO_STATUS_BLOCK iosb, PVOID buffer,
+                        ULONG length, PLARGE_INTEGER offset);
+NTSTATUS xbox_disc_query_information(HANDLE handle, PXBOX_IO_STATUS_BLOCK iosb, PVOID info,
+                                     ULONG length, XBOX_FILE_INFORMATION_CLASS info_class);
+NTSTATUS xbox_disc_set_information(HANDLE handle, PXBOX_IO_STATUS_BLOCK iosb, PVOID info,
+                                   ULONG length, XBOX_FILE_INFORMATION_CLASS info_class);
+NTSTATUS xbox_disc_query_volume(HANDLE handle, PXBOX_IO_STATUS_BLOCK iosb, PVOID info,
+                                ULONG length, XBOX_FS_INFORMATION_CLASS info_class);
+NTSTATUS xbox_disc_query_directory(HANDLE handle, PXBOX_IO_STATUS_BLOCK iosb, PVOID info,
+                                   ULONG length, XBOX_FILE_INFORMATION_CLASS info_class,
+                                   PXBOX_ANSI_STRING pattern, BOOLEAN restart);
+NTSTATUS xbox_disc_full_attributes(const char* below, PXBOX_FILE_NETWORK_OPEN_INFORMATION info);
+void     xbox_disc_close(HANDLE handle);
+
 /*
  * Character type of a translated host path. The Win32 file APIs take wide
  * chars; POSIX takes bytes. kernel_path.c and kernel_file.c are split on

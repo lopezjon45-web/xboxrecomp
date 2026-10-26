@@ -55,8 +55,30 @@ void xbox_frontend_return_to_hub(uint32_t reason);
 /* Whether an NV2A model holds the GPU's registers; the timer thread's GPU work needs one. */
 int xbox_frontend_nv2a_attached(void);
 
-/* The disc volume behind \Device\CdRom0, or NULL when D:\ is a host folder (xbox_path_init's game_dir). */
+/* One file or directory of the disc. */
+typedef struct XboxDiscEntry {
+    uint32_t id;           /* the volume's name for it in read and child; stable for the session */
+    uint32_t attributes;   /* the XDVDFS attribute byte (0x10 directory, 0x01 read-only, ...) */
+    uint64_t size;         /* bytes; 0 for a directory */
+} XboxDiscEntry;
+
+/* The disc volume behind \Device\CdRom0 and D:\ (kernel_disc.c), read in place from the image. Every function may be
+ * called from any guest thread at once. */
 typedef struct XboxDiscVolume XboxDiscVolume;
+struct XboxDiscVolume {
+    /* `path` is below the disc root: backslash-separated, any case, no leading backslash; "" is the root directory.
+     * Returns 1 and fills *out, or 0 when nothing has that name. */
+    int (*find)(const XboxDiscVolume *v, const char *path, XboxDiscEntry *out);
+    /* Copies up to `len` bytes of file `id` from `offset`. Returns the count, short only at the end of the file, or
+     * -1 when the image could not be read. */
+    int64_t (*read)(const XboxDiscVolume *v, uint32_t id, uint64_t offset, void *out, uint32_t len);
+    /* Entry `index` of directory `id`, in the volume's order, and its name (NUL-terminated). Returns 0 past the last
+     * entry. */
+    int (*child)(const XboxDiscVolume *v, uint32_t id, uint32_t index, XboxDiscEntry *out, char name[256]);
+    uint64_t image_bytes;
+};
+
+/* The mounted disc, or NULL when D:\ is a host folder (xbox_path_init's game_dir). */
 const XboxDiscVolume *xbox_frontend_disc(void);
 
 #ifdef __cplusplus

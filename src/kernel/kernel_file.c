@@ -116,6 +116,25 @@ static DWORD xbox_share_to_win32(ULONG Share)
     return result;
 }
 
+/* The path below the disc root when the object names a file on the mounted
+ * disc, by its own path or relative to a disc directory the title opened. */
+static int disc_object_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, char* below, size_t size)
+{
+    const char* xbox_path = get_xbox_path(ObjectAttributes);
+    HANDLE root = ObjectAttributes ? ObjectAttributes->RootDirectory : NULL;
+    if (!xbox_path)
+        return 0;
+    if (root && xbox_disc_owns(root)) {
+        const char* dir = xbox_disc_handle_path(root);
+        int n;
+        while (*xbox_path == '\\')
+            xbox_path++;
+        n = snprintf(below, size, "%s%s%s", dir, *dir && *xbox_path ? "\\" : "", xbox_path);
+        return n >= 0 && (size_t)n < size;
+    }
+    return !root && xbox_disc_path(xbox_path, below, size);
+}
+
 /* Translate an Xbox OBJECT_ATTRIBUTES path to a Win32 wide path */
 static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
                                WCHAR* win_path, DWORD buf_size)
@@ -144,12 +163,17 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     ULONG CreateDisposition, ULONG CreateOptions)
 {
     WCHAR win_path[MAX_PATH];
+    char below[MAX_PATH];
     HANDLE h;
     DWORD flags_and_attrs = FILE_ATTRIBUTE_NORMAL;
     (void)AllocationSize;
 
     if (!FileHandle || !ObjectAttributes)
         return STATUS_INVALID_PARAMETER;
+
+    if (disc_object_path(ObjectAttributes, below, sizeof(below)))
+        return xbox_disc_create(below, DesiredAccess, CreateDisposition, CreateOptions,
+                                FileHandle, IoStatusBlock);
 
     if (!translate_obj_path(ObjectAttributes, win_path, MAX_PATH)) {
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_FILE, "NtCreateFile: path translation failed");
@@ -243,6 +267,8 @@ NTSTATUS __stdcall xbox_NtReadFile(
 
     if (!IoStatusBlock)
         return STATUS_INVALID_PARAMETER;
+    if (xbox_disc_owns(FileHandle))
+        return xbox_disc_read(FileHandle, IoStatusBlock, Buffer, Length, ByteOffset);
 
     if (ByteOffset && ByteOffset->QuadPart >= 0) {
         memset(&ov, 0, sizeof(ov));
@@ -283,6 +309,11 @@ NTSTATUS __stdcall xbox_NtWriteFile(
 
     if (!IoStatusBlock)
         return STATUS_INVALID_PARAMETER;
+    if (xbox_disc_owns(FileHandle)) {
+        IoStatusBlock->Status = STATUS_ACCESS_DENIED;
+        IoStatusBlock->Information = 0;
+        return STATUS_ACCESS_DENIED;
+    }
 
     if (ByteOffset && ByteOffset->QuadPart >= 0) {
         memset(&ov, 0, sizeof(ov));
@@ -310,6 +341,10 @@ NTSTATUS __stdcall xbox_NtWriteFile(
 NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
+    if (xbox_disc_owns(Handle)) {
+        xbox_disc_close(Handle);
+        return STATUS_SUCCESS;
+    }
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
         xbox_dir_context_drop(Handle);
         CloseHandle(Handle);
@@ -321,6 +356,9 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
 {
     WCHAR win_path[MAX_PATH];
+    char below[MAX_PATH];
+    if (disc_object_path(ObjectAttributes, below, sizeof(below)))
+        return STATUS_ACCESS_DENIED;
     if (!translate_obj_path(ObjectAttributes, win_path, MAX_PATH))
         return STATUS_OBJECT_PATH_NOT_FOUND;
     XBOX_TRACE(XBOX_LOG_FILE, "NtDeleteFile: %S", win_path);
@@ -336,6 +374,9 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
     (void)Length;
     if (!IoStatusBlock || !FileInformation)
         return STATUS_INVALID_PARAMETER;
+    if (xbox_disc_owns(FileHandle))
+        return xbox_disc_query_information(FileHandle, IoStatusBlock, FileInformation, Length,
+                                           FileInformationClass);
 
     switch (FileInformationClass) {
         case XboxFileBasicInformation: {
@@ -414,6 +455,9 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
     (void)Length;
     if (!IoStatusBlock || !FileInformation)
         return STATUS_INVALID_PARAMETER;
+    if (xbox_disc_owns(FileHandle))
+        return xbox_disc_set_information(FileHandle, IoStatusBlock, FileInformation, Length,
+                                         FileInformationClass);
 
     switch (FileInformationClass) {
         case XboxFilePositionInformation: {
@@ -509,9 +553,12 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FsInformation, ULONG Length, XBOX_FS_INFORMATION_CLASS FsInformationClass)
 {
-    (void)FileHandle; (void)Length;
+    (void)Length;
     if (!IoStatusBlock || !FsInformation)
         return STATUS_INVALID_PARAMETER;
+    if (xbox_disc_owns(FileHandle))
+        return xbox_disc_query_volume(FileHandle, IoStatusBlock, FsInformation, Length,
+                                      FsInformationClass);
 
     switch (FsInformationClass) {
         case XboxFileFsSizeInformation: {
@@ -542,7 +589,8 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
 
 NTSTATUS __stdcall xbox_NtFlushBuffersFile(HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock)
 {
-    FlushFileBuffers(FileHandle);
+    if (!xbox_disc_owns(FileHandle))
+        FlushFileBuffers(FileHandle);
     if (IoStatusBlock) {
         IoStatusBlock->Status = STATUS_SUCCESS;
         IoStatusBlock->Information = 0;
@@ -555,10 +603,13 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
     PXBOX_FILE_NETWORK_OPEN_INFORMATION FileInformation)
 {
     WCHAR win_path[MAX_PATH];
+    char below[MAX_PATH];
     WIN32_FILE_ATTRIBUTE_DATA fad;
 
     if (!FileInformation)
         return STATUS_INVALID_PARAMETER;
+    if (disc_object_path(ObjectAttributes, below, sizeof(below)))
+        return xbox_disc_full_attributes(below, FileInformation);
     if (!translate_obj_path(ObjectAttributes, win_path, MAX_PATH))
         return STATUS_OBJECT_PATH_NOT_FOUND;
 
@@ -755,9 +806,12 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     PXBOX_ANSI_STRING FileName, BOOLEAN RestartScan)
 {
     static volatile LONG s_logged;
-    NTSTATUS st = query_directory(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
-                                  FileInformation, Length, FileInformationClass,
-                                  FileName, RestartScan);
+    NTSTATUS st = xbox_disc_owns(FileHandle)
+        ? xbox_disc_query_directory(FileHandle, IoStatusBlock, FileInformation, Length,
+                                    FileInformationClass, FileName, RestartScan)
+        : query_directory(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                          FileInformation, Length, FileInformationClass,
+                          FileName, RestartScan);
     if (InterlockedIncrement(&s_logged) <= 400) {
         char pat[64] = "*";
         const char *got = "";
@@ -972,6 +1026,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
+        xbox_dir_context_drop(Handle);
         CloseHandle(Handle);
         return STATUS_SUCCESS;
     }
