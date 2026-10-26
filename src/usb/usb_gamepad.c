@@ -779,6 +779,9 @@ static void min_hold(int pad, uint8_t *out)
     }
 }
 
+static uint32_t s_served[USB_GAMEPAD_MAX];
+static uint8_t  s_served_last[USB_GAMEPAD_MAX][20];
+
 int usb_gamepad_report(int pad, uint8_t *out, int max)
 {
     if (pad < 0 || pad >= USB_GAMEPAD_MAX || max < 20) return 0;
@@ -787,8 +790,22 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     sample_now(pad, out);
     merge_latch(pad, out);
     min_hold(pad, out);
+    s_served[pad]++;
+    memcpy(s_served_last[pad], out, 20);
     LeaveCriticalSection(&s_sample_cs);
     return 20;
+}
+
+uint32_t usb_gamepad_served(int pad, uint8_t last[20])
+{
+    uint32_t n;
+    if (pad < 0 || pad >= USB_GAMEPAD_MAX) return 0;
+    InitOnceExecuteOnce(&s_sampler_once, start_sampler, NULL, NULL);
+    EnterCriticalSection(&s_sample_cs);
+    n = s_served[pad];
+    memcpy(last, s_served_last[pad], 20);
+    LeaveCriticalSection(&s_sample_cs);
+    return n;
 }
 
 /* The pad as it is this instant: the host's pad, plus the pad script. */

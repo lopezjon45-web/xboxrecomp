@@ -43,6 +43,10 @@ void usb_gamepad_out(int pad, const uint8_t *data, int len);
 /* Fill in pad `pad`'s 20-byte input report. Returns the byte count written. */
 int usb_gamepad_report(int pad, uint8_t *out, int max);
 
+/* How many input reports pad `pad` has handed the title, and the last one: what a shell shows to prove the title's
+ * own USB code is reading the pad. Any thread. */
+uint32_t usb_gamepad_served(int pad, uint8_t last[20]);
+
 /* The address the host assigned pad `pad` with SET_ADDRESS, 0 until it does,
  * and whether it has been configured. */
 uint8_t usb_gamepad_address(int pad);
