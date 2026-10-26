@@ -2003,6 +2003,7 @@ static void bridge_KeRemoveQueueDpc(void);   /* defined with the queue */
 typedef struct { uint32_t dpc, arg1, arg2; } PendingDpc;
 static PendingDpc g_dpc_queue[XBOX_MAX_PENDING_DPC];
 static volatile LONG g_dpc_head, g_dpc_tail;
+static void kernel_timer_wake(void);
 /* Two threads queue here: the timer thread for the GPU's interrupt and the
  * OHCI thread for the USB controller's. Unlocked, a USB DPC queued while the
  * GPU's was being queued could be overwritten; the USB routine is what
@@ -2068,6 +2069,10 @@ static void bridge_KeInsertQueueDpc(void)
     g_dpc_tail = next;
     LeaveCriticalSection(&g_dpc_lock);
     g_eax = 1;
+    /* The timer thread is what drains DPCs. A title that queues one before it
+     * ever sets a kernel timer (a USB driver's ISR) had no drainer: its
+     * deferred routine never ran and the controller sat masked. */
+    kernel_timer_wake();
     /* A service routine that claims an interrupt and then does nothing looks
      * the same from outside as one that queued the real work and never had it
      * run. Naming the routine here tells those apart. */
@@ -2888,7 +2893,7 @@ typedef struct {
 } XboxTimer;
 static XboxTimer g_timers[XBOX_MAX_TIMERS];
 static CRITICAL_SECTION g_timer_lock;
-static int g_timer_started;
+static volatile int g_timer_started;
 
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 {
@@ -3026,6 +3031,23 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
     }
 }
 
+/* Start the timer thread on first use, by whichever of the first KeSetTimer
+ * and the first queued DPC comes first, and wake it. */
+static void kernel_timer_wake(void)
+{
+    static volatile LONG starting;
+    if (InterlockedCompareExchange(&starting, 1, 0) == 0) {
+        InitializeCriticalSection(&g_timer_lock);
+        g_timer_wake = CreateEventA(NULL, FALSE, FALSE, NULL);
+        MemoryBarrier();
+        g_timer_started = 1;
+        CloseHandle(CreateThread(NULL, 0, kernel_timer_thread, NULL, 0, NULL));
+    }
+    while (!g_timer_started)
+        SwitchToThread();
+    SetEvent(g_timer_wake);
+}
+
 /* Shared by KeSetTimer and KeSetTimerEx; period is 0 for the former. */
 static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
                              long period_ms, uint32_t dpc_va)
@@ -3034,12 +3056,7 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
     int i, free_slot = -1;
     uint32_t was_set = 0;
 
-    if (!g_timer_started) {
-        InitializeCriticalSection(&g_timer_lock);
-        g_timer_started = 1;
-        g_timer_wake = CreateEventA(NULL, FALSE, FALSE, NULL);
-        CloseHandle(CreateThread(NULL, 0, kernel_timer_thread, NULL, 0, NULL));
-    }
+    kernel_timer_wake();
 
     EnterCriticalSection(&g_timer_lock);
     /* A freshly set timer starts unsignaled, like the real KeSetTimer. Before
