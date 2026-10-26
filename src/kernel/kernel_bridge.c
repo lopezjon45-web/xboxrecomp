@@ -5439,25 +5439,25 @@ static void bridge_IoSetIoCompletion(void)
         (ULONG_PTR)STACK_ARG(4));
 }
 
+/* The Xbox kernel drops NT's cancel arguments from these three: IoStartNextPacket(DeviceObject),
+ * IoStartNextPacketByKey(DeviceObject, Key), IoStartPacket(DeviceObject, Irp, Key). Titles' call sites push one
+ * and three arguments for 81 and 83. */
 static void bridge_IoStartNextPacket(void)
 {
-    xbox_IoStartNextPacket(XBOX_TO_NATIVE(STACK_ARG(0)),
-        (BOOLEAN)STACK_ARG(1));
+    xbox_IoStartNextPacket(XBOX_TO_NATIVE(STACK_ARG(0)), FALSE);
     g_eax = 0;
 }
 
 static void bridge_IoStartNextPacketByKey(void)
 {
-    xbox_IoStartNextPacketByKey(XBOX_TO_NATIVE(STACK_ARG(0)),
-        (BOOLEAN)STACK_ARG(1), STACK_ARG(2));
+    xbox_IoStartNextPacketByKey(XBOX_TO_NATIVE(STACK_ARG(0)), FALSE, STACK_ARG(1));
     g_eax = 0;
 }
 
 static void bridge_IoStartPacket(void)
 {
     xbox_IoStartPacket(XBOX_TO_NATIVE(STACK_ARG(0)),
-        XBOX_TO_NATIVE(STACK_ARG(1)), (PULONG)XBOX_TO_NATIVE(STACK_ARG(2)),
-        XBOX_TO_NATIVE(STACK_ARG(3)));
+        XBOX_TO_NATIVE(STACK_ARG(1)), (PULONG)XBOX_TO_NATIVE(STACK_ARG(2)), NULL);
     g_eax = 0;
 }
 
@@ -9020,9 +9020,9 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case  73: return 12;  /* IoInitializeIrp (3) */
     case  74: return  8;  /* IoInvalidDeviceRequest (2) */
     case  79: return 20;  /* IoSetIoCompletion (5) */
-    case  81: return  8;  /* IoStartNextPacket (2) */
-    case  82: return 12;  /* IoStartNextPacketByKey (3) */
-    case  83: return 16;  /* IoStartPacket (4) */
+    case  81: return  4;  /* IoStartNextPacket (1) */
+    case  82: return  8;  /* IoStartNextPacketByKey (2) */
+    case  83: return 12;  /* IoStartPacket (3) */
     case  84: return 32;  /* IoSynchronousDeviceIoControlRequest (8) */
     case  85: return 20;  /* IoSynchronousFsdRequest (5) */
     case  86: return  0;  /* IofCallDriver (fastcall: args in ecx/edx) */
