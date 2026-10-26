@@ -1459,20 +1459,11 @@ void xbox_UsbSetPadCount(int n)
     if (n > s_npads) s_npads = n;
 }
 
-void xbox_OhciInit(void)
+static OhciController *hc_for(uint32_t va);
+
+/* The settings both front ends read, and both controllers reset. */
+static void ohci_configure(void)
 {
-    static int done;
-
-    if (done)
-        return;
-    done = 1;
-
-    /* Opt-in. Without a descriptor list walker behind it a driver that finds
-     * a port has nothing to enumerate, so this must not change how a title
-     * behaves until the rest of it exists. */
-    if (!getenv("RECOMP_USB"))
-        return;
-
     s_enabled = 1;
     s_trace   = getenv("RECOMP_USB_TRACE") != NULL;
     {
@@ -1500,6 +1491,53 @@ void xbox_OhciInit(void)
     }
     ohci_reset(&s_hc[0], XBOX_OHCI0_BASE, 0);
     ohci_reset(&s_hc[1], XBOX_OHCI1_BASE, 1);
+}
+
+static void ohci_start_thread(void)
+{
+    HANDLE th = CreateThread(NULL, 0, ohci_thread, NULL, 0, NULL);
+    if (th)
+        CloseHandle(th);
+}
+
+void xbox_OhciAttach(void)
+{
+    static int done;
+
+    if (done)
+        return;
+    done = 1;
+    ohci_configure();
+    ohci_start_thread();
+}
+
+uint32_t xbox_OhciRead(uint32_t xbox_va, unsigned size)
+{
+    OhciController *hc = hc_for(xbox_va);
+    return hc ? (uint32_t)ohci_read(hc, xbox_va - hc->base, (int)size) : 0;
+}
+
+void xbox_OhciWrite(uint32_t xbox_va, unsigned size, uint32_t value)
+{
+    OhciController *hc = hc_for(xbox_va);
+    if (hc)
+        ohci_write(hc, xbox_va - hc->base, value, (int)size);
+}
+
+void xbox_OhciInit(void)
+{
+    static int done;
+
+    if (done)
+        return;
+    done = 1;
+
+    /* Opt-in. Without a descriptor list walker behind it a driver that finds
+     * a port has nothing to enumerate, so this must not change how a title
+     * behaves until the rest of it exists. */
+    if (!getenv("RECOMP_USB"))
+        return;
+    ohci_configure();
 
     /* The registers have to fault to be answered. The MCPX aperture is mapped
      * as plain committed memory, so both blocks are made inaccessible here and
@@ -1534,12 +1572,7 @@ void xbox_OhciInit(void)
                     "%d ports each, one device on HC0 root port %u\n",
             XBOX_OHCI0_BASE, XBOX_OHCI1_BASE, OHCI_PORTS, pad_root_port() + 1);
     fflush(stderr);
-
-    {
-        HANDLE th = CreateThread(NULL, 0, ohci_thread, NULL, 0, NULL);
-        if (th)
-            CloseHandle(th);
-    }
+    ohci_start_thread();
 }
 
 static OhciController *hc_for(uint32_t va)

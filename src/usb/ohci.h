@@ -40,6 +40,13 @@ void xbox_OhciInit(void);
  * hot-plug and enumerates it. Never lowers the count. Safe from any thread. */
 void xbox_UsbSetPadCount(int n);
 
+/* A direct front end's bring-up: both controllers on, the controller thread
+ * running, no environment switch and no page protection. The front end routes
+ * guest accesses to the two blocks through xbox_OhciRead and xbox_OhciWrite. */
+void     xbox_OhciAttach(void);
+uint32_t xbox_OhciRead(uint32_t xbox_va, unsigned size);
+void     xbox_OhciWrite(uint32_t xbox_va, unsigned size, uint32_t value);
+
 /* 1 if the address is inside a controller this model owns. */
 int  xbox_OhciOwnsAddress(uint32_t xbox_va);
 
