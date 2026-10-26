@@ -859,7 +859,7 @@ VOID    __stdcall xbox_HalReturnToFirmware(ULONG Routine);
 ULONG   __stdcall xbox_HalReadSMCTrayState(PULONG TrayState, PULONG TrayStateChangeCount);
 VOID    __stdcall xbox_HalClearSoftwareInterrupt(KIRQL RequestIrql);
 VOID    __stdcall xbox_HalRequestSoftwareInterrupt(KIRQL RequestIrql);
-VOID    __stdcall xbox_HalDisableSystemInterrupt(ULONG BusInterruptLevel, KIRQL Irql);
+VOID    __stdcall xbox_HalDisableSystemInterrupt(ULONG BusInterruptLevel);
 ULONG   __stdcall xbox_HalGetInterruptVector(ULONG BusInterruptLevel, PKIRQL Irql);
 VOID    __stdcall xbox_HalInitiateShutdown(void);
 BOOLEAN __stdcall xbox_HalIsResetOrShutdownPending(void);

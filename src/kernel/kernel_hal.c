@@ -737,10 +737,9 @@ VOID __stdcall xbox_HalRequestSoftwareInterrupt(KIRQL RequestIrql)
     (void)RequestIrql;
 }
 
-VOID __stdcall xbox_HalDisableSystemInterrupt(ULONG BusInterruptLevel, KIRQL Irql)
+VOID __stdcall xbox_HalDisableSystemInterrupt(ULONG BusInterruptLevel)
 {
     (void)BusInterruptLevel;
-    (void)Irql;
 }
 
 ULONG __stdcall xbox_HalGetInterruptVector(ULONG BusInterruptLevel, PKIRQL Irql)

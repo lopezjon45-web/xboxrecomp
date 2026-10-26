@@ -26,6 +26,16 @@ BRIDGE_C = os.path.join(ROOT, "src", "kernel", "kernel_bridge.c")
 PARSER_PY = os.path.join(ROOT, "tools", "xbe_parser", "xbe_parser.py")
 
 
+ABI_INC = os.path.join(ROOT, "src", "kernel", "kernel_abi.inc")
+
+
+def load_abi():
+    """ordinal -> (convention, stack bytes popped, register arguments), from the table nxdk's prototypes generate."""
+    rows = re.findall(r"\{ KABI_(\w+), (\d+), (\d+) \},\s*/\* (\d+)", open(ABI_INC, encoding="utf-8").read())
+    assert len(rows) > 300, f"only {len(rows)} rows in kernel_abi.inc"
+    return {int(o): (conv, int(stack), int(regs)) for conv, stack, regs, o in rows}
+
+
 def load_exports():
     with open(PARSER_PY, encoding="utf-8", errors="replace") as fh:
         src = fh.read()
@@ -72,108 +82,29 @@ def test_no_duplicate_ordinals():
     print("ok  no_duplicate_ordinals")
 
 
-def test_no_duplicate_arg_sizes():
-    """The same ordinal twice in the arg-size table is a compile error.
+def test_every_routed_ordinal_is_a_function_of_that_name():
+    """Each bridged ordinal is a function in kernel_abi.inc under the bridge's name.
 
-    test_no_duplicate_ordinals covers the routing switch only. Argument sizes
-    are a second switch over the same values, and a duplicate there is a C2196
-    that surfaces only when something rebuilds the kernel library -- which is
-    not necessarily the build you are running when you add the entry.
+    The dispatcher pops what the table says, so a bridge on an ordinal the
+    table calls data or does not know pops nothing and leaks its arguments, as
+    ordinal 47 (HalRegisterShutdownNotification) once did when its hand-written
+    size was forgotten: esp came back 8 bytes low and the caller's epilogue
+    restored ebx/esi/edi from the wrong slots.
     """
-    with open(BRIDGE_C, encoding="utf-8", errors="replace") as fh:
-        src = fh.read()
-    match = re.search(r"stdcall_args_for_ordinal.*?\n\}", src, re.S)
-    assert match, "could not locate stdcall_args_for_ordinal"
-    seen, dupes = set(), []
-    for ordinal in re.findall(r"case\s+(\d+):\s*return\s+-?\d+;", match.group(0)):
-        ordinal = int(ordinal)
-        if ordinal in seen:
-            dupes.append("ordinal %d has two arg-size entries" % ordinal)
-        seen.add(ordinal)
-    assert not dupes, "\n  ".join(dupes)
-    print("ok  no_duplicate_arg_sizes (%d sized)" % len(seen))
-
-
-def test_arg_size_comments_match_their_ordinal():
-    """The stdcall arg table names each function in a comment; check it.
-
-    Routing and argument sizes are two separate tables, and fixing one does not
-    fix the other. Ordinal 67 was routed correctly to IoCreateSymbolicLink while
-    its arg entry still said `40; /* IoCreateFile(10) */` - so every call popped
-    40 bytes instead of 8 and walked esp 32 bytes off. That does not fail where
-    it happens: it surfaces later as a function returning with ebx/esi/edi
-    restored from the wrong stack slots, which is about as far from "wrong
-    stdcall size" as a symptom can look.
-    """
-    exports = load_exports()
-    with open(BRIDGE_C, encoding="utf-8", errors="replace") as fh:
-        src = fh.read()
-    m = re.search(r"static int stdcall_args_for_ordinal.*?\n\}", src, re.S)
-    assert m, "could not locate stdcall_args_for_ordinal"
-
+    names = dict(re.findall(r"\{ KABI_\w+, \d+, \d+ \},\s*/\* (\d+) (\w+)",
+                            open(ABI_INC, encoding="utf-8").read()))
+    abi = load_abi()
     bad = []
-    for ordinal, _bytes, named in re.findall(
-            r"case\s+(\d+):\s*return\s+(\d+);\s*/\*\s*([A-Za-z_][A-Za-z0-9_]*)",
-            m.group(0)):
-        ordinal = int(ordinal)
-        expected = exports.get(ordinal)
-        if expected and expected != named:
-            bad.append(f"ordinal {ordinal} arg entry is commented {named}, "
-                       f"but ordinal {ordinal} is {expected}")
-
-    assert not bad, "arg-size table disagrees with the export table:\n  " + \
-                    "\n  ".join(bad)
-    print("ok  arg_size_comments_match_their_ordinal")
-
-
-def test_every_routed_ordinal_has_an_arg_size():
-    """A bridged ordinal with no arg entry falls through to `default: return 0`.
-
-    The comment-matching test above cannot see this: there is no entry, so
-    there is no comment to disagree with. Adding a bridge and forgetting the
-    arg size is one edit, and it leaks the whole argument list on every call.
-
-    Ordinal 47 (HalRegisterShutdownNotification, 2 args) was added this way.
-    D3D's CMiniport::InitHardware calls it once, so esp came back 8 bytes low
-    and the epilogue's pop edi/esi/ebx each read one slot too far down: `this`
-    for the next call became 1, the DMA channel was initialised against
-    garbage, and the title hung in a push-buffer wait several calls later with
-    nothing to connect it back to a missing stdcall size.
-
-    An ordinal that genuinely takes no arguments needs an explicit `return 0;`
-    entry, so that "zero" is a decision on the record rather than a fallthrough.
-    """
-    exports = load_exports()
-    with open(BRIDGE_C, encoding="utf-8", errors="replace") as fh:
-        src = fh.read()
-    m = re.search(r"static int stdcall_args_for_ordinal.*?\n\}", src, re.S)
-    assert m, "could not locate stdcall_args_for_ordinal"
-    sized = {int(o) for o in
-             re.findall(r"case\s+(\d+):\s*return\s+\d+;", m.group(0))}
-
-    missing = [
-        f"ordinal {o} routes to bridge_{n} but has no arg-size entry "
-        f"({exports.get(o, '?')})"
-        for o, n in load_routes() if o not in sized
-    ]
-    assert not missing, ("bridged ordinals fall through to `default: return 0` "
-                         "and leak their args:\n  " + "\n  ".join(missing))
-    print(f"ok  every_routed_ordinal_has_an_arg_size ({len(sized)} sized)")
-
-
-def test_arg_sizes_are_dword_multiples():
-    """stdcall cleanup pops whole dwords; an odd size corrupts the stack."""
-    with open(BRIDGE_C, encoding="utf-8", errors="replace") as fh:
-        src = fh.read()
-    m = re.search(r"static int stdcall_args_for_ordinal.*?\n\}", src, re.S)
-    assert m, "could not locate stdcall_args_for_ordinal"
-    bad = [
-        f"ordinal {o} pops {b} bytes"
-        for o, b in re.findall(r"case\s+(\d+):\s*return\s+(\d+);", m.group(0))
-        if int(b) % 4
-    ]
+    for ordinal, name in load_routes():
+        kind = abi[ordinal][0]
+        if kind == "DATA":
+            continue
+        if kind not in ("STDCALL", "FASTCALL", "CDECL"):
+            bad.append(f"ordinal {ordinal} routes to bridge_{name}, but kernel_abi.inc says {kind}")
+        elif names.get(str(ordinal)) != name:
+            bad.append(f"ordinal {ordinal} routes to bridge_{name}, but kernel_abi.inc names it {names.get(str(ordinal))}")
     assert not bad, "\n  ".join(bad)
-    print("ok  arg_sizes_are_dword_multiples")
+    print(f"ok  every_routed_ordinal_is_a_function_of_that_name ({len(load_routes())} routes)")
 
 
 def load_data_exports():
@@ -250,6 +181,60 @@ def test_no_data_export_ordinal_is_also_a_function_route():
     both = sorted(data & {o for o, _ in load_routes()})
     assert not both, ("ordinals routed as BOTH data and function: %s" % both)
     print("ok  no_data_export_ordinal_is_also_a_function_route")
+
+def bridge_bodies():
+    src = open(BRIDGE_C, encoding="utf-8", errors="replace").read()
+    out = {}
+    for m in re.finditer(r"static void (bridge_\w+)\(void\)\s*\{", src):
+        depth, i = 1, m.end()
+        while depth:
+            depth += {"{": 1, "}": -1}.get(src[i], 0)
+            i += 1
+        out[m.group(1)[len("bridge_"):]] = re.sub(r"/\*.*?\*/|//[^\n]*", "", src[m.end():i - 1], flags=re.S)
+    return out
+
+
+def test_bridges_read_the_arguments_their_prototype_has():
+    """Every bridge reads its arguments where the Xbox kernel's prototype puts them.
+
+    The dispatcher pops what kernel_abi.inc says, so a pop count can no longer
+    disagree with nxdk. A bridge body still can: one written against NT's
+    argument list reads the wrong slots, and one that takes a fastcall's
+    argument from the stack reads the caller's locals. A stack-argument bridge
+    reads its last argument, as `(void)STACK_ARG(n)` when it has no use for it,
+    so the highest slot it names is the prototype's own count. eax is never an
+    argument: InterlockedCompareExchange once took its Comparand from eax,
+    where the caller had left whatever it last computed.
+    """
+    abi, bodies = load_abi(), bridge_bodies()
+    bad = []
+    for ordinal, name in load_routes():
+        conv, stack, regs = abi[ordinal]
+        body = bodies.get(name)
+        if body is None or conv not in ("STDCALL", "FASTCALL"):
+            continue
+        slots = [int(n) for n in re.findall(r"\bSTACK_ARG\s*\(\s*(\d+)\s*\)", body)]
+        if re.search(r"\bSTACK_ARG\s*\(\s*[^\d\s]", body):
+            bad.append(f"{ordinal} {name}: STACK_ARG with a computed slot; name each slot")
+        reads_ecx = re.search(r"\bg_ecx\b(?!\s*=[^=])", body)
+        reads_edx = re.search(r"\bg_edx\b(?!\s*=[^=])", body)
+        if slots and max(slots) >= stack // 4:
+            bad.append(f"{ordinal} {name}: reads STACK_ARG({max(slots)}), but the prototype pushes {stack // 4}")
+        elif stack and max(slots, default=-1) != stack // 4 - 1:
+            bad.append(f"{ordinal} {name}: highest slot read is {max(slots, default='none')}, "
+                       f"the prototype pushes {stack // 4}")
+        first_eax = re.search(r"\bg_eax\b(\s*=[^=])?", body)
+        if first_eax and not first_eax.group(1):
+            bad.append(f"{ordinal} {name}: reads g_eax before setting it; eax carries no argument")
+        if conv == "STDCALL" and (reads_ecx or reads_edx):
+            bad.append(f"{ordinal} {name}: stdcall, but reads g_ecx/g_edx as an argument")
+        if conv == "FASTCALL" and regs >= 1 and not reads_ecx:
+            bad.append(f"{ordinal} {name}: fastcall, but never reads its first argument from g_ecx")
+        if conv == "FASTCALL" and regs == 2 and not reads_edx:
+            bad.append(f"{ordinal} {name}: fastcall, but never reads its second argument from g_edx")
+    assert not bad, "bridges disagree with kernel_abi.inc:\n  " + "\n  ".join(bad)
+    print("ok  bridges_read_the_arguments_their_prototype_has")
+
 
 if __name__ == "__main__":
     # Discovered rather than listed: this file has been appended to before, and

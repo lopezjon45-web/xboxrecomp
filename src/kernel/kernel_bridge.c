@@ -1580,6 +1580,7 @@ static void bridge_NtSetEvent(void)
 static void bridge_NtPulseEvent(void)
 {
     HANDLE handle = bridge_resolve_handle(STACK_ARG(0));
+    (void)STACK_ARG(1);
     if (handle) PulseEvent(handle);
     g_eax = 0;
 }
@@ -1725,6 +1726,7 @@ static void bridge_NtUserIoApcDispatcher(void)
     uint32_t information = iostatus ? BRIDGE_MEM32(iostatus + 4) : 0;
     uint32_t args[3] = { status, information, iostatus };
 
+    (void)STACK_ARG(2);
     xbox_frontend_guest_call(apc_context, 3, args, XBOX_CALL_STDCALL);
     g_eax = 0;
 }
@@ -2733,6 +2735,7 @@ static void bridge_KeInitializeInterrupt(void)
     uint32_t context      = STACK_ARG(2);
     uint32_t vector       = STACK_ARG(3);
 
+    (void)STACK_ARG(6);
     if (!bridge_buf_ok(interrupt_va, 44, "KeInitializeInterrupt")) {
         g_eax = 0;
         return;
@@ -2817,6 +2820,7 @@ static void bridge_MmClaimGpuInstanceMemory(void)
  * way, so registration is accepted and dropped. */
 static void bridge_HalRegisterShutdownNotification(void)
 {
+    (void)STACK_ARG(1);
     g_eax = 0;
 }
 
@@ -3686,9 +3690,8 @@ static void bridge_complete_file_io(uint32_t event_token, uint32_t apc_routine,
  */
 #define XBE_SECTION_REFCOUNT_OFFSET 0x18
 
-static void bridge_XeSection(int load)
+static void bridge_XeSection(uint32_t section, int load)
 {
-    uint32_t section = STACK_ARG(0);
     uint32_t count;
 
     if (!section) {
@@ -3708,8 +3711,8 @@ static void bridge_XeSection(int load)
     g_eax = 0;
 }
 
-static void bridge_XeLoadSection(void)   { bridge_XeSection(1); }
-static void bridge_XeUnloadSection(void) { bridge_XeSection(0); }
+static void bridge_XeLoadSection(void)   { bridge_XeSection(STACK_ARG(0), 1); }
+static void bridge_XeUnloadSection(void) { bridge_XeSection(STACK_ARG(0), 0); }
 
 /* -- RtlUnwind (ordinal 312, 4 args = 16 bytes) -------------------------
  *
@@ -3740,6 +3743,7 @@ static void bridge_RtlUnwind(void)
 {
     uint32_t target_frame = STACK_ARG(0);
     uint32_t exc_record   = STACK_ARG(2);
+    uint32_t return_value = STACK_ARG(3);
     uint32_t kpcr         = xbox_frontend_kpcr();
     uint32_t reg          = BRIDGE_MEM32(kpcr);
     uint32_t prev_reg     = 0;
@@ -3799,6 +3803,7 @@ static void bridge_RtlUnwind(void)
 
     if (scratch)
         g_esp += 0x50;
+    g_eax = return_value;
 }
 
 
@@ -4115,6 +4120,7 @@ static void bridge_NtOpenSymbolicLinkObject(void)
     uint32_t handle_va = STACK_ARG(0);
     /* arg1: POBJECT_ATTRIBUTES - ignored, we return a synthetic handle.
      * Written raw (untagged) so NtClose recognises it and skips it. */
+    (void)STACK_ARG(1);
     if (handle_va) BRIDGE_MEM32(handle_va) = 0xDEAD0001u;
     g_eax = STATUS_SUCCESS;
 }
@@ -4170,7 +4176,7 @@ static void bridge_NtQuerySymbolicLinkObject(void)
     g_eax = STATUS_SUCCESS;
 }
 
-/* ── IoCreateFile (ordinal 67, 10 args = 40 bytes) ────── */
+/* ── IoCreateFile (ordinal 66, 10 args = 40 bytes) ────── */
 static void bridge_IoCreateFile(void)
 {
     /* Same as NtCreateFile with an extra Options arg at the end */
@@ -4183,6 +4189,7 @@ static void bridge_IoCreateFile(void)
     uint32_t disposition = STACK_ARG(7);
     uint32_t options     = STACK_ARG(8);
 
+    (void)STACK_ARG(9);
     g_eax = (uint32_t)bridge_create_file_impl(
         handle_va, access, obj_attrs, iostatus,
         file_attrs, share, disposition, options);
@@ -4353,6 +4360,7 @@ static void bridge_NtFsControlFile(void)
 {
     uint32_t fsctl = STACK_ARG(5);
     uint32_t ios_va = STACK_ARG(4);
+    (void)STACK_ARG(9);
     fprintf(stderr, "  [FILE] NtFsControlFile(0x%X) - stub\n", fsctl);
     bridge_write_iostatus(ios_va, 0xC00000BBu, 0);
     g_eax = 0xC00000BBu;
@@ -4363,6 +4371,7 @@ static void bridge_NtCreateDirectoryObject(void)
 {
     /* Return STATUS_SUCCESS with a fake handle */
     uint32_t handle_ptr = STACK_ARG(0);
+    (void)STACK_ARG(1);
     if (handle_ptr) BRIDGE_MEM32(handle_ptr) = 0xBEEF0010;
     g_eax = 0;  /* STATUS_SUCCESS */
 }
@@ -4589,6 +4598,7 @@ static void bridge_MmMapIoSpace(void)
 static void bridge_MmPersistContiguousMemory(void)
 {
     /* No-op stub */
+    (void)STACK_ARG(2);
     g_eax = 0;
 }
 
@@ -4955,18 +4965,18 @@ static void bridge_HalReadWritePCISpace(void)
     g_eax = 0;
 }
 
-/* ── HalRequestSoftwareInterrupt / HalClearSoftwareInterrupt (48 / 38, 1 arg)
+/* ── HalRequestSoftwareInterrupt / HalClearSoftwareInterrupt (48 / 38, fastcall: RequestIrql in cl)
  * DPC/APC delivery hooks with no interrupt-driven machinery behind them here;
  * both xbox_* versions are documented no-ops. */
 static void bridge_HalRequestSoftwareInterrupt(void)
 {
-    xbox_HalRequestSoftwareInterrupt((KIRQL)STACK_ARG(0));
+    xbox_HalRequestSoftwareInterrupt((KIRQL)g_ecx);
     g_eax = 0;
 }
 
 static void bridge_HalClearSoftwareInterrupt(void)
 {
-    xbox_HalClearSoftwareInterrupt((KIRQL)STACK_ARG(0));
+    xbox_HalClearSoftwareInterrupt((KIRQL)g_ecx);
     g_eax = 0;
 }
 
@@ -4992,6 +5002,7 @@ static void bridge_ExSaveNonVolatileSetting(void)
 static void bridge_MmUnmapIoSpace(void)
 {
     xbox_HeapFree(STACK_ARG(0));
+    (void)STACK_ARG(1);
     g_eax = 0;
 }
 
@@ -5364,10 +5375,10 @@ static void bridge_AvSetSavedDataAddress(void)
     g_eax = 0;
 }
 
-/* ── HalDisableSystemInterrupt (ordinal 39, 2 args) */
+/* ── HalDisableSystemInterrupt (ordinal 39, 1 arg) */
 static void bridge_HalDisableSystemInterrupt(void)
 {
-    xbox_HalDisableSystemInterrupt(STACK_ARG(0), (KIRQL)STACK_ARG(1));
+    xbox_HalDisableSystemInterrupt(STACK_ARG(0));
     g_eax = 0;
 }
 
@@ -5541,6 +5552,7 @@ static void bridge_MmLockUnlockPhysicalPage(void)
 static void bridge_MmFreeSystemMemory(void)
 {
     xbox_HeapFree(STACK_ARG(0));
+    (void)STACK_ARG(1);
     g_eax = 0;
 }
 
@@ -5555,6 +5567,7 @@ static void bridge_MmCreateKernelStack(void)
     uint32_t size = STACK_ARG(0);
     uint32_t base_va = xbox_HeapAlloc(size, 16);
 
+    (void)STACK_ARG(1);
     g_eax = base_va ? base_va + size : 0;
 }
 
@@ -5820,15 +5833,6 @@ static void bridge_NtDuplicateObject(void)
 
 typedef void (*bridge_func_t)(void);
 
-/**
- * stdcall arg byte count for each kernel ordinal.
- * On x86 stdcall, the callee cleans (ret N). Our bridges must do the same
- * via g_esp += N after execution so the simulated stack stays balanced.
- *
- * Special cases:
- *   - KfRaiseIrql/KfLowerIrql: fastcall (arg in ecx), 0 stack bytes
- *   - KeSetTimer: DueTime is LARGE_INTEGER (8 bytes on stack) + Timer + Dpc
- */
 /* ---- Section B: Rtl* bridge functions (ordinals 261-321) ----
  * Drawn from bridges_Rtl.c and spliced here at byte level. Macro and status
  * definitions inside remain #ifndef-guarded so the block still compiles
@@ -6601,20 +6605,20 @@ static void bridge_RtlUnicodeStringToInteger(void)
 /* ── Rtl Byte swaps (ordinals 307, 318) ─────────────────────
  * Hand-rolled rather than MSVC _byteswap_* so the file stays portable. */
 
-/* 307: ULONG RtlUlongByteSwap(ULONG Value) */
+/* 307: ULONG FASTCALL RtlUlongByteSwap(ULONG Source), Source in ecx */
 static void bridge_RtlUlongByteSwap(void)
 {
-    uint32_t v = STACK_ARG(0);
+    uint32_t v = g_ecx;
     g_eax = ((v & 0x000000FFu) << 24) |
             ((v & 0x0000FF00u) << 8)  |
             ((v & 0x00FF0000u) >> 8)  |
             ((v & 0xFF000000u) >> 24);
 }
 
-/* 318: USHORT RtlUshortByteSwap(USHORT Value) */
+/* 318: USHORT FASTCALL RtlUshortByteSwap(USHORT Source), Source in cx */
 static void bridge_RtlUshortByteSwap(void)
 {
-    uint32_t v = STACK_ARG(0);
+    uint32_t v = g_ecx;
     g_eax = (uint32_t)(uint16_t)(((v & 0xFFu) << 8) | ((v >> 8) & 0xFFu));
 }
 
@@ -6714,12 +6718,14 @@ static void bridge_RtlGetCallersAddress(void)
 /* 297: VOID RtlMapGenericMask(PACCESS_MASK AccessMask, PRTL_GENERIC_MAPPING) */
 static void bridge_RtlMapGenericMask(void)
 {
+    (void)STACK_ARG(1);
     g_eax = 0;
 }
 
 /* 319: ULONG RtlWalkFrameChain(PVOID *Callers, ULONG Count, ULONG Flags) */
 static void bridge_RtlWalkFrameChain(void)
 {
+    (void)STACK_ARG(2);
     g_eax = 0;
 }
 
@@ -6740,17 +6746,20 @@ static void bridge_XboxEEPROMKey(void)
 
 /* ── Rtl Exception (ordinals 264, 265, 266, 303) ──────────── */
 
-/* 264: VOID RtlAssert(PVOID FailedAssertion, PVOID FileName, ULONG LineNumber) */
+/* 264: VOID RtlAssert(PVOID FailedAssertion, PVOID FileName, ULONG LineNumber,
+ *                     PCHAR Message) */
 static void bridge_RtlAssert(void)
 {
     uint32_t assert_va = STACK_ARG(0);
     uint32_t file_va   = STACK_ARG(1);
     uint32_t line      = STACK_ARG(2);
+    uint32_t msg_va    = STACK_ARG(3);
     const char *a = assert_va ? (const char *)XBOX_TO_NATIVE(assert_va) : NULL;
     const char *f = file_va   ? (const char *)XBOX_TO_NATIVE(file_va) : NULL;
+    const char *m = msg_va    ? (const char *)XBOX_TO_NATIVE(msg_va) : NULL;
 
-    xbox_log(XBOX_LOG_ERROR, XBOX_LOG_RTL, "RtlAssert: %s:%u %s",
-             f ? f : "?", line, a ? a : "?");
+    xbox_log(XBOX_LOG_ERROR, XBOX_LOG_RTL, "RtlAssert: %s:%u %s %s",
+             f ? f : "?", line, a ? a : "?", m ? m : "");
 #ifdef _DEBUG
     DebugBreak();
 #endif
@@ -6767,11 +6776,11 @@ static void bridge_RtlCaptureContext(void)
     g_eax = 0;
 }
 
-/* 266: ULONG RtlCaptureStackBackTrace(FramesToSkip, FramesToCapture,
- *       BackTrace, BackTraceHash) - stub, returns 0 frames. Stack is cleaned
- *       up per stdcall_args_for_ordinal (20 bytes in kernel_bridge.c). */
+/* 266: USHORT RtlCaptureStackBackTrace(FramesToSkip, FramesToCapture,
+ *       BackTrace, BackTraceHash) - stub, returns 0 frames. */
 static void bridge_RtlCaptureStackBackTrace(void)
 {
+    (void)STACK_ARG(3);
     g_eax = 0;
 }
 
@@ -7150,11 +7159,12 @@ static void bridge_DbgPrint(void)
     g_eax = 0;
 }
 
-/* --- DbgPrompt (ordinal 10, 2 args = 8 bytes) --- */
+/* --- DbgPrompt (ordinal 10, 3 args = 12 bytes) --- */
 static void bridge_DbgPrompt(void)
 {
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
+    (void)STACK_ARG(2);
     g_eax = 0;
 }
 
@@ -7195,16 +7205,19 @@ static void bridge_ExInitializeReadWriteLock(void)
     g_eax = 0;
 }
 
-/* --- ExInterlockedAddLargeInteger (ordinal 19, 3 args = 12 bytes)
+/* --- ExInterlockedAddLargeInteger (ordinal 19, 3 args = 16 bytes)
  * LARGE_INTEGER ExInterlockedAddLargeInteger(PLARGE_INTEGER Addend,
- *                                            LARGE_INTEGER Increment);
- * Addend (4) + Increment.Low (4) + Increment.High (4). Returns the PREVIOUS
- * value of Addend in edx:eax. */
+ *                                            LARGE_INTEGER Increment,
+ *                                            PKSPIN_LOCK Lock);
+ * Addend (4) + Increment.Low (4) + Increment.High (4) + Lock (4). Returns the
+ * PREVIOUS value of Addend in edx:eax. The host's interlocked exchange stands
+ * in for the spin lock. */
 static void bridge_ExInterlockedAddLargeInteger(void)
 {
     uint32_t addend_va = STACK_ARG(0);
     LONGLONG increment = ((LONGLONG)(uint32_t)STACK_ARG(2) << 32)
                        | (LONGLONG)(uint32_t)STACK_ARG(1);
+    (void)STACK_ARG(3);
     volatile LONG *p = (volatile LONG *)XBOX_TO_NATIVE(addend_va);
     LONGLONG old = 0;
 
@@ -7235,14 +7248,13 @@ static void bridge_ExInterlockedAddLargeInteger(void)
     g_edx = (uint32_t)((uint64_t)old >> 32);
 }
 
-/* --- ExInterlockedAddLargeStatistic (ordinal 20, 2 args = 8 bytes)
- * LARGE_INTEGER ExInterlockedAddLargeStatistic(PLARGE_INTEGER Addend,
- *                                              ULONG Increment);
- * Addend (4) + Increment (4). Atomic add; per task spec, returns 0. */
+/* --- ExInterlockedAddLargeStatistic (ordinal 20, fastcall)
+ * VOID ExInterlockedAddLargeStatistic(PLARGE_INTEGER Addend, ULONG Increment);
+ * Addend in ecx, Increment in edx. */
 static void bridge_ExInterlockedAddLargeStatistic(void)
 {
-    uint32_t addend_va = STACK_ARG(0);
-    LONG increment = (LONG)STACK_ARG(1);
+    uint32_t addend_va = g_ecx;
+    LONG increment = (LONG)g_edx;
     volatile LONG *p = (volatile LONG *)XBOX_TO_NATIVE(addend_va);
 
     if (p) {
@@ -7266,28 +7278,21 @@ static void bridge_ExInterlockedAddLargeStatistic(void)
     g_eax = 0;
 }
 
-/* --- ExInterlockedCompareExchange64 (ordinal 21, 4 args = 16 bytes)
- * LONGLONG ExInterlockedCompareExchange64(PLONGLONG Destination,
- *                                         LONGLONG Exchange,
+/* --- ExInterlockedCompareExchange64 (ordinal 21, fastcall)
+ * LONGLONG ExInterlockedCompareExchange64(LONGLONG volatile *Destination,
+ *                                         PLONGLONG Exchange,
  *                                         PLONGLONG Comparand);
- * Arg layout on a 32-bit stack is Destination (4) + Exchange (8) +
- * Comparand.Low (4) -- the Comparand high dword is not passed, so the
- * comparison is against a zero-extended 32-bit value. Returns the old value
- * in edx:eax. */
+ * Destination in ecx, Exchange in edx, Comparand pushed: the two values are
+ * passed by address. Returns the old value in edx:eax. */
 static void bridge_ExInterlockedCompareExchange64(void)
 {
     LONGLONG old = 0;
-    volatile LONGLONG *qp;
-    LONGLONG exchange;
-    LONGLONG comparand;
+    volatile LONGLONG *qp = (volatile LONGLONG *)XBOX_TO_NATIVE(g_ecx);
+    const LONGLONG *exchange = (const LONGLONG *)XBOX_TO_NATIVE(g_edx);
+    const LONGLONG *comparand = (const LONGLONG *)XBOX_TO_NATIVE(STACK_ARG(0));
 
-    exchange  = ((LONGLONG)(uint32_t)STACK_ARG(2) << 32)
-              | (LONGLONG)(uint32_t)STACK_ARG(1);
-    comparand = (LONGLONG)(uint32_t)STACK_ARG(3);
-    qp = (volatile LONGLONG *)XBOX_TO_NATIVE(STACK_ARG(0));
-
-    if (qp)
-        old = InterlockedCompareExchange64(qp, exchange, comparand);
+    if (qp && exchange && comparand)
+        old = InterlockedCompareExchange64(qp, *exchange, *comparand);
 
     g_eax = (uint32_t)old;
     g_edx = (uint32_t)((uint64_t)old >> 32);
@@ -7331,14 +7336,14 @@ static void bridge_ExReleaseReadWriteLock(void)
  * ═══════════════════════════════════════════════════════════════════════════
  */
 
-/* --- ExfInterlockedInsertHeadList (ordinal 32, 2 args = 8 bytes)
- * PLIST_ENTRY ExfInterlockedInsertHeadList(ListHead, Entry);
- * Returns the entry's old Flink (the previous first entry, or ListHead
- * itself for an empty list). */
+/* --- ExfInterlockedInsertHeadList (ordinal 32, fastcall)
+ * PLIST_ENTRY ExfInterlockedInsertHeadList(ListHead, ListEntry);
+ * ListHead in ecx, ListEntry in edx. Returns the previous first entry, or
+ * NULL when the list was empty. */
 static void bridge_ExfInterlockedInsertHeadList(void)
 {
-    uint32_t entry_va = STACK_ARG(0);
-    uint32_t head_va  = STACK_ARG(1);
+    uint32_t head_va  = g_ecx;
+    uint32_t entry_va = g_edx;
     volatile LONG *h_flink = (volatile LONG *)XBOX_TO_NATIVE(head_va);
     uint32_t old_flink = 0;
 
@@ -7350,18 +7355,17 @@ static void bridge_ExfInterlockedInsertHeadList(void)
         if (old_flink)
             BRIDGE_MEM32(old_flink + 4) = entry_va; /* old first->Blink = Entry */
     }
-    g_eax = old_flink;
+    g_eax = old_flink == head_va ? 0 : old_flink;
 }
 
-/* --- ExfInterlockedInsertTailList (ordinal 33, 2 args = 8 bytes)
- * PLIST_ENTRY ExfInterlockedInsertTailList(ListHead, Entry);
- * Returns the previous tail. NT semantics return the old Blink (the entry
- * that was last, or ListHead for an empty list); note the task brief said
- * "old Flink" but the canonical Xbox/NT behaviour is the old Blink. */
+/* --- ExfInterlockedInsertTailList (ordinal 33, fastcall)
+ * PLIST_ENTRY ExfInterlockedInsertTailList(ListHead, ListEntry);
+ * ListHead in ecx, ListEntry in edx. Returns the previous last entry, or
+ * NULL when the list was empty. */
 static void bridge_ExfInterlockedInsertTailList(void)
 {
-    uint32_t entry_va = STACK_ARG(0);
-    uint32_t head_va  = STACK_ARG(1);
+    uint32_t head_va  = g_ecx;
+    uint32_t entry_va = g_edx;
     volatile LONG *h_blink = (volatile LONG *)XBOX_TO_NATIVE(head_va + 4);
     uint32_t old_blink = 0;
 
@@ -7373,15 +7377,16 @@ static void bridge_ExfInterlockedInsertTailList(void)
         if (old_blink)
             BRIDGE_MEM32(old_blink + 0) = entry_va; /* old last->Flink = Entry */
     }
-    g_eax = old_blink;
+    g_eax = old_blink == head_va ? 0 : old_blink;
 }
 
-/* --- ExfInterlockedRemoveHeadList (ordinal 34, 1 arg = 4 bytes)
+/* --- ExfInterlockedRemoveHeadList (ordinal 34, fastcall)
  * PLIST_ENTRY ExfInterlockedRemoveHeadList(ListHead);
- * Returns the removed first entry, or 0 when the list is empty. */
+ * ListHead in ecx. Returns the removed first entry, or 0 when the list is
+ * empty. */
 static void bridge_ExfInterlockedRemoveHeadList(void)
 {
-    uint32_t head_va = STACK_ARG(0);
+    uint32_t head_va = g_ecx;
     volatile LONG *h_flink = (volatile LONG *)XBOX_TO_NATIVE(head_va);
     uint32_t removed = 0;
 
@@ -7458,15 +7463,16 @@ static void bridge_HalWriteSMCScratchRegister(void)
 /* --- InterlockedCompareExchange (ordinal 51)
  * LONG InterlockedCompareExchange(PLONG Destination, LONG Exchange,
  *                                 LONG Comparand);
- * fastcall: ecx=Destination, edx=Exchange, eax=Comparand-in/old-out. */
+ * fastcall: ecx=Destination, edx=Exchange, Comparand pushed (ret 4). */
 static void bridge_InterlockedCompareExchange(void)
 {
     LONG *dst = (LONG *)XBOX_TO_NATIVE(g_ecx);
+    LONG comparand = (LONG)STACK_ARG(0);
     if (!dst) {
         g_eax = 0;
         return;
     }
-    g_eax = (uint32_t)InterlockedCompareExchange(dst, (LONG)g_edx, (LONG)g_eax);
+    g_eax = (uint32_t)InterlockedCompareExchange(dst, (LONG)g_edx, comparand);
 }
 
 /* --- InterlockedDecrement (ordinal 52)
@@ -7544,18 +7550,16 @@ static void bridge_InterlockedPushEntrySList(void)
  * ═══════════════════════════════════════════════════════════════════════════
  */
 
-/* --- IoAllocateIrp (ordinal 59, 2 args = 8 bytes)
- * PIRP IoAllocateIrp(CCHAR StackSize, BOOLEAN ChargeQuota);
+/* --- IoAllocateIrp (ordinal 59, 1 arg = 4 bytes)
+ * PIRP IoAllocateIrp(CCHAR StackSize);
  * Allocates an IRP header plus StackSize IO_STACK_LOCATIONs from the guest
  * heap. Pair with IoFreeIrp (ordinal 72), which frees through the same heap. */
 static void bridge_IoAllocateIrp(void)
 {
-    uint32_t stack_size = STACK_ARG(0);
-    uint32_t charge_quota = STACK_ARG(1);
+    uint32_t stack_size = (uint8_t)STACK_ARG(0);
     uint32_t total = 0x28 + stack_size * 0x20;  /* header + stack locations */
     uint32_t va;
 
-    (void)charge_quota;
     va = xbox_HeapAlloc(total, 16);
     if (va)
         memset((void *)((uintptr_t)va + g_xbox_mem_offset), 0, total);
@@ -7564,7 +7568,7 @@ static void bridge_IoAllocateIrp(void)
     g_eax = va;
 }
 
-/* --- IoBuildAsynchronousFsdRequest (ordinal 60, 7 args = 28 bytes) --- */
+/* --- IoBuildAsynchronousFsdRequest (ordinal 60, 6 args = 24 bytes) --- */
 static void bridge_IoBuildAsynchronousFsdRequest(void)
 {
     (void)STACK_ARG(0);
@@ -7573,7 +7577,6 @@ static void bridge_IoBuildAsynchronousFsdRequest(void)
     (void)STACK_ARG(3);
     (void)STACK_ARG(4);
     (void)STACK_ARG(5);
-    (void)STACK_ARG(6);
     g_eax = 0;
 }
 
@@ -7631,14 +7634,13 @@ static void bridge_IoRemoveShareAccess(void)
     (void)STACK_ARG(1);
 }
 
-/* --- IoSetShareAccess (ordinal 80, 5 args = 20 bytes) --- */
+/* --- IoSetShareAccess (ordinal 80, 4 args = 16 bytes) --- */
 static void bridge_IoSetShareAccess(void)
 {
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     (void)STACK_ARG(2);
     (void)STACK_ARG(3);
-    (void)STACK_ARG(4);
 }
 
 /* --- IoDismountVolume (ordinal 90, 1 arg = 4 bytes) --- */
@@ -7902,11 +7904,12 @@ static void bridge_KeEnterCriticalRegion(void)
     g_eax = 0;
 }
 
-/* --- KeInitializeApc (ordinal 105, 6 args = 24 bytes) --- */
+/* --- KeInitializeApc (ordinal 105, 7 args = 28 bytes) --- */
 static void bridge_KeInitializeApc(void)
 {
     uint32_t apc_va = STACK_ARG(0);
 
+    (void)STACK_ARG(6);
     if (apc_va) {
         BRIDGE_MEM8(apc_va + 0)  = 0;
         BRIDGE_MEM8(apc_va + 1)  = 0;
@@ -8051,10 +8054,12 @@ static void bridge_KeRemoveEntryDeviceQueue(void)
     g_eax = 0;
 }
 
-/* --- KeRemoveQueue (ordinal 136, 1 arg = 4 bytes) --- */
+/* --- KeRemoveQueue (ordinal 136, 3 args = 12 bytes) --- */
 static void bridge_KeRemoveQueue(void)
 {
     (void)STACK_ARG(0);
+    (void)STACK_ARG(1);
+    (void)STACK_ARG(2);
     g_eax = 0;
 }
 
@@ -8117,10 +8122,10 @@ static void bridge_KiBugCheckData(void)
     g_eax = XBOX_KERNEL_DATA_BASE + 0x500;
 }
 
-/* --- KiUnlockDispatcherDatabase (ordinal 163, 1 arg = 4 bytes) --- */
+/* --- KiUnlockDispatcherDatabase (ordinal 163, fastcall: OldIrql in ecx) --- */
 static void bridge_KiUnlockDispatcherDatabase(void)
 {
-    (void)STACK_ARG(0);
+    (void)g_ecx;
     g_eax = 0;
 }
 
@@ -8267,12 +8272,11 @@ static void bridge_NtCreateTimer(void)
     g_eax = 0;  /* STATUS_SUCCESS */
 }
 
-/* --- NtOpenDirectoryObject (ordinal 201, 3 args = 12 bytes) --- */
+/* --- NtOpenDirectoryObject (ordinal 201, 2 args = 8 bytes) --- */
 static void bridge_NtOpenDirectoryObject(void)
 {
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
     g_eax = 0;
 }
 
@@ -8306,7 +8310,7 @@ static void bridge_NtQueueApcThread(void)
     g_eax = 0;
 }
 
-/* --- NtQueryDirectoryObject (ordinal 208, 7 args = 28 bytes) --- */
+/* --- NtQueryDirectoryObject (ordinal 208, 6 args = 24 bytes) --- */
 static void bridge_NtQueryDirectoryObject(void)
 {
     (void)STACK_ARG(0);
@@ -8315,61 +8319,46 @@ static void bridge_NtQueryDirectoryObject(void)
     (void)STACK_ARG(3);
     (void)STACK_ARG(4);
     (void)STACK_ARG(5);
-    (void)STACK_ARG(6);
     g_eax = 0;
 }
 
-/* --- NtQueryEvent (ordinal 209, 4 args = 16 bytes) --- */
+/* --- NtQueryEvent (ordinal 209, 2 args = 8 bytes) --- */
 static void bridge_NtQueryEvent(void)
 {
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
     g_eax = 0;
 }
 
-/* --- NtQueryIoCompletion (ordinal 212, 5 args = 20 bytes) --- */
+/* --- NtQueryIoCompletion (ordinal 212, 2 args = 8 bytes) --- */
 static void bridge_NtQueryIoCompletion(void)
 {
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
-    (void)STACK_ARG(4);
     g_eax = 0;
 }
 
-/* --- NtQueryMutant (ordinal 213, 5 args = 20 bytes) --- */
+/* --- NtQueryMutant (ordinal 213, 2 args = 8 bytes) --- */
 static void bridge_NtQueryMutant(void)
 {
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
-    (void)STACK_ARG(4);
     g_eax = 0;
 }
 
-/* --- NtQuerySemaphore (ordinal 214, 5 args = 20 bytes) --- */
+/* --- NtQuerySemaphore (ordinal 214, 2 args = 8 bytes) --- */
 static void bridge_NtQuerySemaphore(void)
 {
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
-    (void)STACK_ARG(4);
     g_eax = 0;
 }
 
-/* --- NtQueryTimer (ordinal 216, 5 args = 20 bytes) --- */
+/* --- NtQueryTimer (ordinal 216, 2 args = 8 bytes) --- */
 static void bridge_NtQueryTimer(void)
 {
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
-    (void)STACK_ARG(4);
     g_eax = 0;
 }
 
@@ -8453,28 +8442,23 @@ static void bridge_NtWriteFileGather(void)
  * ═══════════════════════════════════════════════════════════════════════════
  */
 
-/* --- ObCreateObject (ordinal 239, 7 args = 28 bytes) --- */
+/* --- ObCreateObject (ordinal 239, 4 args = 16 bytes) --- */
 static void bridge_ObCreateObject(void)
 {
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     (void)STACK_ARG(2);
     (void)STACK_ARG(3);
-    (void)STACK_ARG(4);
-    (void)STACK_ARG(5);
-    (void)STACK_ARG(6);
     g_eax = 0;
 }
 
-/* --- ObInsertObject (ordinal 241, 6 args = 24 bytes) --- */
+/* --- ObInsertObject (ordinal 241, 4 args = 16 bytes) --- */
 static void bridge_ObInsertObject(void)
 {
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     (void)STACK_ARG(2);
     (void)STACK_ARG(3);
-    (void)STACK_ARG(4);
-    (void)STACK_ARG(5);
     g_eax = 0;
 }
 
@@ -8495,21 +8479,20 @@ static void bridge_ObOpenObjectByName(void)
     g_eax = 0;
 }
 
-/* --- ObOpenObjectByPointer (ordinal 244, 5 args = 20 bytes) --- */
+/* --- ObOpenObjectByPointer (ordinal 244, 3 args = 12 bytes) --- */
 static void bridge_ObOpenObjectByPointer(void)
 {
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
-    (void)STACK_ARG(4);
     g_eax = 0;
 }
 
-/* --- ObReferenceObjectByPointer (ordinal 248, 1 arg = 4 bytes) --- */
+/* --- ObReferenceObjectByPointer (ordinal 248, 2 args = 8 bytes) --- */
 static void bridge_ObReferenceObjectByPointer(void)
 {
     (void)STACK_ARG(0);
+    (void)STACK_ARG(1);
     g_eax = 0;
 }
 
@@ -8518,17 +8501,17 @@ static void bridge_ObReferenceObjectByPointer(void)
  * ═══════════════════════════════════════════════════════════════════════════
  */
 
-/* --- PsCreateSystemThread (ordinal 254, 7 args = 28 bytes)
- * NTSTATUS PsCreateSystemThread(PHANDLE ThreadHandle, ULONG KernelStackSize,
- *                               ULONG TlsDataSize, PULONG ThreadId,
- *                               PVOID StartContext1, PVOID StartContext2,
- *                               PXBOX_SYSTEM_ROUTINE StartRoutine);
- * Mirror of PsCreateSystemThreadEx (ordinal 255) with the ThreadExtraSize
- * argument dropped. */
+/* --- PsCreateSystemThread (ordinal 254, 5 args = 20 bytes)
+ * NTSTATUS PsCreateSystemThread(PHANDLE ThreadHandle, PHANDLE ThreadId,
+ *                               PKSTART_ROUTINE StartRoutine,
+ *                               PVOID StartContext, BOOLEAN DebuggerThread);
+ * PsCreateSystemThreadEx (ordinal 255) with the default stack, not suspended
+ * and no system routine. */
 static void bridge_PsCreateSystemThread(void)
 {
-    bridge_create_thread(STACK_ARG(0), 0xBEEF0002, STACK_ARG(1), STACK_ARG(4),
-                         STACK_ARG(5), 0, STACK_ARG(6));
+    (void)STACK_ARG(4);
+    bridge_create_thread(STACK_ARG(0), 0xBEEF0002, 0, STACK_ARG(2),
+                         STACK_ARG(3), 0, 0);
 }
 
 /* --- PsQueryStatistics (ordinal 256, 1 arg = 4 bytes)
@@ -8541,11 +8524,10 @@ static void bridge_PsQueryStatistics(void)
     g_eax = 0;
 }
 
-/* --- PsSetCreateThreadNotifyRoutine (ordinal 257, 2 args = 8 bytes) --- */
+/* --- PsSetCreateThreadNotifyRoutine (ordinal 257, 1 arg = 4 bytes) --- */
 static void bridge_PsSetCreateThreadNotifyRoutine(void)
 {
     (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
     g_eax = 0;
 }
 
@@ -8603,32 +8585,27 @@ static void bridge_RtlExtendedLargeIntegerDivide(void)
     g_edx = (uint32_t)(quotient >> 32);
 }
 
-/* --- RtlExtendedMagicDivide (ordinal 283, 4 args = 16 bytes)
- * RtlExtendedMagicDivide(Dividend.Low, Dividend.High, Divisor, Remainder-ptr)
- * per the 16-byte stack layout. The precomputed magic multiplier is not
- * available, so a real division produces the identical quotient. */
+/* --- RtlExtendedMagicDivide (ordinal 283, 3 args = 20 bytes)
+ * LARGE_INTEGER RtlExtendedMagicDivide(LARGE_INTEGER Dividend,
+ *                                      LARGE_INTEGER MagicDivisor,
+ *                                      CCHAR ShiftCount);
+ * Dividend (8) + MagicDivisor (8) + ShiftCount (4). The quotient is the high
+ * 64 bits of |Dividend| * MagicDivisor shifted right by ShiftCount, with the
+ * dividend's sign. Returned in edx:eax. */
 static void bridge_RtlExtendedMagicDivide(void)
 {
-    uint64_t dividend = ((uint64_t)(uint32_t)STACK_ARG(1) << 32)
-                      | (uint32_t)STACK_ARG(0);
-    uint32_t divisor = STACK_ARG(2);
-    uint32_t rem_ptr = STACK_ARG(3);
-    uint32_t remainder;
-    uint64_t quotient;
+    int64_t dividend = (int64_t)(((uint64_t)STACK_ARG(1) << 32) | STACK_ARG(0));
+    uint64_t magic = ((uint64_t)STACK_ARG(3) << 32) | STACK_ARG(2);
+    unsigned shift = (uint8_t)STACK_ARG(4);
+    uint64_t a = dividend < 0 ? 0 - (uint64_t)dividend : (uint64_t)dividend;
+    uint64_t a_lo = (uint32_t)a, a_hi = a >> 32, m_lo = (uint32_t)magic, m_hi = magic >> 32;
+    uint64_t lo_lo = a_lo * m_lo, hi_lo = a_hi * m_lo, lo_hi = a_lo * m_hi, hi_hi = a_hi * m_hi;
+    uint64_t mid = (lo_lo >> 32) + (uint32_t)hi_lo + (uint32_t)lo_hi;
+    uint64_t quotient = hi_hi + (hi_lo >> 32) + (lo_hi >> 32) + (mid >> 32);
 
-    if (divisor == 0) {
-        if (rem_ptr)
-            BRIDGE_MEM32(rem_ptr) = 0;
-        g_eax = 0;
-        g_edx = 0;
-        return;
-    }
-
-    quotient  = dividend / divisor;
-    remainder = (uint32_t)(dividend % divisor);
-
-    if (rem_ptr)
-        BRIDGE_MEM32(rem_ptr) = remainder;
+    quotient = shift < 64 ? quotient >> shift : 0;
+    if (dividend < 0)
+        quotient = 0 - quotient;
     g_eax = (uint32_t)quotient;
     g_edx = (uint32_t)(quotient >> 32);
 }
@@ -9020,444 +8997,25 @@ static void bridge_WRITE_PORT_BUFFER_UCHAR(void)
     g_eax = 0;
 }
 
+enum { KABI_NONE, KABI_DATA, KABI_CDECL, KABI_STDCALL, KABI_FASTCALL };
+struct kernel_abi { unsigned char kind, stack_bytes, register_args; };
+#include "kernel_abi.inc"
+
+/* The argument bytes the callee pops for an ordinal (cdecl: 0, the caller
+ * pops), or -1 for an ordinal that is not a function. Generated from nxdk's
+ * prototypes, so no bridge can carry its own count. */
 static int stdcall_args_for_ordinal(ULONG ordinal)
 {
-    switch (ordinal) {
-    /* ── Display / AV ── */
-    case   1: return  0;  /* AvGetSavedDataAddress (void) */
-    case   2: return 16;  /* AvSendTVEncoderOption (4) */
-    case   3: return 24;  /* AvSetDisplayMode (6) */
-    case   4: return  4;  /* AvSetSavedDataAddress (1) */
-    case   5: return  0;  /* DbgBreakPoint (void) */
-    case   8: return  0;  /* DbgPrint - __cdecl varargs, caller cleans */
-    case   9: return  8;  /* HalReadSMCTrayState (2) */
-    case  14: return  4;  /* ExAllocatePool (1) */
-    case  15: return  8;  /* ExAllocatePoolWithTag (2) */
-    case  17: return  4;  /* ExFreePool (1) */
-    case  23: return  4;  /* ExQueryPoolBlockSize (1) */
-    case  24: return 20;  /* ExQueryNonVolatileSetting (5) */
-    case  29: return 16;  /* ExSaveNonVolatileSetting (4) */
-    case  35: return  0;  /* FscGetCacheSize (void) */
-    case  37: return  4;  /* FscSetCacheSize (1) */
-    case  38: return  4;  /* HalClearSoftwareInterrupt (1) */
-    case  39: return  8;  /* HalDisableSystemInterrupt (2) */
-    case  42: return  0;  /* HalDiskSerialNumber - data export */
-    case  44: return  8;  /* HalGetInterruptVector (2) */
-    case  47: return  8;  /* HalRegisterShutdownNotification (2) */
-    case  46: return 24;  /* HalReadWritePCISpace (6) */
-    case  45: return 16;  /* HalReadSMBusValue (4) */
-    case  50: return 16;  /* HalWriteSMBusValue (4) */
-    case  48: return  4;  /* HalRequestSoftwareInterrupt (1) */
-    case  49: return  4;  /* HalReturnToFirmware (1) */
-    case  61: return 36;  /* IoBuildDeviceIoControlRequest (9) */
-    case  62: return 28;  /* IoBuildSynchronousFsdRequest (7) */
-    case  65: return 24;  /* IoCreateDevice (6) */
-    case  66: return 40;  /* IoCreateFile (10) */
-    case  67: return  8;  /* IoCreateSymbolicLink (2) */
-    case  68: return  4;  /* IoDeleteDevice (1) */
-    case  69: return  4;  /* IoDeleteSymbolicLink (1) */
-    case  73: return 12;  /* IoInitializeIrp (3) */
-    case  74: return  8;  /* IoInvalidDeviceRequest (2) */
-    case  79: return 20;  /* IoSetIoCompletion (5) */
-    case  81: return  4;  /* IoStartNextPacket (1) */
-    case  82: return  8;  /* IoStartNextPacketByKey (2) */
-    case  83: return 12;  /* IoStartPacket (3) */
-    case  84: return 32;  /* IoSynchronousDeviceIoControlRequest (8) */
-    case  85: return 20;  /* IoSynchronousFsdRequest (5) */
-    case  86: return  0;  /* IofCallDriver (fastcall: args in ecx/edx) */
-    case  87: return  0;  /* IofCompleteRequest (fastcall: args in ecx/edx) */
-    /* Missing this entry cost the Xbox Dashboard its whole boot. Ordinal 91 has
-     * no bridge, so the generic stub ran -- and with no arg count it left the
-     * one pushed argument on the guest stack. The caller (sub_00032859) then
-     * ran `pop edi; pop esi; pop ebx` four bytes low and came back with its
-     * registers rotated, which destroyed the XApp `this` pointer two frames up.
-     * Its scene manager was never created, its scene never loaded, and it
-     * returned to firmware -- reported as nothing more than "returning 0". */
-    case  90: return  4;  /* IoDismountVolume (1) */
-    case  91: return  4;  /* IoDismountVolumeByName (1) */
-    case  93: return  8;  /* KeAlertThread (2) */
-    case  95: return  4;  /* KeBugCheck (1) */
-    case  96: return 20;  /* KeBugCheckEx (5) */
-    case  97: return  4;  /* KeCancelTimer (1) */
-    case  98: return  4;  /* KeConnectInterrupt (1) */
-    case  99: return 12;  /* KeDelayExecutionThread (3) */
-    case 100: return  4;  /* KeDisconnectInterrupt (1) */
-    case 107: return 12;  /* KeInitializeDpc (3) */
-    case 109: return 28;  /* KeInitializeInterrupt (7) */
-    case 113: return  8;  /* KeInitializeTimerEx (2) */
-    case 119: return 12;  /* KeInsertQueueDpc (3) */
-    case 124: return  4;  /* KeQueryBasePriorityThread (1) */
-    case 125: return  0;  /* KeQueryInterruptTime (void) */
-    case 126: return  0;  /* KeQueryPerformanceCounter (void) */
-    case 127: return  0;  /* KeQueryPerformanceFrequency (void) */
-    case 128: return  4;  /* KeQuerySystemTime (1) */
-    case 129: return  0;  /* KeRaiseIrqlToDpcLevel (void) */
-    case 137: return  4;  /* KeRemoveQueueDpc (1) */
-    case 139: return  4;  /* KeRestoreFloatingPointState (1) */
-    case 142: return  4;  /* KeSaveFloatingPointState (1) */
-    case 143: return  8;  /* KeSetBasePriorityThread (2) */
-    case 144: return  8;  /* KeSetDisableBoostThread (2) */
-    case 145: return 12;  /* KeSetEvent (3) */
-    case 149: return 16;  /* KeSetTimer (Timer+DueTime[8]+Dpc) */
-    case 150: return 20;  /* KeSetTimerEx (Timer+DueTime[8]+Period+Dpc) */
-    case 151: return  4;  /* KeStallExecutionProcessor (1) */
-    case 153: return 12;  /* KeSynchronizeExecution (3) */
-    case 158: return 32;  /* KeWaitForMultipleObjects (8) */
-    case 159: return 20;  /* KeWaitForSingleObject (5) */
-    case 160: return  0;  /* KfRaiseIrql (fastcall: arg in ecx) */
-    case 161: return  0;  /* KfLowerIrql (fastcall: arg in ecx) */
-    case 165: return  4;  /* MmAllocateContiguousMemory (1) */
-    case 166: return 20;  /* MmAllocateContiguousMemoryEx (5) */
-    case 167: return  8;  /* MmAllocateSystemMemory (2) */
-    case 168: return  8;  /* MmClaimGpuInstanceMemory (2) */
-    case 169: return  8;  /* MmCreateKernelStack (2) */
-    case 170: return  8;  /* MmDeleteKernelStack (2) */
-    case 171: return  4;  /* MmFreeContiguousMemory (1) */
-    case 172: return  8;  /* MmFreeSystemMemory (2) */
-    case 173: return  4;  /* MmGetPhysicalAddress (1) */
-    case 175: return 12;  /* MmLockUnlockBufferPages (3) */
-    case 176: return  8;  /* MmLockUnlockPhysicalPage (2) */
-    case 177: return 12;  /* MmMapIoSpace (3) */
-    case 178: return 12;  /* MmPersistContiguousMemory (3) */
-    case 179: return  4;  /* MmQueryAddressProtect (1) */
-    case 180: return  4;  /* MmQueryAllocationSize (1) */
-    case 181: return  4;  /* MmQueryStatistics (1) */
-    case 182: return 12;  /* MmSetAddressProtect (3) */
-    case 183: return  8;  /* MmUnmapIoSpace (2) */
-    case 184: return 20;  /* NtAllocateVirtualMemory (5) */
-    case 185: return  8;  /* NtCancelTimer (2) */
-    case 186: return  4;  /* NtClearEvent (1) */
-    case 187: return  4;  /* NtClose (1) */
-    case 188: return  8;  /* NtCreateDirectoryObject (2) */
-    case 189: return 16;  /* NtCreateEvent (4) */
-    case 190: return 36;  /* NtCreateFile (9) */
-    case 191: return 16;  /* NtCreateIoCompletion (4) */
-    case 192: return 12;  /* NtCreateMutant (3) */
-    case 193: return 16;  /* NtCreateSemaphore (4) */
-    case 194: return 12;  /* NtCreateTimer (3) */
-    case 195: return  4;  /* NtDeleteFile (1) */
-    case 196: return 40;  /* NtDeviceIoControlFile (10) */
-    case 197: return 12;  /* NtDuplicateObject (3) */
-    case 198: return  8;  /* NtFlushBuffersFile (2) */
-    case 199: return 12;  /* NtFreeVirtualMemory (3) */
-    case 200: return 40;  /* NtFsControlFile (10) */
-    case 202: return 24;  /* NtOpenFile (6) */
-    case 203: return  8;  /* NtOpenSymbolicLinkObject (2) */
-    case 204: return 16;  /* NtProtectVirtualMemory (4) */
-    case 205: return  8;  /* NtPulseEvent (2) */
-    case 206: return 20;  /* NtQueueApcThread (5) */
-    case 207: return 40;  /* NtQueryDirectoryFile (10) */
-    case 210: return  8;  /* NtQueryFullAttributesFile (2) */
-    case 211: return 20;  /* NtQueryInformationFile (5) */
-    case 215: return 12;  /* NtQuerySymbolicLinkObject (3) */
-    case 217: return 8;   /* NtQueryVirtualMemory (2) -- Xbox takes
-                             BaseAddress and Info only, not NT's four */
-    case 218: return 20;  /* NtQueryVolumeInformationFile (5) */
-    case 219: return 32;  /* NtReadFile (8) */
-    case 220: return 32;  /* NtReadFileScatter (8) */
-    case 221: return  8;  /* NtReleaseMutant (2) */
-    case 222: return 12;  /* NtReleaseSemaphore (3) */
-    case 223: return 20;  /* NtRemoveIoCompletion (5) */
-    case 224: return  8;  /* NtResumeThread (2) */
-    case 225: return  8;  /* NtSetEvent (2) */
-    case 226: return 20;  /* NtSetInformationFile (5) */
-    case 227: return 20;  /* NtSetIoCompletion (5) */
-    case 228: return  8;  /* NtSetSystemTime (2) */
-    case 229: return 32;  /* NtSetTimerEx (8) */
-    case 230: return 20;  /* NtSignalAndWaitForSingleObjectEx (5) */
-    case 231: return  8;  /* NtSuspendThread (2) */
-    case 232: return 12;  /* NtUserIoApcDispatcher (3) */
-    case 233: return 12;  /* NtWaitForSingleObject (3) */
-    case 234: return 16;  /* NtWaitForSingleObjectEx (4) */
-    case 235: return 24;  /* NtWaitForMultipleObjectsEx (6) */
-    case 236: return 32;  /* NtWriteFile (8) */
-    case 237: return 32;  /* NtWriteFileGather (8) */
-    case 238: return  0;  /* NtYieldExecution (void) */
-    case 243: return 16;  /* ObOpenObjectByName (4) */
-    case 247: return 20;  /* ObReferenceObjectByName (5) */
-    case 250: return  0;  /* ObfDereferenceObject (fastcall: arg in ecx) */
-    case 251: return  0;  /* ObfReferenceObject (fastcall: arg in ecx) */
-    case 252: return  4;  /* PhyGetLinkState (1) */
-    case 253: return  8;  /* PhyInitialize (2) */
-    case 255: return 40;  /* PsCreateSystemThreadEx (10) */
-    case 258: return  4;  /* PsTerminateSystemThread (1) */
-    case 260: return 12;  /* RtlAnsiStringToUnicodeString (3) */
-    case 268: return 12;  /* RtlCompareMemory (3) */
-    case 269: return 12;  /* RtlCompareMemoryUlong (3) */
-    case 270: return 12;  /* RtlCompareString (3) */
-    case 261: return  8;  /* RtlAppendStringToString (2) */
-    case 262: return  8;  /* RtlAppendUnicodeStringToString (2) */
-    case 263: return  8;  /* RtlAppendUnicodeToString (2) */
-    case 264: return 12;  /* RtlAssert (3) */
-    case 265: return  4;  /* RtlCaptureContext (1) */
-    case 266: return 20;  /* RtlCaptureStackBackTrace (5) */
-    case 267: return 12;  /* RtlCharToInteger (3) */
-    case 271: return 12;  /* RtlCompareUnicodeString (3) */
-    case 272: return  8;  /* RtlCopyString (2) */
-    case 273: return  8;  /* RtlCopyUnicodeString (2) */
-    case 274: return  8;  /* RtlCreateUnicodeString (2) */
-    case 275: return  4;  /* RtlDowncaseUnicodeChar (1) */
-    case 276: return 12;  /* RtlDowncaseUnicodeString (3) */
-    case 278: return  4;  /* RtlEnterCriticalSectionAndRegion (1) */
-    case 280: return 12;  /* RtlEqualUnicodeString (3) */
-    case 284: return 12;  /* RtlFillMemory (3) */
-    case 287: return  4;  /* RtlFreeUnicodeString (1) */
-    case 288: return  8;  /* RtlGetCallersAddress (2) */
-    case 292: return 16;  /* RtlIntegerToChar (4) */
-    case 293: return 12;  /* RtlIntegerToUnicodeString (3) */
-    case 295: return  4;  /* RtlLeaveCriticalSectionAndRegion (1) */
-    case 296: return  4;  /* RtlLowerChar (1) */
-    case 297: return  8;  /* RtlMapGenericMask (2) */
-    case 298: return 12;  /* RtlMoveMemory (3) */
-    case 299: return 20;  /* RtlMultiByteToUnicodeN (5) */
-    case 300: return 12;  /* RtlMultiByteToUnicodeSize (3) */
-    case 306: return  4;  /* RtlTryEnterCriticalSection (1) */
-    case 307: return  4;  /* RtlUlongByteSwap (1) */
-    case 309: return 12;  /* RtlUnicodeStringToInteger (3) */
-    case 310: return 20;  /* RtlUnicodeToMultiByteN (5) */
-    case 311: return 12;  /* RtlUnicodeToMultiByteSize (3) */
-    case 313: return  4;  /* RtlUpcaseUnicodeChar (1) */
-    case 314: return 12;  /* RtlUpcaseUnicodeString (3) */
-    case 315: return 20;  /* RtlUpcaseUnicodeToMultiByteN (5) */
-    case 316: return  4;  /* RtlUpperChar (1) */
-    case 317: return  8;  /* RtlUpperString (2) */
-    case 318: return  4;  /* RtlUshortByteSwap (1) */
-    case 319: return 12;  /* RtlWalkFrameChain (3) */
-    case 320: return  8;  /* RtlZeroMemory (2) */
-    case 321: return  0;  /* XboxEEPROMKey (void) */
-    case 277: return  4;  /* RtlEnterCriticalSection (1) */
-    case 279: return 12;  /* RtlEqualString (3) */
-    case 285: return 12;  /* RtlFillMemoryUlong (3) */
-    case 286: return  4;  /* RtlFreeAnsiString (1) */
-    case 289: return  8;  /* RtlInitAnsiString (2) */
-    case 290: return  8;  /* RtlInitUnicodeString (2) */
-    case 291: return  4;  /* RtlInitializeCriticalSection (1) */
-    case 294: return  4;  /* RtlLeaveCriticalSection (1) */
-    case 301: return  4;  /* RtlNtStatusToDosError (1) */
-    case 302: return  4;  /* RtlRaiseException (1) */
-    case 304: return  8;  /* RtlTimeFieldsToTime (2) */
-    case 305: return  8;  /* RtlTimeToTimeFields (2) */
-    case 308: return 12;  /* RtlUnicodeStringToAnsiString (3) */
-    case 312: return 16;  /* RtlUnwind (4) */
-    case 327: return  4;  /* XeLoadSection (1) */
-    case 328: return  4;  /* XeUnloadSection (1) */
-    case 333: return 12;  /* WRITE_PORT_BUFFER_USHORT (3) */
-    case 334: return 12;  /* WRITE_PORT_BUFFER_ULONG (3) */
-    case 335: return  4;  /* XcSHAInit (1) */
-    case 336: return 12;  /* XcSHAUpdate (3) */
-    case 337: return  8;  /* XcSHAFinal (2) */
-    case 338: return 12;  /* XcRC4Key (3) */
-    case 339: return 12;  /* XcRC4Crypt (3) */
-    case 340: return 28;  /* XcHMAC (7) */
-    case 341: return 12;  /* XcPKEncPublic (3) */
-    case 342: return 12;  /* XcPKDecPrivate (3) */
-    case 343: return  4;  /* XcPKGetKeyLen (1) */
-    case 344: return 12;  /* XcVerifyPKCS1Signature (3) */
-    case 345: return 20;  /* XcModExp (5) */
-    case 346: return  8;  /* XcDESKeyParity (2) */
-    case 347: return 12;  /* XcKeyTable (3) */
-    case 348: return 20;  /* XcBlockCrypt (5) */
-    case 349: return 28;  /* XcBlockCryptCBC (7) */
-    case 350: return  8;  /* XcCryptService (2) */
-    case 351: return  8;  /* XcUpdateCrypto (2) */
-    case 352: return 12;  /* RtlRip (3) */
-    case 358: return  0;  /* HalIsResetOrShutdownPending (void) */
-    case 359: return  4;  /* IoMarkIrpMustComplete (1) */
-
-    /* ── Unknown stubs ── */
-
-    /* ── Pool Allocator ── */
-    /* ordinal 16 is the ExEventObjectType data export; see
-     * kernel_thunks.c, which points its thunk at kernel data.
-     * 17 is ExFreePool and is a real function. */
-
-    /* ── HAL ── */
-
-    /* ── I/O Manager ── */
-    /* ordinal 64 is the IoCompletionObjectType data export; see
-     * kernel_thunks.c. 65 is IoCreateDevice, a real function. */
-    /* case  71: DATA export - IoDeviceObjectType */
-
-    /* ── Kernel Synchronization ── */
-    /* case 156: DATA export - KeTickCount */
-
-    /* ── Launch Data ── */
-    /* case 164: DATA export - LaunchDataPage */
-
-    /* ── Memory Management ── */
-
-    /* ── NT Virtual Memory ── */
-
-    /* ── NT File I/O & Handle ── */
-
-    /* ── Object Manager ── */
-    case 246: return 12;  /* ObReferenceObjectByHandle(3) - Xbox: Handle,Type,Object* */
-    case 360: return  0;  /* HalInitiateShutdown (void) */
-
-    /* ── Network / PHY ── */
-
-    /* ── Threading ── */
-    /* case 259: DATA export - PsThreadObjectType */
-
-    /* ── Runtime Library ── */
-
-    /* ── Xbox Identity (data exports) ── */
-    /* cases 322-328, 355-357: DATA exports */
-
-    /* ── Port I/O ── */
-
-    /* ── Crypto ── */
-
-    /* Data exports */
-    case 102: return 0;  /* MmGlobalData (void/data) */
-    case 120: return 0;  /* KeInterruptTime (void/data) */
-    case 154: return 0;  /* KeSystemTime (void/data) */
-    case 240: return 0;  /* ObDirectoryObjectType (void/data) */
-    case 245: return 0;  /* ObpObjectHandleTable (void/data) */
-    case 249: return 0;  /* ObSymbolicLinkObjectType (void/data) */
-
-    /* Dbg */
-    case   6: return  4;  /* DbgBreakPointWithStatus (1) */
-    case   7: return 12;  /* DbgLoadImageSymbols (3) */
-    case  10: return  8;  /* DbgPrompt (2) */
-    case  11: return 12;  /* DbgUnLoadImageSymbols (3) */
-
-    /* Ex */
-    case  12: return  4;  /* ExAcquireReadWriteLockExclusive (1) */
-    case  13: return  4;  /* ExAcquireReadWriteLockShared (1) */
-    case  18: return  4;  /* ExInitializeReadWriteLock (1) */
-    case  19: return 12;  /* ExInterlockedAddLargeInteger (3) */
-    case  20: return  8;  /* ExInterlockedAddLargeStatistic (2) */
-    case  21: return 16;  /* ExInterlockedCompareExchange64 (4) */
-    case  25: return 12;  /* ExReadWriteRefurbInfo (3) */
-    case  26: return  4;  /* ExRaiseException (1) */
-    case  27: return  4;  /* ExRaiseStatus (1) */
-    case  28: return  4;  /* ExReleaseReadWriteLock (1) */
-
-    /* ExfInterlocked */
-    case  32: return  8;  /* ExfInterlockedInsertHeadList (2) */
-    case  33: return  8;  /* ExfInterlockedInsertTailList (2) */
-    case  34: return  4;  /* ExfInterlockedRemoveHeadList (1) */
-
-    /* Fsc */
-    case  36: return  0;  /* FscInvalidateIdleBlocks (void) */
-
-    /* Hal */
-    case  43: return  8;  /* HalEnableSystemInterrupt (2) */
-    case 365: return  0;  /* HalEnableSecureTrayEject (void) */
-    case 366: return  4;  /* HalWriteSMCScratchRegister (1) */
-
-    /* Interlocked (fastcall, args in ecx/edx) */
-    case  51: return  0;  /* InterlockedCompareExchange (fastcall) */
-    case  52: return  0;  /* InterlockedDecrement (fastcall) */
-    case  53: return  0;  /* InterlockedIncrement (fastcall) */
-    case  54: return  0;  /* InterlockedExchange (fastcall) */
-    case  55: return  0;  /* InterlockedExchangeAdd (fastcall) */
-    case  56: return  0;  /* InterlockedFlushSList (fastcall) */
-    case  57: return  0;  /* InterlockedPopEntrySList (fastcall) */
-    case  58: return  0;  /* InterlockedPushEntrySList (fastcall) */
-
-    /* Io */
-    case  59: return  8;  /* IoAllocateIrp (2) */
-    case  60: return 28;  /* IoBuildAsynchronousFsdRequest (7) */
-    case  63: return 20;  /* IoCheckShareAccess (5) */
-    case  72: return  4;  /* IoFreeIrp (1) */
-    case  75: return 20;  /* IoQueryFileInformation (5) */
-    case  76: return 20;  /* IoQueryVolumeInformation (5) */
-    case  77: return  4;  /* IoQueueThreadIrp (1) */
-    case  78: return  8;  /* IoRemoveShareAccess (2) */
-    case  80: return 20;  /* IoSetShareAccess (5) */
-
-    /* Kd */
-
-    /* Ke (new) */
-    case  92: return  4;  /* KeAlertResumeThread (1) */
-    case  94: return  8;  /* KeBoostPriorityThread (2) */
-    case 101: return  0;  /* KeEnterCriticalRegion (void) */
-    case 103: return  0;  /* KeGetCurrentIrql (void) */
-    case 104: return  0;  /* KeGetCurrentThread (void) */
-    case 105: return 24;  /* KeInitializeApc (6) */
-    case 106: return  4;  /* KeInitializeDeviceQueue (1) */
-    case 108: return 12;  /* KeInitializeEvent (3) */
-    case 110: return  8;  /* KeInitializeMutant (2) */
-    case 111: return  8;  /* KeInitializeQueue (2) */
-    case 112: return 12;  /* KeInitializeSemaphore (3) */
-    case 114: return 12;  /* KeInsertByKeyDeviceQueue (3) */
-    case 115: return  8;  /* KeInsertDeviceQueue (2) */
-    case 116: return  8;  /* KeInsertHeadQueue (2) */
-    case 117: return  8;  /* KeInsertQueue (2) */
-    case 118: return 16;  /* KeInsertQueueApc (4) */
-    case 121: return  0;  /* KeIsExecutingDpc (void) */
-    case 122: return  0;  /* KeLeaveCriticalRegion (void) */
-    case 123: return 12;  /* KePulseEvent (3) */
-    case 130: return  0;  /* KeRaiseIrqlToSynchLevel (void) */
-    case 131: return 16;  /* KeReleaseMutant (4) */
-    case 132: return 16;  /* KeReleaseSemaphore (4) */
-    case 133: return  8;  /* KeRemoveByKeyDeviceQueue (2) */
-    case 134: return  4;  /* KeRemoveDeviceQueue (1) */
-    case 135: return  8;  /* KeRemoveEntryDeviceQueue (2) */
-    case 136: return  4;  /* KeRemoveQueue (1) */
-    case 138: return  4;  /* KeResetEvent (1) */
-    case 140: return  4;  /* KeResumeThread (1) */
-    case 141: return  4;  /* KeRundownQueue (1) */
-    case 146: return  8;  /* KeSetEventBoostPriority (2) */
-    case 147: return  8;  /* KeSetPriorityProcess (2) */
-    case 148: return  8;  /* KeSetPriorityThread (2) */
-    case 152: return  4;  /* KeSuspendThread (1) */
-    case 155: return  4;  /* KeTestAlertThread (1) */
-    case 162: return  0;  /* KiBugCheckData (void/data) */
-    case 163: return  4;  /* KiUnlockDispatcherDatabase (1) */
-
-    /* Mm */
-    case 174: return  4;  /* MmIsAddressValid (1) */
-    case 374: return  8;  /* MmDbgAllocateMemory (2) */
-    case 375: return  8;  /* MmDbgFreeMemory (2) */
-    case 376: return  0;  /* MmDbgQueryAvailablePages (void) */
-    case 377: return  8;  /* MmDbgReleaseAddress (2) */
-    case 378: return  8;  /* MmDbgWriteCheck (2) */
-
-    /* Nt */
-    case 201: return 12;  /* NtOpenDirectoryObject (3) */
-    case 208: return 28;  /* NtQueryDirectoryObject (7) */
-    case 209: return 16;  /* NtQueryEvent (4) */
-    case 212: return 20;  /* NtQueryIoCompletion (5) */
-    case 213: return 20;  /* NtQueryMutant (5) */
-    case 214: return 20;  /* NtQuerySemaphore (5) */
-    case 216: return 20;  /* NtQueryTimer (5) */
-
-    /* Ob */
-    case 239: return 28;  /* ObCreateObject (7) */
-    case 241: return 24;  /* ObInsertObject (6) */
-    case 242: return  4;  /* ObMakeTemporaryObject (1) */
-    case 244: return 20;  /* ObOpenObjectByPointer (5) */
-    case 248: return  4;  /* ObReferenceObjectByPointer (1) */
-
-    /* Ps */
-    case 254: return 28;  /* PsCreateSystemThread (7) */
-    case 256: return  4;  /* PsQueryStatistics (1) */
-    case 257: return  8;  /* PsSetCreateThreadNotifyRoutine (2) */
-
-    /* Rtl */
-    case 281: return 12;  /* RtlExtendedIntegerMultiply (3) */
-    case 282: return 16;  /* RtlExtendedLargeIntegerDivide (4) */
-    case 283: return 16;  /* RtlExtendedMagicDivide (4) */
-    case 303: return  4;  /* RtlRaiseStatus (1) */
-    case 361: return  0;  /* RtlSnprintf - __cdecl, caller cleans */
-    case 362: return  0;  /* RtlSprintf - __cdecl, caller cleans */
-    case 363: return  0;  /* RtlVsnprintf - __cdecl, caller cleans */
-    case 364: return  0;  /* RtlVsprintf - __cdecl, caller cleans */
-
-    /* Port I/O */
-    case 329: return 12;  /* READ_PORT_BUFFER_UCHAR (3) */
-    case 330: return 12;  /* READ_PORT_BUFFER_USHORT (3) */
-    case 331: return 12;  /* READ_PORT_BUFFER_ULONG (3) */
-    case 332: return 12;  /* WRITE_PORT_BUFFER_UCHAR (3) */
-
-    /* Not 0: a genuine zero-argument function and an ordinal nobody has
-     * written down are both "pop nothing", but only one of them is a
-     * problem, and the warning below could not tell them apart -- it
-     * accused FscGetCacheSize, which really does take no arguments. */
-    default:  return -1;  /* DATA exports or truly unknown */
+    if (ordinal >= sizeof k_kernel_abi / sizeof k_kernel_abi[0])
+        return -1;
+    switch (k_kernel_abi[ordinal].kind) {
+    case KABI_STDCALL:
+    case KABI_FASTCALL:
+        return k_kernel_abi[ordinal].stack_bytes;
+    case KABI_CDECL:
+        return 0;
+    default:
+        return -1;
     }
 }
 
@@ -10346,17 +9904,16 @@ static void kernel_thunk_dispatch_body(void)
                     ordinal, slot);
             /* "Returning 0" is the harmless half. The damaging half is the
              * stack: the Xbox kernel is stdcall, so the callee owes the caller
-             * its arguments back, and an ordinal missing from
-             * stdcall_args_for_ordinal() returns 0 bytes and leaves them
-             * there. The caller's own `pop`s then run low by that much and it
+             * its arguments back, and an ordinal kernel_abi.inc does not
+             * know pops 0 bytes and leaves them there. The caller's own `pop`s then run low by that much and it
              * returns with its callee-saved registers rotated -- silently,
              * frames away from here. Say so, because a title that dies of this
              * looks nothing like a title that is missing a kernel function. */
             if (g_slot_arg_unknown[slot])
-                fprintf(stderr, "  [KERNEL]   ordinal %u has no entry in "
-                        "stdcall_args_for_ordinal(). If it takes arguments, "
-                        "this call is corrupting the caller's stack -- add its "
-                        "argument size there before anything else.\n", ordinal);
+                fprintf(stderr, "  [KERNEL]   ordinal %u is no function in "
+                        "nxdk's xboxkrnl.exe.def (kernel_abi.inc). If it takes "
+                        "arguments, this call is corrupting the caller's "
+                        "stack.\n", ordinal);
             fflush(stderr);
         }
         g_eax = 0;
