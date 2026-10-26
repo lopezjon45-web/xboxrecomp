@@ -304,6 +304,15 @@ void xbox_WatchInit(void);
  * it to work out the running image's path. The struct was declared without
  * anything to point at, so Buffer held whatever was in that page. */
 #define KDATA_XE_IMAGE_BUF      0x4B0  /* image path text (up to 64 bytes) */
+/* Above the IDE channel's 512 bytes at 0x500. */
+#define KDATA_BUG_CHECK_DATA    0x700  /* KiBugCheckData (ULONG[5]) */
+#define KDATA_MM_GLOBAL_DATA    0x720  /* MmGlobalData (MMGLOBALDATA, 32 bytes) */
+#define KDATA_INTERRUPT_TIME    0x740  /* KeInterruptTime (KSYSTEM_TIME, 12 bytes) */
+#define KDATA_SYSTEM_TIME       0x750  /* KeSystemTime (KSYSTEM_TIME, 12 bytes) */
+#define KDATA_DIRECTORY_OBJ_TYPE 0x760 /* ObDirectoryObjectType (OBJECT_TYPE) */
+#define KDATA_SYMLINK_OBJ_TYPE  0x780  /* ObSymbolicLinkObjectType (OBJECT_TYPE) */
+#define KDATA_OBJECT_HANDLE_TABLE 0x7A0 /* ObpObjectHandleTable (OBJECT_HANDLE_TABLE) */
+#define KDATA_EEPROM_KEY        0x7C0  /* XboxEEPROMKey (16 bytes) */
 
 /** Size of the simulated Xbox stack (8 MB).
  *  Increased from 1 MB because failed RECOMP_ICALL indirect calls

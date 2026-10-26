@@ -185,6 +185,14 @@ static uint32_t kernel_data_va_for_ordinal(ULONG ordinal)
     case  88: return XBOX_KERNEL_DATA_BASE + KDATA_KD_DEBUGGER_ENABLED;
     case  89: return XBOX_KERNEL_DATA_BASE + KDATA_KD_DEBUGGER_NOT_PRESENT;
     case 357: return XBOX_KERNEL_DATA_BASE + KDATA_IDEX_CHANNEL;
+    case 102: return XBOX_KERNEL_DATA_BASE + KDATA_MM_GLOBAL_DATA;
+    case 120: return XBOX_KERNEL_DATA_BASE + KDATA_INTERRUPT_TIME;
+    case 154: return XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME;
+    case 162: return XBOX_KERNEL_DATA_BASE + KDATA_BUG_CHECK_DATA;
+    case 240: return XBOX_KERNEL_DATA_BASE + KDATA_DIRECTORY_OBJ_TYPE;
+    case 245: return XBOX_KERNEL_DATA_BASE + KDATA_OBJECT_HANDLE_TABLE;
+    case 249: return XBOX_KERNEL_DATA_BASE + KDATA_SYMLINK_OBJ_TYPE;
+    case 321: return XBOX_KERNEL_DATA_BASE + KDATA_EEPROM_KEY;
     default:  return 0;  /* Not a data export */
     }
 }
@@ -278,6 +286,29 @@ void xbox_kernel_data_init(void)
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SEMAPHORE_OBJ_TYPE) = XBOX_KERNEL_DATA_BASE + KDATA_SEMAPHORE_OBJ_TYPE;
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_TIMER_OBJ_TYPE)     = XBOX_KERNEL_DATA_BASE + KDATA_TIMER_OBJ_TYPE;
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_FILE_OBJ_TYPE)      = XBOX_KERNEL_DATA_BASE + KDATA_FILE_OBJ_TYPE;
+    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_DIRECTORY_OBJ_TYPE) = XBOX_KERNEL_DATA_BASE + KDATA_DIRECTORY_OBJ_TYPE;
+    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SYMLINK_OBJ_TYPE)   = XBOX_KERNEL_DATA_BASE + KDATA_SYMLINK_OBJ_TYPE;
+
+    /* KeInterruptTime and KeSystemTime (ordinals 120, 154) are KSYSTEM_TIME:
+     * LowPart, High1Time, High2Time, in 100 ns units since boot and since
+     * 1601. MmGlobalData, KiBugCheckData, ObpObjectHandleTable and
+     * XboxEEPROMKey are zero, as on a console that has not bugchecked and
+     * whose key the runtime does not have. */
+    {
+        ULONGLONG it = xbox_GuestUptimeMs() * 10000ull;
+        FILETIME ft;
+        GetSystemTimeAsFileTime(&ft);
+        BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_INTERRUPT_TIME + 0) = (uint32_t)it;
+        BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_INTERRUPT_TIME + 4) = (uint32_t)(it >> 32);
+        BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_INTERRUPT_TIME + 8) = (uint32_t)(it >> 32);
+        BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME + 0) = ft.dwLowDateTime;
+        BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME + 4) = ft.dwHighDateTime;
+        BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME + 8) = ft.dwHighDateTime;
+        memset(XBOX_TO_NATIVE(XBOX_KERNEL_DATA_BASE + KDATA_MM_GLOBAL_DATA), 0, 0x20);
+        memset(XBOX_TO_NATIVE(XBOX_KERNEL_DATA_BASE + KDATA_BUG_CHECK_DATA), 0, 0x20);
+        memset(XBOX_TO_NATIVE(XBOX_KERNEL_DATA_BASE + KDATA_OBJECT_HANDLE_TABLE), 0, 0x20);
+        memset(XBOX_TO_NATIVE(XBOX_KERNEL_DATA_BASE + KDATA_EEPROM_KEY), 0, 16);
+    }
 
     /* KeTimeIncrement (ordinal 157) - 100ns units per clock tick. 0x2710 is
      * 1 ms, which is what KeTickCount above is updated at. A title dividing by
@@ -6729,21 +6760,6 @@ static void bridge_RtlWalkFrameChain(void)
     g_eax = 0;
 }
 
-/* 321: XboxEEPROMKey (data export, 0 args)
- * Not in the kernel_data_va_for_ordinal table, so it needs a bridge that hands
- * the caller a guest-addressable 16-byte key.  Carved from the guest heap once. */
-static void bridge_XboxEEPROMKey(void)
-{
-    static uint32_t eeprom_va = 0;
-
-    if (!eeprom_va) {
-        eeprom_va = xbox_HeapAlloc(16, 16);
-        if (eeprom_va)
-            memset(XBOX_TO_NATIVE(eeprom_va), 0, 16);
-    }
-    g_eax = eeprom_va;
-}
-
 /* ── Rtl Exception (ordinals 264, 265, 266, 303) ──────────── */
 
 /* 264: VOID RtlAssert(PVOID FailedAssertion, PVOID FileName, ULONG LineNumber,
@@ -7034,90 +7050,6 @@ static HANDLE ke_guest_event(uint32_t guest_va, int *type)
                             "(%s)\n", guest_va, *type ? "synchronization" : "notification");
     }
     return h;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * Data Exports (102, 120, 154, 240, 245, 249)
- *
- * These ordinals are DATA exports, not functions. The bridge returns a guest
- * VA inside the kernel data page so the title can dereference it. The offsets
- * below (0x510-0x558) are free in xbox_memory_layout.h's KDATA block (existing
- * slots end at 0x4B0+64, KiBugCheckData uses 0x500, page is 4 KB). Prefer
- * moving them into xbox_memory_layout.h and dropping the guarded defines here.
- * ═══════════════════════════════════════════════════════════════════════════
- */
-#ifndef KDATA_MMGLOBAL
-#define KDATA_MMGLOBAL          0x510  /* MmGlobalData (4 bytes) */
-#endif
-#ifndef KDATA_INTERRUPT_TIME
-#define KDATA_INTERRUPT_TIME    0x520  /* KeInterruptTime (LARGE_INTEGER, 8 bytes) */
-#endif
-#ifndef KDATA_SYSTEM_TIME
-#define KDATA_SYSTEM_TIME       0x530  /* KeSystemTime (LARGE_INTEGER, 8 bytes) */
-#endif
-#ifndef KDATA_OBJ_DIR_TYPE
-#define KDATA_OBJ_DIR_TYPE      0x540  /* ObDirectoryObjectType (4 bytes) */
-#endif
-#ifndef KDATA_OBJ_HANDLE_TABLE
-#define KDATA_OBJ_HANDLE_TABLE  0x548  /* ObpObjectHandleTable (4 bytes) */
-#endif
-#ifndef KDATA_OBJ_SYM_LINK_TYPE
-#define KDATA_OBJ_SYM_LINK_TYPE 0x550  /* ObSymbolicLinkObjectType (4 bytes) */
-#endif
-
-/* --- MmGlobalData (ordinal 102, 0 args) --- */
-static void bridge_MmGlobalData(void)
-{
-    /* Titles rarely dereference this; give it a stable, mapped address that
-     * reads back the address itself (self-referential placeholder). */
-    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_MMGLOBAL) =
-        XBOX_KERNEL_DATA_BASE + KDATA_MMGLOBAL;
-    g_eax = XBOX_KERNEL_DATA_BASE + KDATA_MMGLOBAL;
-}
-
-/* --- KeInterruptTime (ordinal 120, 0 args) --- */
-static void bridge_KeInterruptTime(void)
-{
-    /* Refresh the 100ns-since-boot counter before handing out the pointer. */
-    ULONGLONG t = xbox_GuestUptimeMs() * 10000ull;
-    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_INTERRUPT_TIME + 0) = (uint32_t)t;
-    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_INTERRUPT_TIME + 4) = (uint32_t)(t >> 32);
-    g_eax = XBOX_KERNEL_DATA_BASE + KDATA_INTERRUPT_TIME;
-}
-
-/* --- KeSystemTime (ordinal 154, 0 args) --- */
-static void bridge_KeSystemTime(void)
-{
-    /* Refresh the 100ns-since-1601 clock before handing out the pointer. */
-    FILETIME ft;
-    GetSystemTimeAsFileTime(&ft);
-    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME + 0) = ft.dwLowDateTime;
-    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME + 4) = ft.dwHighDateTime;
-    g_eax = XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME;
-}
-
-/* --- ObDirectoryObjectType (ordinal 240, 0 args) --- */
-static void bridge_ObDirectoryObjectType(void)
-{
-    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_OBJ_DIR_TYPE) =
-        XBOX_KERNEL_DATA_BASE + KDATA_OBJ_DIR_TYPE;
-    g_eax = XBOX_KERNEL_DATA_BASE + KDATA_OBJ_DIR_TYPE;
-}
-
-/* --- ObpObjectHandleTable (ordinal 245, 0 args) --- */
-static void bridge_ObpObjectHandleTable(void)
-{
-    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_OBJ_HANDLE_TABLE) =
-        XBOX_KERNEL_DATA_BASE + KDATA_OBJ_HANDLE_TABLE;
-    g_eax = XBOX_KERNEL_DATA_BASE + KDATA_OBJ_HANDLE_TABLE;
-}
-
-/* --- ObSymbolicLinkObjectType (ordinal 249, 0 args) --- */
-static void bridge_ObSymbolicLinkObjectType(void)
-{
-    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_OBJ_SYM_LINK_TYPE) =
-        XBOX_KERNEL_DATA_BASE + KDATA_OBJ_SYM_LINK_TYPE;
-    g_eax = XBOX_KERNEL_DATA_BASE + KDATA_OBJ_SYM_LINK_TYPE;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -8114,12 +8046,6 @@ static void bridge_KeTestAlertThread(void)
 {
     (void)STACK_ARG(0);
     g_eax = 0;
-}
-
-/* --- KiBugCheckData (ordinal 162, 0 args = 0 bytes) --- */
-static void bridge_KiBugCheckData(void)
-{
-    g_eax = XBOX_KERNEL_DATA_BASE + 0x500;
 }
 
 /* --- KiUnlockDispatcherDatabase (ordinal 163, fastcall: OldIrql in ecx) --- */
@@ -9192,7 +9118,6 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 318: return bridge_RtlUshortByteSwap;
     case 319: return bridge_RtlWalkFrameChain;
     case 320: return bridge_RtlZeroMemory;
-    case 321: return bridge_XboxEEPROMKey;
 
 
     /* Routed. The XcRC4 pair was turned OFF mid-bisect and never turned back
@@ -9386,12 +9311,6 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 197: return bridge_NtDuplicateObject;
 
     /* Data exports */
-    case 102: return bridge_MmGlobalData;
-    case 120: return bridge_KeInterruptTime;
-    case 154: return bridge_KeSystemTime;
-    case 240: return bridge_ObDirectoryObjectType;
-    case 245: return bridge_ObpObjectHandleTable;
-    case 249: return bridge_ObSymbolicLinkObjectType;
 
     /* Dbg */
     case   6: return bridge_DbgBreakPointWithStatus;
@@ -9486,7 +9405,6 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 148: return bridge_KeSetPriorityThread;
     case 152: return bridge_KeSuspendThread;
     case 155: return bridge_KeTestAlertThread;
-    case 162: return bridge_KiBugCheckData;
     case 163: return bridge_KiUnlockDispatcherDatabase;
 
     /* Mm */

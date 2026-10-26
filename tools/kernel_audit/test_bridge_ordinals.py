@@ -97,8 +97,6 @@ def test_every_routed_ordinal_is_a_function_of_that_name():
     bad = []
     for ordinal, name in load_routes():
         kind = abi[ordinal][0]
-        if kind == "DATA":
-            continue
         if kind not in ("STDCALL", "FASTCALL", "CDECL"):
             bad.append(f"ordinal {ordinal} routes to bridge_{name}, but kernel_abi.inc says {kind}")
         elif names.get(str(ordinal)) != name:
@@ -146,6 +144,14 @@ KDATA_OWNER = {
     "KDATA_XE_PUBLIC_KEY": "XePublicKeyData",
     "KDATA_BOOT_SMC_VIDEO": "HalBootSMCVideoMode",
     "KDATA_IDEX_CHANNEL": "IdexChannelObject",
+    "KDATA_BUG_CHECK_DATA": "KiBugCheckData",
+    "KDATA_MM_GLOBAL_DATA": "MmGlobalData",
+    "KDATA_INTERRUPT_TIME": "KeInterruptTime",
+    "KDATA_SYSTEM_TIME": "KeSystemTime",
+    "KDATA_DIRECTORY_OBJ_TYPE": "ObDirectoryObjectType",
+    "KDATA_SYMLINK_OBJ_TYPE": "ObSymbolicLinkObjectType",
+    "KDATA_OBJECT_HANDLE_TABLE": "ObpObjectHandleTable",
+    "KDATA_EEPROM_KEY": "XboxEEPROMKey",
 }
 
 
@@ -234,6 +240,32 @@ def test_bridges_read_the_arguments_their_prototype_has():
             bad.append(f"{ordinal} {name}: fastcall, but never reads its second argument from g_edx")
     assert not bad, "bridges disagree with kernel_abi.inc:\n  " + "\n  ".join(bad)
     print("ok  bridges_read_the_arguments_their_prototype_has")
+
+
+def test_every_data_export_is_served_from_the_data_page():
+    """Every export nxdk's xboxkrnl.exe.def marks DATA is a kernel_data_va_for_ordinal entry and no bridge route.
+
+    A title reads a data export through its import slot. Routed as a function,
+    the slot holds a dispatch address and the title reads whatever is there:
+    KdDebuggerEnabled and KdDebuggerNotPresent (88, 89) read the first byte of
+    the dispatch stub, non-zero, so every title saw a debugger attached.
+    data_exports_match_their_ordinal could not see that, because it only
+    checks the entries that exist.
+    """
+    data = {o for o, _ in load_data_exports()}
+    routes = dict(load_routes())
+    names = dict(re.findall(r"\{ KABI_\w+, \d+, \d+ \},\s*/\* (\d+) (\w+)",
+                            open(ABI_INC, encoding="utf-8").read()))
+    bad = []
+    for ordinal, (kind, _, _) in sorted(load_abi().items()):
+        if kind != "DATA":
+            continue
+        if ordinal in routes:
+            bad.append(f"{ordinal} {names[str(ordinal)]} is data, but routes to bridge_{routes[ordinal]}")
+        elif ordinal not in data:
+            bad.append(f"{ordinal} {names[str(ordinal)]} is data, but kernel_data_va_for_ordinal has no entry")
+    assert not bad, "data exports not served from the kernel data page:\n  " + "\n  ".join(bad)
+    print("ok  every_data_export_is_served_from_the_data_page")
 
 
 if __name__ == "__main__":
