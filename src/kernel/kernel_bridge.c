@@ -182,6 +182,8 @@ static uint32_t kernel_data_va_for_ordinal(ULONG ordinal)
     case 354: return XBOX_KERNEL_DATA_BASE + KDATA_ALT_SIGNATURE_KEYS;
     case 355: return XBOX_KERNEL_DATA_BASE + KDATA_XE_PUBLIC_KEY;
     case 356: return XBOX_KERNEL_DATA_BASE + KDATA_BOOT_SMC_VIDEO;
+    case  88: return XBOX_KERNEL_DATA_BASE + KDATA_KD_DEBUGGER_ENABLED;
+    case  89: return XBOX_KERNEL_DATA_BASE + KDATA_KD_DEBUGGER_NOT_PRESENT;
     case 357: return XBOX_KERNEL_DATA_BASE + KDATA_IDEX_CHANNEL;
     default:  return 0;  /* Not a data export */
     }
@@ -285,6 +287,11 @@ void xbox_kernel_data_init(void)
     /* HalBootSMCVideoMode (ordinal 356) - SMC video mode word from boot. 0 is
      * "no video mode reported", which titles treat as auto-detect. */
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_BOOT_SMC_VIDEO) = 0;
+
+    /* KdDebuggerEnabled and KdDebuggerNotPresent (ordinals 88, 89) are BOOLEAN
+     * variables a title reads through its thunk slot: no kernel debugger. */
+    BRIDGE_MEM8(XBOX_KERNEL_DATA_BASE + KDATA_KD_DEBUGGER_ENABLED) = 0;
+    BRIDGE_MEM8(XBOX_KERNEL_DATA_BASE + KDATA_KD_DEBUGGER_NOT_PRESENT) = 1;
 
     /* IdexChannelObject is a structure, not an opaque pointer. Guest file-close
      * code walks DeviceQueue.DeviceListHead at +0x28. Host-backed synchronous
@@ -7613,23 +7620,6 @@ static void bridge_IoDismountVolumeByName(void)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Kd (88, 89)
- * ═══════════════════════════════════════════════════════════════════════════
- */
-
-/* --- KdDebuggerEnabled (ordinal 88, 0 args = 0 bytes) --- */
-static void bridge_KdDebuggerEnabled(void)
-{
-    g_eax = 0;  /* not connected */
-}
-
-/* --- KdDebuggerNotPresent (ordinal 89, 0 args = 0 bytes) --- */
-static void bridge_KdDebuggerNotPresent(void)
-{
-    g_eax = 1;  /* true: no debugger present */
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
  * Ke -- shadow-table object bridges (92-163)
  *
  * The KeInitialize* family creates a real Win32 object, records guest-VA ->
@@ -9340,8 +9330,6 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case  80: return 20;  /* IoSetShareAccess (5) */
 
     /* Kd */
-    case  88: return  0;  /* KdDebuggerEnabled (void) */
-    case  89: return  0;  /* KdDebuggerNotPresent (void) */
 
     /* Ke (new) */
     case  92: return  4;  /* KeAlertResumeThread (1) */
@@ -9864,8 +9852,6 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case  91: return bridge_IoDismountVolumeByName;
 
     /* Kd */
-    case  88: return bridge_KdDebuggerEnabled;
-    case  89: return bridge_KdDebuggerNotPresent;
 
     /* Ke (new) */
     case  92: return bridge_KeAlertResumeThread;

@@ -200,6 +200,8 @@ KDATA_OWNER = {
     "KDATA_IO_DEVICE_TYPE": "IoDeviceObjectType",
     "KDATA_FILE_OBJ_TYPE": "IoFileObjectType",
     "KDATA_TICK_COUNT": "KeTickCount",
+    "KDATA_KD_DEBUGGER_ENABLED": "KdDebuggerEnabled",
+    "KDATA_KD_DEBUGGER_NOT_PRESENT": "KdDebuggerNotPresent",
     "KDATA_TIME_INCREMENT": "KeTimeIncrement",
     "KDATA_LAUNCH_DATA_PAGE": "LaunchDataPage",
     "KDATA_THREAD_OBJ_TYPE": "PsThreadObjectType",

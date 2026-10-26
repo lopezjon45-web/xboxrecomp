@@ -283,6 +283,8 @@ void xbox_WatchInit(void);
 #define KDATA_FILE_OBJ_TYPE     0x0C0  /* IoFileObjectType (4 bytes) */
 #define KDATA_TIME_INCREMENT    0x0D0  /* KeTimeIncrement (4 bytes) */
 #define KDATA_BOOT_SMC_VIDEO    0x0E0  /* HalBootSMCVideoMode (4 bytes) */
+#define KDATA_KD_DEBUGGER_ENABLED     0x0F0  /* KdDebuggerEnabled (BOOLEAN) */
+#define KDATA_KD_DEBUGGER_NOT_PRESENT 0x0F1  /* KdDebuggerNotPresent (BOOLEAN) */
 #define KDATA_IDEX_CHANNEL      0x500  /* IDE_CHANNEL_OBJECT (512-byte reserved region) */
 #define KDATA_HD_KEY            0x100  /* XboxHDKey (16 bytes) */
 #define KDATA_SIGNATURE_KEY     0x110  /* XboxSignatureKey (16 bytes) */
