@@ -3,6 +3,7 @@
 
 #include "app_partition.h"
 #include "xbox/xbox_shell.h"
+#include <stdio.h>
 #include <string.h>
 
 BOOL WINAPI PulseEvent(HANDLE hEvent)
@@ -58,6 +59,87 @@ DWORD WINAPI xbox_app_GetFileAttributesW(LPCWSTR lpFileName)
     if (!GetFileAttributesExFromAppW(lpFileName, GetFileExInfoStandard, &data))
         return INVALID_FILE_ATTRIBUTES;
     return data.dwFileAttributes;
+}
+
+#define GUARD_MAX 4
+static wchar_t s_guarded[MAX_PATH];
+static wchar_t s_allowed[GUARD_MAX][MAX_PATH];
+static int s_allowed_count;
+
+/* Whether `path` is `folder` or below it, case-insensitively, at a separator. */
+static int under(const wchar_t *path, const wchar_t *folder)
+{
+    size_t n = wcslen(folder);
+    return n && _wcsnicmp(path, folder, n) == 0 && (path[n] == 0 || path[n] == L'\\' || folder[n - 1] == L'\\');
+}
+
+static void full_path(const wchar_t *path, wchar_t out[MAX_PATH])
+{
+    DWORD n = GetFullPathNameW(path, MAX_PATH, out, NULL);
+    if (!n || n >= MAX_PATH)
+        wcsncpy(out, path, MAX_PATH - 1), out[MAX_PATH - 1] = 0;
+    n = (DWORD)wcslen(out);
+    while (n > 3 && out[n - 1] == L'\\')
+        out[--n] = 0;
+}
+
+void xbox_app_guard_writes(const wchar_t *guarded, const wchar_t *const *allowed, int count)
+{
+    full_path(guarded, s_guarded);
+    s_allowed_count = count < GUARD_MAX ? count : GUARD_MAX;
+    for (int i = 0; i < s_allowed_count; i++)
+        full_path(allowed[i], s_allowed[i]);
+}
+
+/* A folder on the way to an allowed one may be made too: the saves folder needs its parents. */
+static int write_allowed(const wchar_t *path, int folder)
+{
+    wchar_t full[MAX_PATH];
+    if (!s_guarded[0] || !path)
+        return 1;
+    full_path(path, full);
+    if (!under(full, s_guarded))
+        return 1;
+    for (int i = 0; i < s_allowed_count; i++)
+        if (under(full, s_allowed[i]) || (folder && under(s_allowed[i], full)))
+            return 1;
+    {
+        static volatile LONG told;
+        if (InterlockedIncrement(&told) <= 20)
+            fprintf(stderr, "  [FILE] refused a write outside the runtime's folders: %S\n", full);
+    }
+    SetLastError(ERROR_ACCESS_DENIED);
+    return 0;
+}
+
+HANDLE WINAPI xbox_app_CreateFileW(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES security,
+                                   DWORD disposition, DWORD flags, HANDLE template_file)
+{
+    const DWORD writes = GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES |
+                         FILE_WRITE_EA | DELETE;
+    if (((access & writes) || disposition != OPEN_EXISTING) && !write_allowed(name, 0))
+        return INVALID_HANDLE_VALUE;
+    return CreateFileFromAppW(name, access, share, security, disposition, flags, template_file);
+}
+
+BOOL WINAPI xbox_app_CreateDirectoryW(LPCWSTR name, LPSECURITY_ATTRIBUTES security)
+{
+    return write_allowed(name, 1) && CreateDirectoryFromAppW(name, security);
+}
+
+BOOL WINAPI xbox_app_DeleteFileW(LPCWSTR name)
+{
+    return write_allowed(name, 0) && DeleteFileFromAppW(name);
+}
+
+BOOL WINAPI xbox_app_RemoveDirectoryW(LPCWSTR name)
+{
+    return write_allowed(name, 0) && RemoveDirectoryFromAppW(name);
+}
+
+BOOL WINAPI xbox_app_CopyFileW(LPCWSTR from, LPCWSTR to, BOOL fail_if_exists)
+{
+    return write_allowed(to, 0) && CopyFileFromAppW(from, to, fail_if_exists);
 }
 
 int WINAPI SHCreateDirectoryExA(HWND hwnd, LPCSTR pszPath, const SECURITY_ATTRIBUTES *psa)

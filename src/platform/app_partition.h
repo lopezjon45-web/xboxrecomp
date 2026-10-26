@@ -108,16 +108,29 @@ int WINAPI SHCreateDirectoryExA(HWND hwnd, LPCSTR pszPath, const SECURITY_ATTRIB
 
 /* Declared, but on E: (removable storage) the plain call fails with error 5 (vault-one-s/probe/FINDINGS.md). The
  * FromApp call has the same contract, goes through the broker only when the plain one is refused, and so costs
- * nothing extra in LocalState. Saves on the drive (kernel_path.c's saves root) and kernel_file.c's opens reach E:
+ * nothing extra in LocalState; the write calls reach it through the xbox_app_ fence below. Saves on the drive (kernel_path.c's saves root) and kernel_file.c's opens reach E:
  * through these. Redirected by function-like macro, so those files read as upstream wrote them and a field of the same
  * name (FILE_DISPOSITION_INFO.DeleteFile) is left alone. */
 #include <fileapifromapp.h>
 #define CreateFileW(name, access, share, security, disposition, flags, template) \
-    CreateFileFromAppW((name), (access), (share), (security), (disposition), (flags), (template))
-#define CreateDirectoryW(name, security) CreateDirectoryFromAppW((name), (security))
-#define DeleteFileW(name) DeleteFileFromAppW(name)
-#define RemoveDirectoryW(name) RemoveDirectoryFromAppW(name)
-#define CopyFileW(from, to, fail_if_exists) CopyFileFromAppW((from), (to), (fail_if_exists))
+    xbox_app_CreateFileW((name), (access), (share), (security), (disposition), (flags), (template))
+#define CreateDirectoryW(name, security) xbox_app_CreateDirectoryW((name), (security))
+#define DeleteFileW(name) xbox_app_DeleteFileW(name)
+#define RemoveDirectoryW(name) xbox_app_RemoveDirectoryW(name)
+#define CopyFileW(from, to, fail_if_exists) xbox_app_CopyFileW((from), (to), (fail_if_exists))
+HANDLE WINAPI xbox_app_CreateFileW(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES security,
+                                   DWORD disposition, DWORD flags, HANDLE template_file);
+BOOL WINAPI xbox_app_CreateDirectoryW(LPCWSTR name, LPSECURITY_ATTRIBUTES security);
+BOOL WINAPI xbox_app_DeleteFileW(LPCWSTR name);
+BOOL WINAPI xbox_app_RemoveDirectoryW(LPCWSTR name);
+BOOL WINAPI xbox_app_CopyFileW(LPCWSTR from, LPCWSTR to, BOOL fail_if_exists);
+
+/* The writes above are fenced: once a front end names a guarded folder (the link's home on the drive) and the
+ * folders on it the runtime owns, a create, write, delete or copy anywhere else under the guarded folder fails with
+ * ERROR_ACCESS_DENIED, whatever path the title built; only the folders leading to an owned one may also be made.
+ * Paths are compared after GetFullPathNameW, so ".." cannot climb out. Call once, before the first guest call; with
+ * no call nothing is fenced. */
+void xbox_app_guard_writes(const wchar_t *guarded, const wchar_t *const *allowed, int count);
 #define GetFileAttributesExW(name, level, data) GetFileAttributesExFromAppW((name), (level), (data))
 #define FindFirstFileW(pattern, found) \
     FindFirstFileExFromAppW((pattern), FindExInfoStandard, (found), FindExSearchNameMatch, NULL, 0)
