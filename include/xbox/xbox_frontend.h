@@ -55,6 +55,10 @@ void xbox_frontend_return_to_hub(uint32_t reason);
 /* Whether an NV2A model holds the GPU's registers; the timer thread's GPU work needs one. */
 int xbox_frontend_nv2a_attached(void);
 
+/* Whether the GPU's interrupt line (vector 3) is up in a front end's own NV2A model, one that is not the fork's (so
+ * xbox_frontend_nv2a_attached is 0). The timer thread calls the title's service routine while it is. */
+int xbox_Nv2aIrqPending(void);
+
 /* One file or directory of the disc. */
 typedef struct XboxDiscEntry {
     uint32_t id;           /* the volume's name for it in read and child; stable for the session */

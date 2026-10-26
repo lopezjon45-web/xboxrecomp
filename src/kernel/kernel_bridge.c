@@ -2969,21 +2969,34 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         }
         kernel_drain_dpcs();   /* deferred work, before due timers */
         {
-            /* The APU's line (vector 5), level-triggered like the GPU's: while
-             * it is up, call DirectSound's service routine, which clears the
-             * status and queues its deferred work (patch 0068). */
+            /* Device lines a front end's own models raise, level-triggered:
+             * while one is up, call the title's service routine, which clears
+             * the cause and queues its deferred work (patch 0068). The GPU's
+             * is here only for a front end whose NV2A model is not the fork's
+             * (xbox_frontend_nv2a_attached is 0); the fork's own is above. */
             extern int xbox_ApuIrqPending(void);
-            static unsigned apu_irqs;
+            static const struct {
+                const char *name;
+                uint32_t vector;
+                int (*pending)(void);
+            } lines[] = {
+                { "GPU", NV2A_VECTOR, xbox_Nv2aIrqPending },
+                { "APU", 5, xbox_ApuIrqPending },
+            };
+            static unsigned irqs[sizeof lines / sizeof lines[0]];
+            size_t l;
             int k;
-            for (k = 0; k < 4 && xbox_ApuIrqPending(); k++) {
-                int claimed = kernel_raise_interrupt(5);
-                if (apu_irqs++ < 5 || apu_irqs % 10000 == 0)
-                    fprintf(stderr, "  [APU] interrupt -> ISR %s (#%u)\n",
-                            claimed < 0 ? "not callable" : claimed ? "claimed it"
-                            : "declined it", apu_irqs);
-                kernel_drain_dpcs();
-                if (claimed < 0)
-                    break;
+            for (l = 0; l < sizeof lines / sizeof lines[0]; l++) {
+                for (k = 0; k < 4 && lines[l].pending(); k++) {
+                    int claimed = kernel_raise_interrupt(lines[l].vector);
+                    if (irqs[l]++ < 5 || irqs[l] % 10000 == 0)
+                        fprintf(stderr, "  [%s] interrupt -> ISR %s (#%u)\n", lines[l].name,
+                                claimed < 0 ? "not callable" : claimed ? "claimed it"
+                                : "declined it", irqs[l]);
+                    kernel_drain_dpcs();
+                    if (claimed < 0)
+                        break;
+                }
             }
         }
         now = (long long)GetTickCount64();
@@ -3046,6 +3059,14 @@ static void kernel_timer_wake(void)
     while (!g_timer_started)
         SwitchToThread();
     SetEvent(g_timer_wake);
+}
+
+/* For a front end's device models: a line that just rose is delivered now,
+ * not on the next tick, and the thread exists before the title's first
+ * KeSetTimer or DPC. */
+void xbox_KernelInterruptsWake(void)
+{
+    kernel_timer_wake();
 }
 
 /* Shared by KeSetTimer and KeSetTimerEx; period is 0 for the former. */

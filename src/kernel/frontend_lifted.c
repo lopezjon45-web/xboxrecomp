@@ -276,6 +276,11 @@ int xbox_frontend_nv2a_attached(void)
     return 1;
 }
 
+int xbox_Nv2aIrqPending(void)
+{
+    return 0;
+}
+
 const XboxDiscVolume *xbox_frontend_disc(void)
 {
     return NULL;
